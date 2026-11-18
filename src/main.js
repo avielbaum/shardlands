@@ -1,0 +1,2418 @@
+/**
+ * @file Game state and rules, fixed-timestep loop, game-state machine (EXPLORE, DIALOGUE,
+ * INVENTORY, SKILLS, JOURNAL, MAP, TRADE, LOOT, READ, REST, PAUSE, DEAD, ENDING), input
+ * orchestration (keyboard, mouse with Pointer Lock plus a free-look fallback, dual touch
+ * joysticks), the diegetic HUD, modal UIs and the localStorage save/load manager.
+ */
+import {
+  buildObservatory, buildOverworld, buildDungeon, Level, ChunkStreamer, HAZARD, STEP, TILE,
+  BIOME_NAMES, SITES,
+} from './world.js';
+import { Renderer } from './renderer.js';
+import { AudioEngine } from './audio.js';
+import { SPR, VIEW, spriteRect, viewRect } from './textures.js';
+import { Player, Enemy, Orb, NPC, Particle, angleDiff } from './entities.js';
+import {
+  Character, QuestLog, Dialogue, ITEMS, RECIPES, SPELLS, SKILLS, ATTRIBUTES, PERKS, FACTIONS, SHOPS, BOOKS,
+  makeContract, buyPrice, sellPrice, craft, spellFor,
+} from './rpg.js';
+
+/** @typedef {import('./entities.js').FrameInput} FrameInput */
+/** @typedef {import('./entities.js').Projectile} Projectile */
+/** @typedef {import('./world.js').Prop} Prop */
+/** @typedef {import('./world.js').Door} Door */
+/** @typedef {import('./world.js').Portal} Portal */
+/** @typedef {import('./world.js').Light} Light */
+/** @typedef {import('./renderer.js').SpriteDesc} SpriteDesc */
+/** @typedef {import('./renderer.js').Env} Env */
+/** @typedef {import('./rpg.js').Contract} Contract */
+/** @typedef {import('./rpg.js').Marker} Marker */
+/** @typedef {{kind:'npc', ref:NPC, label:string}|{kind:'prop', ref:Prop, label:string}|{kind:'door', ref:Door, label:string}} Interactable */
+
+const STEP_DT = 1 / 60;
+const SAVE_KEY = 'aetherium-shardlands-save-v1';
+/** Lever -> anchors it toggles (left, heart, right). */
+const LEVER_MAP = [[0, 1], [1], [1, 2]];
+const ANCHOR_START = [false, true, false];
+/** @param {number} v @param {number} a @param {number} b */
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+/** @param {number[]} a @param {number[]} b @param {number} t */
+const mix3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+
+/** Pack a 0/1 byte array into base64 bits. @param {Uint8Array} a */
+function packBits(a) {
+  let s = '';
+  for (let i = 0; i < a.length; i += 8) {
+    let b = 0;
+    for (let k = 0; k < 8; k++) if (a[i + k]) b |= 1 << k;
+    s += String.fromCharCode(b);
+  }
+  return btoa(s);
+}
+
+/** @param {string} b64 @param {Uint8Array} out */
+function unpackBits(b64, out) {
+  const s = atob(b64);
+  for (let i = 0; i < out.length; i++) out[i] = (s.charCodeAt(i >> 3) >> (i & 7)) & 1;
+}
+
+export class Game {
+  /** @param {AudioEngine} audio @param {number} seed */
+  constructor(audio, seed) {
+    this.audio = audio;
+    this.seed = seed;
+    this.char = new Character();
+    this.quests = new QuestLog();
+    this.factions = { rep: /** @type {Record<string, number>} */ ({ artificers: 0, wardens: 0, cinderwick: 0, oakhaven: 0 }), member: { artificers: false, wardens: false } };
+    /** @type {Record<string, any>} */
+    this.flags = { levers: [false, false, false], rent: null, rentUntil: 0, pumpFixed: false, gateOpen: false, ending: false, levisGiven: false };
+    /** @type {{artificers: Contract|null, wardens: Contract|null, n: number}} */
+    this.contracts = { artificers: null, wardens: null, n: 0 };
+    /** @type {Set<string>} */
+    this.discovered = new Set();
+    /** Persistent world changes, keyed by stable ids. */
+    this.world = {
+      /** @type {Record<string, {locked:boolean, shut:boolean}>} */ doors: {},
+      /** @type {Record<string, [string, number][]>} */ loot: {},
+      /** @type {Record<string, boolean>} */ gone: {},
+      /** @type {Record<string, boolean>} */ killed: {},
+    };
+    /** @type {{level:string, x:number, z:number, label:string}[]} */
+    this.markers = [];
+    /** @type {Record<string, {day:number, items:[string, number][]}>} */
+    this.shopStock = {};
+    this.minutes = 7.5 * 60;
+    this.time = 0;
+    /** @type {Map<string, Level>} */
+    this.levels = new Map();
+    /** @type {Level} */
+    this.level = this.getLevel('observatory');
+    this.player = new Player(this.level.spawn.x, 0, this.level.spawn.z, this.level.spawn.yaw);
+    /** @type {Enemy[]} */
+    this.enemies = [];
+    /** @type {NPC[]} */
+    this.npcs = [];
+    /** @type {Orb[]} */
+    this.orbs = [];
+    /** @type {Projectile[]} */
+    this.projectiles = [];
+    /** @type {Particle[]} */
+    this.particles = [];
+    this.streamer = new ChunkStreamer(this.level, 3);
+    /** @type {number[]} chunk keys the renderer should build */
+    this.chunkLoads = [];
+    /** @type {number[]} */
+    this.chunkUnloads = [];
+    this.levelChanged = true;
+    this.streamT = 0;
+    this.revealT = 0;
+    this.flowT = 0;
+    this.flowOx = 0;
+    this.flowOz = 0;
+    this.flow = new Int16Array(48 * 48);
+    this.fx = { dash: 0, parry: 0, hurt: 0 };
+    /** @type {{text:string, t:number}[]} */
+    this.notes = [];
+    this.hotIndex = 0;
+    this.dead = false;
+    /** @type {Portal|null} */
+    this.pendingTravel = null;
+    /** @type {Env} */
+    this.env = { fog: [0.03, 0.03, 0.07], fogDensity: 0.07, ambient: [0.07, 0.07, 0.12], sunDir: [0, 1, 0], sunCol: [0, 0, 0] };
+    this.ambienceKey = '';
+    this.hitmarker = 0;
+  }
+
+  /** Start a fresh run: awaken in the Sunken Observatory. */
+  newRun() {
+    this.quests.start('main', 'The Unquiet Ley', 'main');
+    this.setMain(10, 'I awoke in the Sunken Observatory. The Great Astrolabe Gate is sealed; the Keeper\'s log speaks of a Fork, three levers and three anchors.');
+    this.enterLevel('observatory', this.level.spawn.x, this.level.spawn.z, this.level.spawn.yaw);
+  }
+
+  get hour() {
+    return (this.minutes % 1440) / 60;
+  }
+
+  get day() {
+    return Math.floor(this.minutes / 1440) + 1;
+  }
+
+  get mainStage() {
+    return this.quests.get('main')?.stage ?? 0;
+  }
+
+  // -------------------------------------------------------------------------
+  // Levels
+  // -------------------------------------------------------------------------
+
+  /** Build (or fetch) a level and apply persistent world state to it. @param {string} id */
+  getLevel(id) {
+    const cached = this.levels.get(id);
+    if (cached) return cached;
+    const L = id === 'observatory' ? buildObservatory(this.seed) : id === 'overworld' ? buildOverworld(this.seed) : buildDungeon(this.seed, id.slice(8));
+    for (const d of L.doors) {
+      const s = this.world.doors[d.key];
+      if (s) { d.locked = s.locked; d.shut = s.shut; d.open = s.shut ? 0 : 1; }
+    }
+    if (id === 'observatory' && this.flags.gateOpen) {
+      const gate = L.doors.find((d) => d.puzzle);
+      if (gate) { gate.locked = false; gate.shut = false; gate.open = 1; }
+    }
+    for (const p of L.props) if (this.world.gone[p.key]) p.gone = true;
+    this.levels.set(id, L);
+    return L;
+  }
+
+  /** Place a contract relic in its dungeon if it is not there yet. @param {Level} L */
+  _placeRelic(L) {
+    const c = this.contracts.artificers;
+    if (!c || c.kind !== 'relic' || L.id !== `dungeon:${c.dungeon}` || this.char.inventory.count('relic')) return;
+    const key = `${L.id}:relic:${c.id}`;
+    if (this.world.gone[key] || L.props.some((p) => p.key === key)) return;
+    const boss = L.spawns.find((s) => s.boss) ?? L.spawns[0];
+    const p = L.addProp('item', 'i_relic', boss.x - 1, boss.z + 0.5, { size: 0.7, data: { item: 'relic', qty: 1 } });
+    p.key = key;
+    L.finalize();
+  }
+
+  /** @param {string} id @param {number} x @param {number} z @param {number} yaw */
+  enterLevel(id, x, z, yaw) {
+    const L = this.getLevel(id);
+    this._placeRelic(L);
+    this.level = L;
+    const p = this.player;
+    p.x = x;
+    p.z = z;
+    p.y = L.heightAt(x, z);
+    p.yaw = yaw;
+    p.pitch = 0;
+    p.vx = 0;
+    p.vz = 0;
+    p.vy = 0;
+    p.fallFrom = p.y;
+    p.lastSafe = { x, z, y: p.y };
+    this.enemies = L.spawns.filter((s) => !this.world.killed[s.key]).map((s) => new Enemy(s, L.heightAt(s.x, s.z)));
+    this.npcs = L.npcDefs.map((d) => new NPC(d, L));
+    this.orbs = [];
+    this.projectiles = [];
+    this.particles = [];
+    this.streamer = new ChunkStreamer(L, L.outdoor ? 4 : 3);
+    this.chunkLoads = [];
+    this.chunkUnloads = [];
+    this.levelChanged = true;
+    this.streamT = 0;
+    this.flowT = 0;
+    this.ambienceKey = '';
+    if (id === 'overworld' && this.mainStage === 10) {
+      this.setMain(20, 'I escaped the Sunken Observatory into the Shardlands. The Keeper\'s log mentioned the Artificers; I should seek Master Vance in Cinderwick, east along the road.');
+    }
+    this.notify(L.outdoor ? 'The Shardlands' : L.name);
+    this.save(true);
+  }
+
+  /** @param {Portal} portal */
+  travel(portal) {
+    const L = this.getLevel(portal.level);
+    this.enterLevel(portal.level, portal.x ?? L.spawn.x, portal.z ?? L.spawn.z, portal.yaw ?? L.spawn.yaw);
+  }
+
+  // -------------------------------------------------------------------------
+  // Simulation
+  // -------------------------------------------------------------------------
+
+  /** @param {number} dt @param {FrameInput} input */
+  update(dt, input) {
+    if (this.dead) return;
+    this.minutes += dt;
+    this.time += dt;
+    const p = this.player;
+    const L = this.level;
+    const c = this.char;
+    p.update(dt, input, this);
+
+    for (const d of L.doors) {
+      d.hold = Math.max(0, d.hold - dt);
+      const want = !d.shut || d.hold > 0 ? 1 : 0;
+      d.open = clamp(d.open + clamp(want - d.open, -dt * 2, dt * 2.5), 0, 1);
+    }
+    const di = L.inBounds(Math.floor(p.x), Math.floor(p.z)) ? L.doorAt[L.idx(Math.floor(p.x), Math.floor(p.z))] : -1;
+    if (di >= 0 && L.doors[di].portal && L.doors[di].open > 0.6) this.pendingTravel = L.doors[di].portal;
+
+    this.streamT -= dt;
+    if (this.streamT <= 0) {
+      this.streamT = 0.25;
+      const ev = this.streamer.update(p.x, p.z);
+      this.chunkLoads.push(...ev.load);
+      this.chunkUnloads.push(...ev.unload);
+    }
+    this.flowT -= dt;
+    if (this.flowT <= 0) {
+      this.flowT = 0.35;
+      this._computeFlow();
+    }
+
+    this._shields();
+    for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 4900) e.update(dt, this);
+    this._separate();
+    this.enemies = this.enemies.filter((e) => e.alive);
+    for (const n of this.npcs) n.update(dt, this, Math.hypot(n.x - p.x, n.z - p.z) < 50);
+    for (const o of this.orbs) o.update(dt, this);
+    for (const s of this.projectiles) s.update(dt, this);
+    for (const q of this.particles) q.update(dt, L.heightAt(q.x, q.z));
+    this.orbs = this.orbs.filter((o) => o.alive);
+    this.projectiles = this.projectiles.filter((s) => s.alive);
+    this.particles = this.particles.filter((q) => q.alive).slice(-300);
+
+    this.revealT -= dt;
+    if (this.revealT <= 0) {
+      this.revealT = 0.3;
+      L.reveal(p.x, p.z, L.outdoor ? 14 : 6);
+      for (const lm of L.landmarks) {
+        if (!this.discovered.has(lm.id) && Math.hypot(lm.x - p.x, lm.z - p.z) < lm.r) this.discover(lm.id, lm.name);
+      }
+      if (this.flags.rent && this.minutes > this.flags.rentUntil) this.flags.rent = null;
+    }
+    this.fx.dash = Math.max(0, this.fx.dash - dt * 3);
+    this.fx.parry = Math.max(0, this.fx.parry - dt * 2.5);
+    this.fx.hurt = Math.max(0, this.fx.hurt - dt * 1.8);
+    this.hitmarker = Math.max(0, this.hitmarker - dt);
+    for (const n of this.notes) n.t -= dt;
+    this.notes = this.notes.filter((n) => n.t > 0);
+
+    let near = 0;
+    for (const e of this.enemies) if (e.awake && e.state !== 'home' && Math.hypot(e.x - p.x, e.z - p.z) < 14) near++;
+    this.audio.setIntensity(near * 0.3);
+    const amb = this.ambienceName();
+    const night = this.hour < 6 || this.hour >= 20;
+    if (amb + night !== this.ambienceKey) {
+      this.ambienceKey = amb + night;
+      this.audio.setAmbience(amb, night);
+    }
+    this._updateEnv(dt);
+    if (c.hp <= 0) this._die();
+    if (this.pendingTravel) {
+      const t = this.pendingTravel;
+      this.pendingTravel = null;
+      this.travel(t);
+    }
+  }
+
+  ambienceName() {
+    const L = this.level;
+    if (L.id === 'observatory') return 'observatory';
+    if (!L.outdoor) return 'dungeon';
+    const p = this.player;
+    if (L.zone[L.idx(Math.floor(p.x), Math.floor(p.z))] >= 0) return 'town';
+    return ['fen', 'badlands', 'wood'][L.biomeAt ? L.biomeAt(p.x, p.z) : 2];
+  }
+
+  locationName() {
+    const L = this.level;
+    if (!L.outdoor) return L.name;
+    const p = this.player;
+    const z = L.zone[L.idx(Math.floor(p.x), Math.floor(p.z))];
+    if (z === 0) return 'Oakhaven';
+    if (z === 1) return 'Cinderwick';
+    return BIOME_NAMES[L.biomeAt ? L.biomeAt(p.x, p.z) : 2];
+  }
+
+  /** Fog, ambient and sun by level, biome and time of day (eased). @param {number} dt */
+  _updateEnv(dt) {
+    const L = this.level;
+    /** @type {Env} */
+    let target;
+    if (!L.outdoor) {
+      const healed = L.id === 'observatory' && this.flags.ending;
+      target = { fog: L.fog, fogDensity: L.fogDensity, ambient: healed ? [0.16, 0.18, 0.24] : L.ambient, sunDir: [0, 1, 0], sunCol: [0, 0, 0] };
+    } else {
+      const h = this.hour;
+      const ang = ((h - 6) / 12) * Math.PI;
+      const sy = Math.sin(ang);
+      const day = clamp(sy * 1.6 + 0.25, 0, 1);
+      const dusk = clamp(1 - Math.abs(sy) * 2.5, 0, 1) * (h > 4 && h < 21 ? 1 : 0);
+      const biome = L.biomeAt ? L.biomeAt(this.player.x, this.player.z) : 2;
+      const dayFog = [[0.5, 0.58, 0.54], [0.7, 0.57, 0.46], [0.46, 0.6, 0.6]][biome];
+      // exp2 fog: visibility tuned to the ~64-unit streaming radius.
+      const dens = [0.026, 0.016, 0.02][biome];
+      let fog = mix3([0.06, 0.07, 0.13], dayFog, day);
+      fog = mix3(fog, [0.75, 0.42, 0.28], dusk * 0.45);
+      const sunCol = mix3([0, 0, 0], [1.0, 0.9, 0.75], day).map((v, k) => v + [0.5, 0.2, 0.05][k] * dusk * 0.6);
+      const l = Math.hypot(Math.cos(ang), Math.max(0.15, sy), 0.35);
+      target = {
+        fog, fogDensity: dens * (day < 0.3 ? 1.4 : 1), ambient: mix3([0.15, 0.16, 0.26], [0.36, 0.37, 0.42], Math.max(day, dusk * 0.6)), sunCol,
+        sunDir: [Math.cos(ang) / l, Math.max(0.15, sy) / l, 0.35 / l],
+      };
+    }
+    const k = 1 - Math.exp(-dt * 2.5);
+    const e = this.env;
+    e.fog = mix3(e.fog, target.fog, k);
+    e.ambient = mix3(e.ambient, target.ambient, k);
+    e.sunCol = mix3(e.sunCol, target.sunCol, k);
+    e.sunDir = target.sunDir;
+    e.fogDensity += (target.fogDensity - e.fogDensity) * k;
+  }
+
+  /** Breadth-first distance field (48x48 window around the player) for enemies without sight. */
+  _computeFlow() {
+    const L = this.level;
+    const p = this.player;
+    const N = 48;
+    const ox = Math.floor(p.x) - N / 2;
+    const oz = Math.floor(p.z) - N / 2;
+    this.flowOx = ox;
+    this.flowOz = oz;
+    const f = this.flow;
+    f.fill(32767);
+    const q = [];
+    const si = Math.floor(p.x) - ox;
+    const sj = Math.floor(p.z) - oz;
+    f[sj * N + si] = 0;
+    q.push(sj * N + si);
+    for (let h = 0; h < q.length; h++) {
+      const cur = q[h];
+      const i = cur % N;
+      const j = (cur / N) | 0;
+      const ch = L.floorH[L.idx(clamp(i + ox, 0, L.w - 1), clamp(j + oz, 0, L.h - 1))];
+      for (const [ni, nj] of [[i + 1, j], [i - 1, j], [i, j + 1], [i, j - 1]]) {
+        if (ni < 0 || nj < 0 || ni >= N || nj >= N) continue;
+        const n = nj * N + ni;
+        if (f[n] <= f[cur] + 1) continue;
+        if (L.blocked(ni + ox, nj + oz, ch, false, true)) continue;
+        f[n] = f[cur] + 1;
+        q.push(n);
+      }
+    }
+  }
+
+  /** Unit direction down the flow field, or null. @param {number} x @param {number} z */
+  flowDir(x, z) {
+    const N = 48;
+    const i = Math.floor(x) - this.flowOx;
+    const j = Math.floor(z) - this.flowOz;
+    if (i < 0 || j < 0 || i >= N || j >= N) return null;
+    const here = this.flow[j * N + i];
+    if (here >= 32767) return null;
+    let tx = this.player.x;
+    let tz = this.player.z;
+    if (here > 0) {
+      let best = here;
+      for (const [ni, nj] of [[i + 1, j], [i - 1, j], [i, j + 1], [i, j - 1]]) {
+        if (ni < 0 || nj < 0 || ni >= N || nj >= N) continue;
+        const v = this.flow[nj * N + ni];
+        if (v < best) { best = v; tx = ni + this.flowOx + 0.5; tz = nj + this.flowOz + 0.5; }
+      }
+      if (best === here) return null;
+    }
+    const dx = tx - x;
+    const dz = tz - z;
+    const d = Math.hypot(dx, dz) || 1;
+    return { x: dx / d, z: dz / d };
+  }
+
+  /**
+   * Grid path for townsfolk (BFS inside a box around both ends; doors count as open).
+   * @param {number} x0 @param {number} z0 @param {number} x1 @param {number} z1 @returns {{x:number, z:number}[]}
+   */
+  findPath(x0, z0, x1, z1) {
+    const L = this.level;
+    const pad = 8;
+    const ax = Math.max(0, Math.floor(Math.min(x0, x1)) - pad);
+    const az = Math.max(0, Math.floor(Math.min(z0, z1)) - pad);
+    const bx = Math.min(L.w - 1, Math.floor(Math.max(x0, x1)) + pad);
+    const bz = Math.min(L.h - 1, Math.floor(Math.max(z0, z1)) + pad);
+    const W = bx - ax + 1;
+    const H = bz - az + 1;
+    const prev = new Int32Array(W * H).fill(-1);
+    const s = (Math.floor(z0) - az) * W + (Math.floor(x0) - ax);
+    const goal = (Math.floor(z1) - az) * W + (Math.floor(x1) - ax);
+    if (s < 0 || goal < 0 || s >= W * H || goal >= W * H) return [];
+    prev[s] = s;
+    const q = [s];
+    for (let h = 0; h < q.length && prev[goal] < 0; h++) {
+      const cur = q[h];
+      const i = (cur % W) + ax;
+      const j = Math.floor(cur / W) + az;
+      const ch = L.floorH[L.idx(i, j)];
+      for (const [ni, nj] of [[i + 1, j], [i - 1, j], [i, j + 1], [i, j - 1]]) {
+        if (ni < ax || nj < az || ni > bx || nj > bz) continue;
+        const n = (nj - az) * W + (ni - ax);
+        if (prev[n] >= 0) continue;
+        const k = L.idx(ni, nj);
+        if (L.wall[k] || L.hazard[k] || Math.abs(L.floorH[k] - ch) > STEP) continue;
+        prev[n] = cur;
+        q.push(n);
+      }
+    }
+    if (prev[goal] < 0) return [];
+    const path = [{ x: x1, z: z1 }];
+    for (let cur = prev[goal]; cur !== s; cur = prev[cur]) path.unshift({ x: (cur % W) + ax + 0.5, z: Math.floor(cur / W) + az + 0.5 });
+    return path;
+  }
+
+  /** NPCs open doors on their path. @param {number} x @param {number} z */
+  holdDoorAt(x, z) {
+    const L = this.level;
+    const i = Math.floor(x);
+    const j = Math.floor(z);
+    if (!L.inBounds(i, j)) return;
+    const d = L.doorAt[L.idx(i, j)];
+    if (d >= 0) L.doors[d].hold = 1.2;
+  }
+
+  /** Basalt Wardens shield nearby allies. */
+  _shields() {
+    for (const e of this.enemies) e.shielded = false;
+    for (const g of this.enemies) {
+      if (!g.alive || g.kind !== 'golem' || !g.awake) continue;
+      for (const e of this.enemies) if (e !== g && e.kind !== 'golem' && e.alive && Math.hypot(e.x - g.x, e.z - g.z) < 5.5) e.shielded = true;
+    }
+  }
+
+  _separate() {
+    const list = this.enemies;
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      for (let j = i + 1; j < list.length; j++) {
+        const b = list[j];
+        const dx = b.x - a.x;
+        const dz = b.z - a.z;
+        const d = Math.hypot(dx, dz);
+        const min = a.radius + b.radius;
+        if (d >= min || d < 1e-4) continue;
+        const push = (min - d) / 2;
+        this.level.move(a, (-dx / d) * push, (-dz / d) * push, a.radius, a.y, false, true);
+        this.level.move(b, (dx / d) * push, (dz / d) * push, b.radius, b.y, false, true);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Combat
+  // -------------------------------------------------------------------------
+
+  /**
+   * @param {Enemy} e @param {number} amt @param {number} sx @param {number} sz @param {number} knock
+   * @param {{burn?:boolean, slow?:boolean, quiet?:boolean}} o
+   */
+  damageEnemy(e, amt, sx, sz, knock, o) {
+    if (!e.alive || e.state === 'fall') return;
+    e.hp -= e.shielded ? amt * 0.25 : amt;
+    e.flash = 0.1;
+    e.wake();
+    if (o.burn) e.burn = 3;
+    if (o.slow) e.slow = 3;
+    if (!o.quiet) {
+      this.audio.enemyHit();
+      this.hitmarker = 0.15;
+    }
+    if (knock) {
+      const dx = e.x - sx;
+      const dz = e.z - sz;
+      const d = Math.hypot(dx, dz) || 1;
+      const k = e.kind === 'golem' ? knock * 0.3 : knock;
+      e.kx += (dx / d) * k;
+      e.kz += (dz / d) * k;
+    }
+    if (e.hp <= 0) this.killEnemy(e, '');
+  }
+
+  /** @param {Enemy} e @param {string} how */
+  killEnemy(e, how) {
+    if (!e.alive) return;
+    e.alive = false;
+    this.world.killed[e.key] = true;
+    this.audio.enemyDie();
+    this.burst(e.x, e.y + 1, e.z, 16, [1.4, 1.0, 0.45], 3);
+    if (how) this.notify(`The ${e.name} ${how}.`);
+    if (e.state !== 'fall' && Math.random() < 0.4) {
+      const drop = ['scrap', 'crystal', 'salt', 'ammo_shard'][Math.floor(Math.random() * 4)];
+      const p = this.level.addProp('item', ITEMS[drop].sprite, e.x, e.z, { size: 0.6, data: { item: drop, qty: drop === 'ammo_shard' ? 6 : 1 } });
+      this.level._indexProp(p);
+    }
+    if (this.contracts.wardens?.kind === 'bounty' && this.contractReady(this.contracts.wardens)) this.notify('Bounty complete: report to Captain Marr.');
+  }
+
+  /** Knocked-back constructs meet hazards. @param {Enemy} e */
+  hazardCheck(e) {
+    const hz = this.level.hazardAt(e.x, e.z);
+    if (hz === HAZARD.CHASM) {
+      e.state = 'fall';
+      e.t = 1;
+      e.pushed = 0;
+      this.audio.thud();
+    } else if (hz === HAZARD.DEEP) {
+      e.pushed = 0;
+      this.audio.splash();
+      this.burst(e.x, e.y + 0.5, e.z, 14, [0.5, 0.9, 1.4], 3);
+      this.damageEnemy(e, 70, e.x, e.z, 0, {});
+      if (!e.alive) this.notify(`The ${e.name} shorted out in the water.`);
+    } else if (hz === HAZARD.VENT) {
+      e.pushed = 0;
+      this.damageEnemy(e, 35, e.x, e.z, 0, { burn: true });
+    }
+  }
+
+  /**
+   * Resolve an attack on the player: timed parry, block, armour, then damage.
+   * @param {number} dmg @param {Enemy|null} attacker null for hazards and orbs @returns {boolean} damage landed
+   */
+  hurtPlayer(dmg, attacker) {
+    const p = this.player;
+    const c = this.char;
+    if (this.dead || p.iframes > 0) return false;
+    if (attacker && p.parryT > 0) {
+      attacker.stagger = c.has('riposte') ? 2 : 1.2;
+      attacker.flash = 0.1;
+      if (c.has('riposte')) p.riposte = true;
+      this.audio.block();
+      this.fx.parry = 1;
+      this.exercise('blade', 1.5);
+      this.notify('Parried!');
+      return false;
+    }
+    if (attacker && p.blocking) {
+      dmg *= 0.35;
+      c.stamina = Math.max(0, c.stamina - dmg * 2);
+      this.audio.block();
+    }
+    if (attacker) dmg *= 25 / (25 + c.armor);
+    c.hp -= dmg;
+    p.iframes = 0.25;
+    this.fx.hurt = 1;
+    this.audio.hurt();
+    return true;
+  }
+
+  /** Turn enemy orbs in front of the player. @param {number} range */
+  tryDeflect(range) {
+    const p = this.player;
+    const fx = Math.cos(p.yaw);
+    const fz = Math.sin(p.yaw);
+    let any = false;
+    for (const o of this.orbs) {
+      if (o.owner !== 'enemy') continue;
+      const dx = o.x - p.x;
+      const dz = o.z - p.z;
+      const d = Math.hypot(dx, dz);
+      if (d > range || (d > 0.6 && (dx * fx + dz * fz) / d < 0.2)) continue;
+      o.owner = 'player';
+      o.angle = p.yaw;
+      o.speed *= 2;
+      o.life = 4;
+      any = true;
+      this.burst(o.x, o.y, o.z, 8, [1.6, 1.3, 0.5], 2);
+    }
+    if (any) {
+      this.audio.deflect();
+      this.fx.parry = 1;
+      this.exercise('blade', 1);
+    }
+  }
+
+  /** @param {Enemy} e @param {number} angle */
+  spawnOrb(e, angle) {
+    this.orbs.push(new Orb(e.x + Math.cos(angle) * 0.5, e.y + 1.2, e.z + Math.sin(angle) * 0.5, angle, e.dmg));
+    this.audio.enemyShoot();
+  }
+
+  /** @param {number} x @param {number} z @param {number} maxD @returns {Enemy|null} */
+  nearestEnemy(x, z, maxD) {
+    let best = null;
+    let bd = maxD;
+    for (const e of this.enemies) {
+      const d = Math.hypot(e.x - x, e.z - z);
+      if (e.alive && d < bd) { bd = d; best = e; }
+    }
+    return best;
+  }
+
+  /** Kinetic Push spell: cone of force that shoves constructs into hazards. @param {number} power */
+  kineticPush(power) {
+    const p = this.player;
+    const fx = Math.cos(p.yaw);
+    const fz = Math.sin(p.yaw);
+    for (const e of this.enemies) {
+      const dx = e.x - p.x;
+      const dz = e.z - p.z;
+      const d = Math.hypot(dx, dz);
+      if (d > 4 || (d > 0.3 && (dx * fx + dz * fz) / d < 0.5)) continue;
+      const k = (e.kind === 'golem' ? 5 : 10) * power;
+      e.kx += (dx / (d || 1)) * k;
+      e.kz += (dz / (d || 1)) * k;
+      e.pushed = 1;
+      e.stagger = 0.6;
+      e.wake();
+    }
+  }
+
+  /** Unlock spell on the lock in front of the player. @param {number} lore @returns {boolean} */
+  castUnlock(lore) {
+    const t = this.findInteract();
+    const target = t?.kind === 'door' ? t.ref : t?.kind === 'prop' && t.ref.kind === 'chest' ? t.ref : null;
+    if (!target) {
+      this.notify('There is no lock before you.');
+      return false;
+    }
+    const door = t?.kind === 'door' ? /** @type {Door} */ (target) : null;
+    const prop = t?.kind === 'prop' ? /** @type {Prop} */ (target) : null;
+    const level = door ? door.lockLevel : prop?.data.lockLevel ?? 0;
+    const locked = door ? door.locked && !door.puzzle : (prop?.data.lockLevel ?? 0) > 0 && !this.world.loot[prop?.key ?? ''];
+    if (!locked) {
+      this.notify('That is not locked.');
+      return false;
+    }
+    if (!(door?.magic) && level > 1 + Math.floor(lore / 2)) {
+      this.notify('The lock resists your Unlock. Train Aether Lore.');
+      return false;
+    }
+    this._unlocked(door, prop);
+    return true;
+  }
+
+  /** @param {Door|null} door @param {Prop|null} prop */
+  _unlocked(door, prop) {
+    this.audio.lockOpen();
+    if (door) {
+      door.locked = false;
+      door.magic = false;
+      this.world.doors[door.key] = { locked: false, shut: door.shut };
+    }
+    if (prop) {
+      prop.data.lockLevel = 0;
+      this.world.loot[prop.key] = this.world.loot[prop.key] ?? prop.data.loot ?? [];
+    }
+    this.notify('Unlocked.');
+  }
+
+  /** @param {number} x @param {number} y @param {number} z @param {number} n @param {number[]} tint @param {number} speed */
+  burst(x, y, z, n, tint, speed) {
+    for (let k = 0; k < n; k++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = speed * (0.3 + Math.random() * 0.7);
+      this.particles.push(new Particle(x, y, z, Math.cos(a) * s, 1 + Math.random() * speed, Math.sin(a) * s, 0.4 + Math.random() * 0.5, 0.25, tint));
+    }
+  }
+
+  /** @param {number} x @param {number} z @param {boolean} deep */
+  footstep(x, z, deep) {
+    const t = this.level.floorTex[this.level.idx(Math.floor(x), Math.floor(z))];
+    const surface = deep || (this.level.waterLevel > this.level.heightAt(x, z)) ? 'water'
+      : t === TILE.PLANK ? 'wood' : t === TILE.GRASS || t === TILE.FEN ? 'grass' : t === TILE.DUST || t === TILE.BASALT ? 'dirt'
+        : t === TILE.OBS_FLOOR || t === TILE.LEY_FLOOR ? 'metal' : 'stone';
+    this.audio.footstep(surface);
+  }
+
+  _die() {
+    this.dead = true;
+    this.char.hp = 0;
+    this.audio.defeat();
+  }
+
+  // -------------------------------------------------------------------------
+  // Character helpers used by dialogue, UI and entities
+  // -------------------------------------------------------------------------
+
+  /** @param {string} text */
+  notify(text) {
+    this.notes.push({ text, t: 4.5 });
+    if (this.notes.length > 6) this.notes.shift();
+  }
+
+  /** @param {string} skill @param {number} amount */
+  exercise(skill, amount) {
+    const r = this.char.exercise(skill, amount);
+    for (const t of r.text) this.notify(t);
+    if (r.levelUp) this.audio.levelUp();
+    else if (r.skillUp) this.audio.skillUp();
+  }
+
+  /** @param {number} n */
+  addShards(n) {
+    this.char.shards = Math.max(0, this.char.shards + n);
+    if (n > 0) this.notify(`+${n} Aether Shards`);
+  }
+
+  /** @param {string} faction @param {number} n */
+  changeRep(faction, n) {
+    this.factions.rep[faction] = (this.factions.rep[faction] || 0) + n;
+    this.notify(`${FACTIONS[faction]} reputation ${n >= 0 ? '+' : ''}${n}`);
+  }
+
+  /** Add items (shards go to the purse), wire weapons into the hotbar, fire quest hooks. @param {string} id @param {number} qty */
+  give(id, qty) {
+    const c = this.char;
+    if (id === 'shards') {
+      this.addShards(qty);
+      return;
+    }
+    c.inventory.add(id, qty);
+    this.notify(`+${qty > 1 ? `${qty} ` : ''}${ITEMS[id].name}`);
+    const def = ITEMS[id];
+    if (def.type === 'weapon' && !c.hotbar.some((s) => s && s.id === id)) {
+      const free = c.hotbar.indexOf(null);
+      if (free >= 0) c.hotbar[free] = { kind: 'item', id };
+      if (!c.equip.main) this.selectSlot(c.hotbar.findIndex((s) => s?.id === id));
+    }
+    if (def.type === 'offhand' && !c.equip.off) c.equip.off = id;
+    if (def.type === 'rune') this.notify('Inscribe runes into spells from the Skills panel (K).');
+    if (id === 'core' && this.mainStage === 30) this.setMain(40, 'I recovered the Resonant Core from the Drowned Shrine. Master Vance will want to see it.');
+  }
+
+  /** @param {number} i */
+  selectSlot(i) {
+    const s = this.char.hotbar[i];
+    if (!s) return;
+    if (this.hotIndex !== i) this.audio.swap();
+    this.hotIndex = i;
+    if (s.kind === 'item' && ITEMS[s.id]?.type === 'weapon') this.char.equip.main = s.id;
+  }
+
+  /** @param {number} d */
+  cycleSlot(d) {
+    const hb = this.char.hotbar;
+    for (let k = 1; k <= hb.length; k++) {
+      const i = (this.hotIndex + d * k + hb.length * 6) % hb.length;
+      if (hb[i]) { this.selectSlot(i); return; }
+    }
+  }
+
+  selectedSlot() {
+    const s = this.char.hotbar[this.hotIndex];
+    if (s && s.kind === 'item' && !this.char.inventory.count(s.id)) return null;
+    return s;
+  }
+
+  /** @param {string} id @param {string} title @param {string} text @param {Marker|null} [marker] */
+  startQuest(id, title, text, marker = null) {
+    this.quests.start(id, title, id.startsWith('contract') ? 'guild' : 'town');
+    this.quests.update(id, 10, text, this.day, marker);
+    this.audio.quest();
+    this.notify(`New quest: ${title}`);
+  }
+
+  /** @param {string} id @param {string} text */
+  finishQuest(id, text) {
+    this.quests.complete(id, text, this.day);
+    this.audio.quest();
+    this.notify(`Quest complete: ${this.quests.get(id)?.title}`);
+  }
+
+  /** Advance the main quest with a journal entry and a compass marker. @param {number} stage @param {string} text */
+  setMain(stage, text) {
+    const vance = () => {
+      const def = this.getLevel('overworld').npcDefs.find((d) => d.id === 'vance');
+      return def ? { level: 'overworld', x: def.spots.work.x, z: def.spots.work.z } : null;
+    };
+    /** @type {Record<number, () => Marker|null>} */
+    const markers = {
+      10: () => ({ level: 'observatory', x: 26.5, z: 20.5 }),
+      20: vance,
+      30: () => ({ level: 'overworld', x: SITES.drowned.x + 0.5, z: SITES.drowned.z + 0.5 }),
+      40: vance,
+      50: () => ({ level: 'overworld', x: SITES.gate.x + 0.5, z: SITES.gate.z + 0.5 }),
+    };
+    if (stage >= 100) {
+      const q = this.quests.get('main');
+      if (q) q.stage = stage;
+      this.quests.complete('main', text, this.day);
+    } else {
+      this.quests.update('main', stage, text, this.day, markers[stage]?.() ?? null);
+      this.notify('Journal updated (J)');
+    }
+    this.audio.quest();
+  }
+
+  /** @param {string} id @param {string} name */
+  discover(id, name) {
+    this.discovered.add(id);
+    this.exercise('wayfaring', 3);
+    this.notify(`Discovered: ${name}`);
+    const c = this.contracts.wardens;
+    if (c && c.kind === 'scout' && c.landmark === id) this.notify('Survey complete: report to Captain Marr.');
+  }
+
+  // -------------------------------------------------------------------------
+  // Contracts
+  // -------------------------------------------------------------------------
+
+  /** @param {'artificers'|'wardens'} guild @returns {Contract} */
+  offerContract(guild) {
+    const n = ++this.contracts.n;
+    const c = makeContract(guild, n, this.seed);
+    this.contracts[guild] = c;
+    /** @type {Marker|null} */
+    let marker = null;
+    if (c.dungeon) marker = { level: 'overworld', x: SITES[/** @type {'drowned'} */ (c.dungeon)].x + 0.5, z: SITES[/** @type {'drowned'} */ (c.dungeon)].z + 0.5 };
+    if (c.landmark) {
+      const lm = this.getLevel('overworld').landmarks.find((l) => l.id === c.landmark);
+      if (lm) marker = { level: 'overworld', x: lm.x, z: lm.z };
+    }
+    if (c.npc) {
+      const def = this.getLevel('overworld').npcDefs.find((d) => d.id === c.npc);
+      if (def) marker = { level: 'overworld', x: def.spots.work.x, z: def.spots.work.z };
+      this.give('parcel', 1);
+    }
+    this.startQuest(c.id, c.title, c.brief, marker);
+    return c;
+  }
+
+  /** @param {Contract} c */
+  contractReady(c) {
+    if (c.kind === 'relic') return this.char.inventory.count('relic') > 0;
+    if (c.kind === 'gather') return this.char.inventory.count(c.item ?? '') >= (c.count ?? 1);
+    if (c.kind === 'scout') return this.discovered.has(c.landmark ?? '');
+    if (c.kind === 'delivery') return !!c.delivered;
+    return this.getLevel(`dungeon:${c.dungeon}`).spawns.every((s) => this.world.killed[s.key]);
+  }
+
+  /** @param {'artificers'|'wardens'} guild @returns {string} */
+  completeContract(guild) {
+    const c = this.contracts[guild];
+    if (!c || !this.contractReady(c)) return 'The work is not finished.';
+    if (c.kind === 'relic') this.char.inventory.remove('relic', 1);
+    if (c.kind === 'gather') this.char.inventory.remove(c.item ?? '', c.count ?? 1);
+    this.addShards(c.reward);
+    this.changeRep(guild, 10);
+    this.exercise('wayfaring', 2);
+    this.finishQuest(c.id, `Completed: ${c.title}.`);
+    this.contracts[guild] = null;
+    if (guild === 'wardens' && !this.flags.levisGiven) {
+      this.flags.levisGiven = true;
+      this.give('rune_levis', 1);
+      return 'Good work, Warden. Take my Levis stone; with Vis it will carry you across the chasm to the Hollow Spire.';
+    }
+    return 'Good work. The ledger is square.';
+  }
+
+  /** @param {'artificers'|'wardens'} guild */
+  abandonContract(guild) {
+    const c = this.contracts[guild];
+    if (!c) return;
+    if (c.kind === 'delivery') this.char.inventory.remove('parcel', 1);
+    this.quests.complete(c.id, 'Abandoned.', this.day);
+    this.contracts[guild] = null;
+    this.changeRep(guild, -5);
+  }
+
+  // -------------------------------------------------------------------------
+  // Interaction
+  // -------------------------------------------------------------------------
+
+  /** Best thing to interact with in front of the player. @returns {Interactable|null} */
+  findInteract() {
+    const p = this.player;
+    const L = this.level;
+    const fx = Math.cos(p.yaw);
+    const fz = Math.sin(p.yaw);
+    /** @type {Interactable|null} */
+    let best = null;
+    let bd = 2.6;
+    /** @param {number} x @param {number} z @param {number} r */
+    const score = (x, z, r) => {
+      const dx = x - p.x;
+      const dz = z - p.z;
+      const d = Math.hypot(dx, dz);
+      if (d > r) return Infinity;
+      if (d > 0.9 && (dx * fx + dz * fz) / d < 0.55) return Infinity;
+      return d;
+    };
+    for (const n of this.npcs) {
+      const d = score(n.x, n.z, 2.6);
+      if (d < bd) { bd = d; best = { kind: 'npc', ref: n, label: `Speak to ${n.def.name}` }; }
+    }
+    for (const k of this.streamer.active) {
+      for (const pr of L.propChunks.get(k) ?? []) {
+        if (pr.gone || pr.kind === 'decor') continue;
+        const d = score(pr.x, pr.z, 2.4);
+        if (d < bd) { bd = d; best = { kind: 'prop', ref: pr, label: this._propLabel(pr) }; }
+      }
+    }
+    for (const t of [0.7, 1.3, 1.9]) {
+      const i = Math.floor(p.x + fx * t);
+      const j = Math.floor(p.z + fz * t);
+      if (!L.inBounds(i, j)) continue;
+      const di = L.doorAt[L.idx(i, j)];
+      if (di < 0) continue;
+      const d = L.doors[di];
+      if (t < bd) best = { kind: 'door', ref: d, label: this._doorLabel(d) };
+      break;
+    }
+    return best;
+  }
+
+  /** @param {Prop} p */
+  _propLabel(p) {
+    const lockLevel = p.data.lockLevel ?? 0;
+    switch (p.kind) {
+      case 'chest': return lockLevel > 0 && !this.world.loot[p.key] ? `Pick Lock (Lv ${lockLevel}) - Chest` : 'Open Chest';
+      case 'book': return 'Read Tablet';
+      case 'bed': return p.data.rent ? 'Sleep (rented bed)' : p.data.owned ? 'Sleep (someone\'s bed)' : 'Rest';
+      case 'campfire': return 'Rest by the fire';
+      case 'lever': return 'Pull Lever';
+      case 'item': return `Take ${ITEMS[p.data.item]?.name ?? 'item'}`;
+      case 'herb': return `Harvest ${ITEMS[p.data.item].name}`;
+      case 'stairs': return p.data.label;
+      case 'landmark': return `Study ${p.data.name}`;
+      case 'notice': return 'Read the notice board';
+      case 'gatecore': return 'Examine the Great Astrolabe';
+      case 'anchor': return 'Examine Anchor';
+      default: return 'Use';
+    }
+  }
+
+  /** @param {Door} d */
+  _doorLabel(d) {
+    if (d.puzzle && d.locked) return `${d.name} (sealed by the anchors)`;
+    if (d.locked && d.magic) return `${d.name} (rune-sealed)`;
+    if (d.locked) return this.char.inventory.count(d.keyId ?? '') ? `Unlock ${d.name}` : `Pick Lock (Lv ${d.lockLevel}) - ${d.name}`;
+    return d.shut ? `Open ${d.name}` : `Close ${d.name}`;
+  }
+
+  /**
+   * Use whatever is in front of the player. Returns a UI request for the app, if any.
+   * @returns {{open:string, data?:any}|null}
+   */
+  interact() {
+    const t = this.findInteract();
+    if (!t) return null;
+    if (t.kind === 'npc') return { open: 'dialogue', data: t.ref };
+    if (t.kind === 'door') {
+      this._useDoor(t.ref);
+      return null;
+    }
+    const p = t.ref;
+    switch (p.kind) {
+      case 'chest':
+        if ((p.data.lockLevel ?? 0) > 0 && !this.world.loot[p.key]) {
+          if (!this._tryLock(p.data.lockLevel, null)) return null;
+          this._unlocked(null, p);
+        }
+        this.world.loot[p.key] = this.world.loot[p.key] ?? p.data.loot ?? [];
+        p.sprite = 'chest_open';
+        this.audio.creak();
+        return { open: 'loot', data: p };
+      case 'book':
+        return { open: 'read', data: p.data.book };
+      case 'notice':
+        return { open: 'read', data: `notice_${p.data.guild}` };
+      case 'bed':
+        if (p.data.owned) { this.notify('This bed belongs to someone.'); return null; }
+        if (p.data.rent && this.flags.rent !== p.data.rent) { this.notify('Rent a bed from the innkeeper first.'); return null; }
+        return { open: 'rest' };
+      case 'campfire':
+        return { open: 'rest' };
+      case 'lever':
+        this._pullLever(p);
+        return null;
+      case 'item':
+      case 'herb':
+        this.give(p.data.item, p.data.qty ?? 1);
+        p.gone = true;
+        this.world.gone[p.key] = true;
+        this.audio.pickup();
+        return null;
+      case 'stairs':
+        this.pendingTravel = p.data.portal;
+        return null;
+      case 'landmark':
+        if (!this.discovered.has(p.data.id)) this.discover(p.data.id, p.data.name);
+        this.notify(`${p.data.name}: the ley hums here.`);
+        this.char.mana = this.char.maxMana;
+        return null;
+      case 'gatecore':
+        this._useGateCore();
+        return null;
+      case 'anchor':
+        this.notify(this._anchors()[p.data.index] ? 'The anchor sings.' : 'The anchor is dark.');
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  /** @param {Door} d */
+  _useDoor(d) {
+    if (d.puzzle && d.locked) {
+      this.notify('The Great Astrolabe Gate will not move while its anchors are dark.');
+      return;
+    }
+    if (d.locked) {
+      if (d.magic) { this.notify('A rune seal holds this door. Only the Unlock rune will open it.'); return; }
+      if (!this._tryLock(d.lockLevel, d.keyId)) return;
+      this._unlocked(d, null);
+    }
+    d.shut = !d.shut;
+    this.world.doors[d.key] = { locked: d.locked, shut: d.shut };
+    this.audio.creak();
+  }
+
+  /**
+   * Key, or lockpick attempt scaled by Artificing and Finesse.
+   * @param {number} level @param {string|null} keyId @returns {boolean} unlocked
+   */
+  _tryLock(level, keyId) {
+    const c = this.char;
+    if (keyId && c.inventory.count(keyId)) return true;
+    if (!c.inventory.count('lockpick')) {
+      this.notify(`Locked (Lv ${level}). You need a key, a lockpick, or the Unlock rune.`);
+      return false;
+    }
+    for (let k = 0; k < 3; k++) setTimeout(() => this.audio.lockClick(), k * 90);
+    const chance = clamp(0.35 + 0.15 * (c.skill('artificing') - level) + c.attrs.finesse * 0.02 + (c.has('steady') ? 0.15 : 0), 0.05, 0.95);
+    if (Math.random() < chance) {
+      this.exercise('artificing', 1 + level);
+      return true;
+    }
+    this.exercise('artificing', 0.3);
+    if (Math.random() < (c.has('steady') ? 0.25 : 0.5)) {
+      c.inventory.remove('lockpick', 1);
+      this.audio.lockBreak();
+      this.notify('Your lockpick snapped.');
+    } else this.notify('The pick slips. Try again.');
+    return false;
+  }
+
+  _anchors() {
+    const lit = [...ANCHOR_START];
+    this.flags.levers.forEach((/** @type {boolean} */ on, /** @type {number} */ i) => {
+      if (on) for (const a of LEVER_MAP[i]) lit[a] = !lit[a];
+    });
+    return lit;
+  }
+
+  /** @param {Prop} p */
+  _pullLever(p) {
+    const i = p.data.index;
+    this.flags.levers[i] = !this.flags.levers[i];
+    this.audio.creak();
+    this.audio.chime(this.flags.levers[i] ? 1320 : 990);
+    const lit = this._anchors();
+    if (lit.every(Boolean) && !this.flags.gateOpen) {
+      this.flags.gateOpen = true;
+      const gate = this.level.doors.find((d) => d.puzzle);
+      if (gate) {
+        gate.locked = false;
+        gate.shut = false;
+        this.world.doors[gate.key] = { locked: false, shut: false };
+      }
+      this.audio.gateOpen();
+      this.notify('All three anchors sing. The Great Astrolabe Gate grinds open!');
+    }
+  }
+
+  _useGateCore() {
+    if (this.mainStage >= 100) { this.notify('The Great Astrolabe turns, true and steady.'); return; }
+    if (this.mainStage !== 50 || !this.char.inventory.count('core')) {
+      this.notify(this.mainStage < 50 ? 'The armillary is still. Its heart is missing.' : 'You need the attuned Resonant Core.');
+      return;
+    }
+    this.char.inventory.remove('core', 1);
+    this.flags.ending = true;
+    this.setMain(100, 'I seated the Resonant Core in the Great Astrolabe. The ley-lines are drawing true again across the Shardlands.');
+    this.exercise('aether', 6);
+    this.addShards(150);
+    this.audio.victory();
+    this.burst(27, 2, 15.5, 40, [0.5, 1.4, 1.8], 5);
+  }
+
+  /** Sleep: advance the clock and recover. @param {number} hours @returns {string|null} error */
+  rest(hours) {
+    const p = this.player;
+    if (this.enemies.some((e) => e.awake && e.state !== 'home' && Math.hypot(e.x - p.x, e.z - p.z) < 20)) return 'You cannot rest with enemies nearby.';
+    const c = this.char;
+    this.minutes += hours * 60;
+    c.hp = Math.min(c.maxHp, c.hp + hours * 14);
+    c.mana = Math.min(c.maxMana, c.mana + hours * 20);
+    c.stamina = c.maxStamina;
+    this.notify(`You rested ${hours} hour${hours > 1 ? 's' : ''}.`);
+    for (const n of this.npcs) n.thinkT = 0;
+    this.save(true);
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Trade
+  // -------------------------------------------------------------------------
+
+  /** @param {string} shop */
+  stock(shop) {
+    const s = this.shopStock[shop];
+    if (!s || s.day !== this.day) this.shopStock[shop] = { day: this.day, items: SHOPS[shop].items.map(([id, n]) => [id, n]) };
+    return this.shopStock[shop].items;
+  }
+
+  /** @param {string} shop @param {string} id @returns {string|null} error */
+  buy(shop, id) {
+    const items = this.stock(shop);
+    const row = items.find((r) => r[0] === id);
+    const price = buyPrice(this.char, id, this.factions.rep[SHOPS[shop].town] || 0);
+    if (!row || row[1] <= 0) return 'Sold out.';
+    if (this.char.shards < price) return 'Not enough Aether Shards.';
+    this.char.shards -= price;
+    row[1]--;
+    this.give(id, 1);
+    this.audio.coins();
+    this.exercise('wayfaring', 0.5);
+    return null;
+  }
+
+  /** @param {string} shop @param {string} id @returns {string|null} error */
+  sell(shop, id) {
+    const c = this.char;
+    if (ITEMS[id].value <= 0) return 'They will not buy that.';
+    if (Object.values(c.equip).includes(id) && c.inventory.count(id) <= 1) return 'Unequip it first.';
+    if (!c.inventory.remove(id, 1)) return null;
+    c.shards += sellPrice(c, id, this.factions.rep[SHOPS[shop].town] || 0);
+    const row = this.stock(shop).find((r) => r[0] === id);
+    if (row) row[1]++;
+    else this.stock(shop).push([id, 1]);
+    this.audio.coins();
+    this.exercise('wayfaring', 0.5);
+    return null;
+  }
+
+  /** Use, equip or read an inventory item. @param {string} id @returns {{open:string, data?:any}|null} */
+  useItem(id) {
+    const c = this.char;
+    const def = ITEMS[id];
+    if (def.type === 'weapon') {
+      c.equip.main = id;
+      const slot = c.hotbar.findIndex((s) => s?.id === id);
+      if (slot >= 0) this.hotIndex = slot;
+    } else if (def.type === 'offhand') c.equip.off = c.equip.off === id ? null : id;
+    else if (def.type === 'armor') c.equip.armor = c.equip.armor === id ? null : id;
+    else if (def.type === 'relic') {
+      c.equip.relic = c.equip.relic === id ? null : id;
+      c.mana = Math.min(c.mana, c.maxMana);
+    } else if (def.type === 'ammo') {
+      c.ammo = id;
+      this.notify(`Loaded ${def.name}.`);
+    } else if (def.type === 'book') return { open: 'read', data: def.book };
+    else if (def.type === 'consumable') {
+      if (!c.inventory.remove(id, 1)) return null;
+      if (def.heal) c.hp = Math.min(c.maxHp, c.hp + def.heal);
+      if (def.mana) c.mana = Math.min(c.maxMana, c.mana + def.mana);
+      if (def.oil) c.effects[def.oil === 'ember' ? 'oil_ember' : 'oil_frost'] = 90;
+      if (def.heal && def.value < 5) this.audio.eat();
+      else this.audio.brew();
+    }
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Rendering feeds
+  // -------------------------------------------------------------------------
+
+  /** @returns {SpriteDesc[]} */
+  collectSprites() {
+    const L = this.level;
+    const p = this.player;
+    /** @type {SpriteDesc[]} */
+    const out = [];
+    const lit = this._anchors();
+    const glowy = new Set(['pylon', 'stones', 'herb_bloom', 'herb_moss', 'tablet', 'anchor', 'gate_core', 'vent', 'campfire_a', 'stairs', 'rune_lux', 'rune_vita', 'rune_vis', 'rune_aperio', 'rune_levis', 'i_core', 'i_crystal']);
+    for (const k of this.streamer.active) {
+      for (const pr of L.propChunks.get(k) ?? []) {
+        if (pr.gone) continue;
+        if ((pr.x - p.x) ** 2 + (pr.z - p.z) ** 2 > 75 * 75) continue;
+        let sprite = pr.sprite;
+        let tint = [1, 1, 1];
+        if (pr.kind === 'lever') sprite = this.flags.levers[pr.data.index] ? 'lever_down' : 'lever_up';
+        if (pr.kind === 'chest' && this.world.loot[pr.key] && (this.world.loot[pr.key].length === 0 || pr.sprite === 'chest_open')) sprite = 'chest_open';
+        if (pr.kind === 'campfire') sprite = Math.floor(this.time * 6) % 2 ? 'campfire_b' : 'campfire_a';
+        if (pr.kind === 'anchor') tint = lit[pr.data.index] ? [1.3, 1.3, 1.4] : [0.3, 0.35, 0.45];
+        if (pr.kind === 'gatecore') tint = this.flags.ending ? [1.4, 1.4, 1.4] : [0.55, 0.6, 0.7];
+        const emit = glowy.has(sprite) && !(pr.kind === 'anchor' && !lit[pr.data.index]) ? 1 : pr.kind === 'item' ? 1 : 0;
+        out.push({ x: pr.x, y: L.heightAt(pr.x, pr.z) + pr.lift, z: pr.z, w: pr.size, h: pr.size, frame: SPR[sprite], emit, tint, sky: L.covered(pr.x, pr.z) ? 0 : 1 });
+      }
+    }
+    for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 75 * 75) out.push(e.getSprite());
+    for (const n of this.npcs) if ((n.x - p.x) ** 2 + (n.z - p.z) ** 2 < 75 * 75) out.push(n.getSprite(L));
+    for (const o of this.orbs) out.push(o.getSprite());
+    for (const s of this.projectiles) out.push(s.getSprite());
+    for (const q of this.particles) out.push(q.getSprite());
+    return out;
+  }
+
+  /** @returns {Light[]} */
+  collectLights() {
+    const L = this.level;
+    const p = this.player;
+    const c = this.char;
+    /** @type {Light[]} */
+    const out = [];
+    for (const k of this.streamer.active) for (const l of L.lightChunks.get(k) ?? []) out.push(l);
+    const hand = { x: p.x + Math.cos(p.yaw) * 0.3, y: p.y + 1.4, z: p.z + Math.sin(p.yaw) * 0.3 };
+    if (c.equip.off === 'lantern') out.push({ ...hand, r: 1.5, g: 1.05, b: 0.55, flicker: 0.06 });
+    if (c.effects.lumina) out.push({ x: p.x, y: p.y + 2.2, z: p.z, r: 1.3, g: 1.6, b: 1.8 });
+    if (p.flash > 0) out.push({ ...hand, r: 1.6 * p.flash, g: 1.2 * p.flash, b: 0.8 * p.flash });
+    if (this.flags.ending && L.id === 'observatory') out.push({ x: 27, y: 2.5, z: 15.5, r: 0.6, g: 1.5, b: 2 });
+    for (const o of this.orbs) out.push(o.owner === 'enemy' ? { x: o.x, y: o.y, z: o.z, r: 0.7, g: 0.25, b: 1 } : { x: o.x, y: o.y, z: o.z, r: 0.2, g: 0.9, b: 1.1 });
+    for (const s of this.projectiles) if (s.ammo !== 'shard') out.push(s.ammo === 'flare' ? { x: s.x, y: s.y, z: s.z, r: 1.4, g: 0.6, b: 0.2 } : { x: s.x, y: s.y, z: s.z, r: 0.4, g: 0.8, b: 1.4 });
+    return out;
+  }
+
+  // -------------------------------------------------------------------------
+  // Save / load
+  // -------------------------------------------------------------------------
+
+  /** @param {boolean} [quiet] */
+  save(quiet = false) {
+    const p = this.player;
+    /** @type {Record<string, string>} */
+    const explored = {};
+    for (const [id, L] of this.levels) explored[id] = packBits(L.explored);
+    const data = {
+      v: 1, seed: this.seed, minutes: this.minutes, levelId: this.level.id,
+      player: { x: p.x, z: p.z, yaw: p.yaw }, char: this.char.toJSON(), quests: { quests: this.quests.quests, tracked: this.quests.tracked },
+      factions: this.factions, flags: this.flags, contracts: this.contracts, discovered: [...this.discovered], world: this.world,
+      markers: this.markers, explored, hotIndex: this.hotIndex, shopStock: this.shopStock,
+    };
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+      if (!quiet) this.notify('Game saved.');
+    } catch {
+      this.notify('Could not save: browser storage is unavailable.');
+    }
+  }
+
+  static hasSave() {
+    try {
+      return !!localStorage.getItem(SAVE_KEY);
+    } catch {
+      return false;
+    }
+  }
+
+  /** @param {AudioEngine} audio @returns {Game|null} */
+  static load(audio) {
+    let data;
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return null;
+      data = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+    if (!data || data.v !== 1) return null;
+    const g = new Game(audio, data.seed);
+    g.minutes = data.minutes;
+    g.char = Character.fromJSON(data.char);
+    g.quests.quests = data.quests.quests;
+    g.quests.tracked = data.quests.tracked;
+    g.factions = data.factions;
+    g.flags = data.flags;
+    g.contracts = data.contracts;
+    g.discovered = new Set(data.discovered);
+    g.world = data.world;
+    g.markers = data.markers || [];
+    g.hotIndex = data.hotIndex || 0;
+    g.shopStock = data.shopStock || {};
+    g.levels.clear();
+    for (const [id, b64] of Object.entries(data.explored || {})) unpackBits(/** @type {string} */ (b64), g.getLevel(id).explored);
+    g.enterLevel(data.levelId, data.player.x, data.player.z, data.player.yaw);
+    g.notify('Game loaded.');
+    return g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+const MOUSE_SENS = 0.0022;
+/** @type {Record<string, {x:number, y:number}>} */
+const TAP_DIRS = { KeyW: { x: 0, y: 1 }, KeyS: { x: 0, y: -1 }, KeyA: { x: -1, y: 0 }, KeyD: { x: 1, y: 0 } };
+
+export class Input {
+  constructor() {
+    /** @type {Set<string>} */
+    this.keys = new Set();
+    this.attackHeld = false;
+    this.attackPressed = false;
+    this.parryHeld = false;
+    this.parry = false;
+    this.dash = false;
+    this.jump = false;
+    this.slot = -1;
+    this.cycle = 0;
+    this.lookX = 0;
+    this.lookY = 0;
+    this.touchMove = { x: 0, y: 0 };
+    this.touchLook = { x: 0, y: 0 };
+    this.lastTap = { code: '', t: 0 };
+  }
+
+  /** @param {KeyboardEvent} e */
+  keyDown(e) {
+    if (e.repeat) return;
+    this.keys.add(e.code);
+    const dir = TAP_DIRS[e.code];
+    if (dir) {
+      const now = performance.now();
+      if (this.lastTap.code === e.code && now - this.lastTap.t < 250) {
+        this.dash = true;
+        this.lastTap.code = '';
+      } else this.lastTap = { code: e.code, t: now };
+    }
+    if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') this.dash = true;
+    if (e.code === 'Space') this.jump = true;
+    if (/^Digit[1-6]$/.test(e.code)) this.slot = Number(e.code.slice(5)) - 1;
+    if (e.code === 'KeyQ') this.cycle = 1;
+  }
+
+  /** @param {KeyboardEvent} e */
+  keyUp(e) {
+    this.keys.delete(e.code);
+  }
+
+  /** @returns {FrameInput} */
+  sample() {
+    const k = this.keys;
+    const right = (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0) - (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0);
+    const fwd = (k.has('KeyW') || k.has('ArrowUp') ? 1 : 0) - (k.has('KeyS') || k.has('ArrowDown') ? 1 : 0);
+    const curve = (/** @type {number} */ v) => Math.sign(v) * v * v;
+    /** @type {FrameInput} */
+    const s = {
+      moveX: right + this.touchMove.x, moveY: fwd - this.touchMove.y,
+      lookX: this.lookX + curve(this.touchLook.x) * 3.2 * STEP_DT, lookY: this.lookY + curve(this.touchLook.y) * 2.0 * STEP_DT,
+      attack: this.attackHeld, attackPressed: this.attackPressed, parry: this.parry, parryHeld: this.parryHeld,
+      dash: this.dash, jump: this.jump, slot: this.slot, cycle: this.cycle,
+    };
+    this.lookX = 0;
+    this.lookY = 0;
+    this.attackPressed = false;
+    this.parry = false;
+    this.dash = false;
+    this.jump = false;
+    this.slot = -1;
+    this.cycle = 0;
+    return s;
+  }
+
+  clearHeld() {
+    this.keys.clear();
+    this.attackHeld = false;
+    this.parryHeld = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DOM helpers & icons
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {string} tag @param {Record<string, any>} [props] @param {...any} kids
+ * @returns {HTMLElement}
+ */
+function h(tag, props = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'style') el.style.cssText = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'disabled') /** @type {any} */ (el).disabled = true;
+    else el.setAttribute(k, String(v));
+  }
+  for (const c of kids.flat(3)) if (c !== null && c !== undefined && c !== false) el.append(c instanceof Node ? c : String(c));
+  return el;
+}
+
+/** @param {string} id */
+function $(id) {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`Missing #${id}`);
+  return el;
+}
+
+/** @type {Map<string, string>} */
+const iconCache = new Map();
+/** @type {HTMLCanvasElement|null} */
+let ATLAS = null;
+
+/** Small <img> of a sprite frame. @param {string} sprite @param {number} [size] */
+function icon(sprite, size = 40) {
+  let url = iconCache.get(sprite);
+  if (!url && ATLAS) {
+    const c = document.createElement('canvas');
+    c.width = 64;
+    c.height = 64;
+    const g = c.getContext('2d');
+    if (g) {
+      g.imageSmoothingEnabled = false;
+      const r = spriteRect(SPR[sprite] ?? 0);
+      g.drawImage(ATLAS, r.sx, r.sy, r.size, r.size, 0, 0, 64, 64);
+    }
+    url = c.toDataURL();
+    iconCache.set(sprite, url);
+  }
+  return h('img', { src: url ?? '', width: size, height: size, class: 'icon', alt: '' });
+}
+
+/** @param {string} label @param {() => void} fn @param {boolean} [disabled] */
+const btn = (label, fn, disabled = false) => h('button', { class: 'brass-btn', type: 'button', onclick: fn, disabled }, label);
+
+// ---------------------------------------------------------------------------
+// HUD
+// ---------------------------------------------------------------------------
+
+const IVORY = '#f6e7c1';
+const BRASS = '#c99a48';
+const CYAN = '#3fe6ff';
+
+/**
+ * Draw a viewmodel frame, skipping its top texel row: when scaled, browsers sample one texel
+ * past the source rectangle, which would pull in the bottom row of the frame above in the atlas.
+ * @param {CanvasRenderingContext2D} c @param {HTMLCanvasElement} atlas @param {{sx:number, sy:number, size:number}} r
+ * @param {number} x @param {number} y @param {number} size
+ */
+function viewImage(c, atlas, r, x, y, size) {
+  const k = size / r.size;
+  c.drawImage(atlas, r.sx, r.sy + 1, r.size, r.size - 1, x, y + k, size, size - k);
+}
+
+/** @param {CanvasRenderingContext2D} c @param {number} x @param {number} y @param {number} w @param {number} frac @param {string} col @param {string} label */
+function tube(c, x, y, w, frac, col, label) {
+  c.fillStyle = 'rgba(12,8,20,0.75)';
+  c.fillRect(x - 2, y - 2, w + 4, 14);
+  c.fillStyle = col;
+  c.fillRect(x, y, w * clamp(frac, 0, 1), 10);
+  c.fillStyle = 'rgba(255,255,255,0.25)';
+  c.fillRect(x, y + 1, w * clamp(frac, 0, 1), 2);
+  c.strokeStyle = BRASS;
+  c.lineWidth = 2;
+  c.strokeRect(x - 2, y - 2, w + 4, 14);
+  c.fillStyle = IVORY;
+  c.font = '600 9px Georgia, serif';
+  c.textAlign = 'left';
+  c.textBaseline = 'middle';
+  c.fillText(label, x + 4, y + 5.5);
+}
+
+/**
+ * @param {CanvasRenderingContext2D} c @param {Game} g @param {HTMLCanvasElement} atlas
+ * @param {number} w @param {number} h @param {boolean} touch @param {Interactable|null} target
+ */
+function drawHud(c, g, atlas, w, h, touch, target) {
+  const p = g.player;
+  const ch = g.char;
+  // Viewmodels: weapon or casting hand on the right, lantern on the left.
+  const slot = g.selectedSlot();
+  const size = Math.min(w, h) * 0.55;
+  const bobX = Math.sin(p.bob) * 6;
+  const bobY = Math.abs(Math.cos(p.bob)) * 6;
+  c.imageSmoothingEnabled = false;
+  if (slot) {
+    /** @type {number} */
+    let view = VIEW.CAST;
+    if (slot.kind === 'item') {
+      if (slot.id === 'fork') view = p.swingT > 0 ? VIEW.FORK_SLASH : VIEW.FORK;
+      else if (slot.id === 'scatter') view = p.recoil > 0.5 ? VIEW.SCATTER_FIRE : VIEW.SCATTER;
+      else view = p.recoil > 0.5 ? VIEW.CROSSBOW_FIRE : VIEW.CROSSBOW;
+    }
+    const r = viewRect(view);
+    const lift = view === VIEW.CAST ? (p.castT > 0 ? -size * 0.08 : size * 0.12) : 0;
+    viewImage(c, atlas, r, w * 0.5 + size * 0.05 + bobX, h - size * 0.9 + bobY + p.recoil * 18 + lift + (p.blocking ? size * 0.15 : 0), size);
+  }
+  if (ch.equip.off === 'lantern') {
+    const r = viewRect(VIEW.LANTERN);
+    viewImage(c, atlas, r, w * 0.5 - size * 1.05 - bobX * 0.5, h - size * 0.85 + bobY, size);
+  }
+  // Crosshair and hit marker.
+  c.strokeStyle = p.parryT > 0 ? '#ffd36b' : 'rgba(246,231,193,0.85)';
+  c.lineWidth = 1.5;
+  c.beginPath();
+  c.arc(w / 2, h / 2, slot?.kind === 'spell' ? 9 : 5, 0, Math.PI * 2);
+  c.stroke();
+  if (g.hitmarker > 0) {
+    c.strokeStyle = '#ffd36b';
+    for (const [dx, dy] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+      c.beginPath();
+      c.moveTo(w / 2 + dx * 7, h / 2 + dy * 7);
+      c.lineTo(w / 2 + dx * 13, h / 2 + dy * 13);
+      c.stroke();
+    }
+  }
+  // Vitals.
+  const vx = 16;
+  // Touch layout stacks top-down: compass, HTML hotbar (34-84px), vitals | clock, then notes beside the drawer.
+  const vy = touch ? 96 : h - 70;
+  tube(c, vx, vy, 170, ch.hp / ch.maxHp, '#d8374a', `HEALTH ${Math.ceil(ch.hp)}/${ch.maxHp}`);
+  tube(c, vx, vy + 18, 170, ch.mana / ch.maxMana, '#3a7ae0', `AETHER ${Math.floor(ch.mana)}/${ch.maxMana}`);
+  tube(c, vx, vy + 36, 170, ch.stamina / ch.maxStamina, '#3aa860', `STAMINA ${Math.floor(ch.stamina)}`);
+  if (ch.encumbered) {
+    c.fillStyle = '#ff8a5a';
+    c.font = '600 11px Georgia, serif';
+    c.fillText('OVER-ENCUMBERED', vx, vy - 12);
+  }
+  // Compass.
+  const half = Math.min(220, w / 2 - 20);
+  const cx = w / 2;
+  const y = touch ? 18 : 22;
+  c.fillStyle = 'rgba(12,8,20,0.7)';
+  c.fillRect(cx - half, y - 12, half * 2, 24);
+  c.strokeStyle = BRASS;
+  c.lineWidth = 2;
+  c.strokeRect(cx - half, y - 12, half * 2, 24);
+  /** @param {number} a */
+  const toX = (a) => {
+    const d = angleDiff(a, p.yaw);
+    return { x: cx + (d / (Math.PI / 2)) * half, off: Math.abs(d) > Math.PI / 2, d };
+  };
+  c.font = '600 11px Georgia, serif';
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  for (const [a, label] of [[0, 'E'], [Math.PI / 2, 'S'], [Math.PI, 'W'], [-Math.PI / 2, 'N']]) {
+    const m = toX(/** @type {number} */ (a));
+    if (m.off) continue;
+    c.fillStyle = label === 'N' ? '#ff9a7a' : IVORY;
+    c.fillText(/** @type {string} */ (label), m.x, y);
+  }
+  /** @param {number} tx @param {number} tz @param {string} col @param {number} sizePx */
+  const marker = (tx, tz, col, sizePx) => {
+    const m = toX(Math.atan2(tz - p.z, tx - p.x));
+    const x = m.off ? cx + Math.sign(m.d) * (half - 6) : m.x;
+    c.fillStyle = col;
+    c.beginPath();
+    c.moveTo(x, y - sizePx);
+    c.lineTo(x + sizePx * 0.7, y);
+    c.lineTo(x, y + sizePx);
+    c.lineTo(x - sizePx * 0.7, y);
+    c.closePath();
+    c.fill();
+  };
+  const L = g.level;
+  if (L.outdoor) {
+    for (const lm of L.landmarks) {
+      if ((lm.kind === 'town' || g.discovered.has(lm.id)) && Math.hypot(lm.x - p.x, lm.z - p.z) < 160) marker(lm.x, lm.z, lm.kind === 'town' ? '#e8c779' : '#8fb0c0', 4);
+    }
+  }
+  for (const m of g.markers) if (m.level === L.id) marker(m.x, m.z, '#ff8ab0', 4);
+  const qm = g.quests.trackedMarker();
+  if (qm && qm.level === L.id) marker(qm.x, qm.z, CYAN, 7);
+  else if (qm) {
+    c.fillStyle = CYAN;
+    c.font = '600 9px Georgia, serif';
+    c.fillText('quest marker: another region', cx, y + 20);
+  }
+  // Clock and location.
+  const hh = Math.floor(g.hour);
+  const mm = Math.floor((g.hour - hh) * 60);
+  c.textAlign = 'right';
+  c.fillStyle = IVORY;
+  c.font = '600 12px Georgia, serif';
+  c.fillText(`Day ${g.day}  ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`, w - 16, touch ? 100 : 22);
+  c.fillText(g.locationName(), w - 16, touch ? 116 : 38);
+  let ey = touch ? 132 : 56;
+  for (const [k, v] of Object.entries(ch.effects)) {
+    const name = { lumina: 'Lumina', feather: 'Feather Step', oil_ember: 'Ember oil', oil_frost: 'Frost oil' }[/** @type {'lumina'} */ (k)] ?? k;
+    c.fillStyle = k === 'feather' && v < 3 ? '#ff8a5a' : CYAN;
+    c.fillText(`${name} ${Math.ceil(v)}s`, w - 16, ey);
+    ey += 15;
+  }
+  // Notifications.
+  c.textAlign = 'left';
+  const nx = touch ? 70 : 12;
+  const ny = touch ? 186 : 60;
+  g.notes.forEach((n, i) => {
+    c.globalAlpha = Math.min(1, n.t);
+    c.fillStyle = 'rgba(0,0,0,0.55)';
+    c.fillRect(nx, ny + i * 20 - 9, Math.min(touch ? w - nx - 8 : w * 0.5, 9 + n.text.length * 6.6), 18);
+    c.fillStyle = IVORY;
+    c.font = '600 12px Georgia, serif';
+    c.fillText(n.text, nx + 4, ny + i * 20, (touch ? w - nx - 8 : w * 0.5) - 8);
+  });
+  c.globalAlpha = 1;
+  // Interaction prompt and ammo readout.
+  c.textAlign = 'center';
+  // On touch, sit above the crosshair and between the left drawer and the right-hand buttons.
+  const py = touch ? Math.max(310, h / 2 - 40) : h * 0.62;
+  const maxW = touch ? w - 140 : w - 24;
+  if (target) {
+    c.font = '600 15px Georgia, serif';
+    const text = `${touch ? '' : '[E] '}${target.label}`;
+    const tw = Math.min(c.measureText(text).width, maxW);
+    c.fillStyle = 'rgba(12,8,20,0.7)';
+    c.fillRect(w / 2 - tw / 2 - 10, py - 13, tw + 20, 26);
+    c.fillStyle = IVORY;
+    c.fillText(text, w / 2, py, maxW);
+  }
+  if (slot?.kind === 'item' && ITEMS[slot.id]?.weapon === 'ranged') {
+    c.font = '600 12px Georgia, serif';
+    c.fillStyle = IVORY;
+    c.fillText(`${ITEMS[ch.ammo].name}: ${ch.inventory.count(ch.ammo)}  (R to switch)`, w / 2, touch ? py + 26 : h - 84);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// App: state machine, modals, loop
+// ---------------------------------------------------------------------------
+
+/** @typedef {'TITLE'|'EXPLORE'|'DIALOGUE'|'INVENTORY'|'SKILLS'|'JOURNAL'|'MAP'|'TRADE'|'LOOT'|'READ'|'REST'|'PAUSE'|'DEAD'|'ENDING'} AppState */
+
+class App {
+  constructor() {
+    this.canvas = /** @type {HTMLCanvasElement} */ ($('view'));
+    this.hud = /** @type {HTMLCanvasElement} */ ($('hud'));
+    const hctx = this.hud.getContext('2d');
+    if (!hctx) throw new Error('2D canvas is not available');
+    this.hctx = hctx;
+    this.renderer = new Renderer(this.canvas);
+    ATLAS = this.renderer.spriteAtlas;
+    this.audio = new AudioEngine();
+    this.input = new Input();
+    const params = new URLSearchParams(location.search);
+    this.fixedSeed = params.has('seed') ? Number(params.get('seed')) >>> 0 : 0;
+    // ?debug exposes the running app for console inspection and automated playtests.
+    if (params.has('debug')) /** @type {any} */ (window).__app = this;
+    this.game = new Game(this.audio, this.fixedSeed || 1 + Math.floor(Math.random() * 999999));
+    /** @type {AppState} */
+    this.state = 'TITLE';
+    this.touch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+    this.lockFailed = false;
+    /** @type {number|null} */
+    this.cursorX = null;
+    this.expectUnlock = false;
+    /** @type {Interactable|null} */
+    this.target = null;
+    /** @type {Dialogue|null} */
+    this.dialogue = null;
+    /** @type {NPC|null} */
+    this.talkNpc = null;
+    this.invTab = 'pack';
+    /** @type {string|null} */
+    this.selItem = null;
+    /** @type {string[]} */
+    this.runeSel = [];
+    this.modal = $('modal');
+    /** Render-scale ceiling for this device; adaptive resolution works below it. */
+    this.baseScale = 1;
+    /** Smoothed frame time (seconds) and countdown to the next resolution adjustment. */
+    this.frameAvg = 1 / 60;
+    this.scaleT = 1;
+    this.setTouch(this.touch);
+    this._bind();
+    this.showTitle();
+    this.last = performance.now();
+    this.acc = 0;
+    requestAnimationFrame((t) => this.frame(t));
+  }
+
+  /** @param {boolean} on */
+  setTouch(on) {
+    this.touch = on;
+    document.body.classList.toggle('touch', on);
+    this.baseScale = on ? 0.7 : 1;
+    this.renderer.renderScale = this.baseScale;
+    this.renderer.maxLights = on ? 8 : 16;
+  }
+
+  lock() {
+    if (this.touch || this.lockFailed) return;
+    try {
+      const r = /** @type {any} */ (this.canvas.requestPointerLock());
+      if (r && r.catch) r.catch(() => {});
+    } catch { /* unsupported: free-look fallback handles it */ }
+  }
+
+  /** @param {AppState} s */
+  setState(s) {
+    const was = this.state;
+    this.state = s;
+    this.input.clearHeld();
+    if (s !== 'EXPLORE' && document.pointerLockElement) {
+      this.expectUnlock = true;
+      document.exitPointerLock();
+    }
+    if (s === 'EXPLORE') {
+      this.modal.classList.add('hidden');
+      this.modal.innerHTML = '';
+      if (this.talkNpc) this.talkNpc.talking = false;
+      this.talkNpc = null;
+      this.dialogue = null;
+      if (was !== 'EXPLORE') this.lock();
+    }
+    this._refreshHotbar();
+  }
+
+  /** Show a modal panel. @param {AppState} s @param {string} title @param {...any} body */
+  panel(s, title, ...body) {
+    this.state !== s && this.setState(s);
+    this.modal.innerHTML = '';
+    this.modal.classList.remove('hidden');
+    const close = s === 'DEAD' || s === 'TITLE' ? null : h('button', { class: 'close brass-btn', type: 'button', onclick: () => this.setState('EXPLORE') }, '✕');
+    this.modal.append(h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', {}, title), close), h('div', { class: 'panel-body' }, ...body)));
+  }
+
+  _bind() {
+    const cv = this.canvas;
+    document.addEventListener('pointerlockchange', () => {
+      if (document.pointerLockElement !== cv && this.state === 'EXPLORE' && !this.touch && !this.expectUnlock) this.showPause();
+      this.expectUnlock = false;
+    });
+    document.addEventListener('pointerlockerror', () => {
+      if (this.lockFailed) return;
+      this.lockFailed = true;
+      document.body.classList.add('free-look');
+      this.game.notify('Free mouse look: rest the cursor at an edge to keep turning.');
+    });
+    cv.addEventListener('click', () => { if (this.state === 'EXPLORE') this.lock(); });
+    cv.addEventListener('mouseleave', () => { this.cursorX = null; });
+    document.addEventListener('mousemove', (e) => {
+      const locked = document.pointerLockElement === cv;
+      const free = this.lockFailed && this.state === 'EXPLORE' && !this.touch;
+      if (!locked && !free) return;
+      this.input.lookX += e.movementX * MOUSE_SENS;
+      this.input.lookY += e.movementY * MOUSE_SENS;
+      if (free) {
+        const r = cv.getBoundingClientRect();
+        this.cursorX = ((e.clientX - r.left) / r.width) * 2 - 1;
+      }
+    });
+    cv.addEventListener('mousedown', (e) => {
+      if (this.state !== 'EXPLORE' || this.touch) return;
+      if (e.button === 0) { this.input.attackHeld = true; this.input.attackPressed = true; }
+      if (e.button === 2) { this.input.parryHeld = true; this.input.parry = true; }
+    });
+    window.addEventListener('mouseup', (e) => {
+      if (e.button === 0) this.input.attackHeld = false;
+      if (e.button === 2) this.input.parryHeld = false;
+    });
+    cv.addEventListener('contextmenu', (e) => e.preventDefault());
+    cv.addEventListener('wheel', (e) => {
+      if (this.state === 'EXPLORE') this.input.cycle = e.deltaY > 0 ? 1 : -1;
+      e.preventDefault();
+    }, { passive: false });
+    window.addEventListener('keydown', (e) => this._key(e));
+    window.addEventListener('keyup', (e) => this.input.keyUp(e));
+    window.addEventListener('blur', () => this.input.clearHeld());
+    $('mute').addEventListener('click', () => {
+      this.audio.init();
+      $('mute').textContent = this.audio.toggleMute() ? 'Sound: off' : 'Sound: on';
+    });
+    $('touch-toggle').addEventListener('click', () => this.setTouch(!this.touch));
+    this._bindStick($('zone-move'), this.input.touchMove);
+    this._bindStick($('zone-look'), this.input.touchLook);
+    for (const b of Array.from(document.querySelectorAll('[data-act]'))) {
+      const act = /** @type {HTMLElement} */ (b).dataset.act ?? '';
+      b.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.audio.init();
+        if (act === 'attack') { this.input.attackHeld = true; this.input.attackPressed = true; }
+        else if (act === 'parry') { this.input.parryHeld = true; this.input.parry = true; }
+        else if (act === 'dash') this.input.dash = true;
+        else if (act === 'jump') this.input.jump = true;
+        else if (act === 'interact') this.doInteract();
+        else this.openPanel(act);
+      });
+      const release = () => {
+        if (act === 'attack') this.input.attackHeld = false;
+        if (act === 'parry') this.input.parryHeld = false;
+      };
+      b.addEventListener('pointerup', release);
+      b.addEventListener('pointercancel', release);
+      b.addEventListener('pointerleave', release);
+    }
+  }
+
+  /** Floating virtual joystick. @param {HTMLElement} zone @param {{x:number, y:number}} target */
+  _bindStick(zone, target) {
+    const base = /** @type {HTMLElement} */ (zone.querySelector('.stick-base'));
+    const knob = /** @type {HTMLElement} */ (zone.querySelector('.stick-knob'));
+    const R = 50;
+    /** @type {number|null} */
+    let id = null;
+    let ox = 0;
+    let oy = 0;
+    zone.addEventListener('pointerdown', (e) => {
+      if (id !== null) return;
+      id = e.pointerId;
+      zone.setPointerCapture(id);
+      const rect = zone.getBoundingClientRect();
+      ox = e.clientX;
+      oy = e.clientY;
+      base.style.left = `${ox - rect.left}px`;
+      base.style.top = `${oy - rect.top}px`;
+      base.classList.add('active');
+      e.preventDefault();
+    });
+    zone.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== id) return;
+      let dx = (e.clientX - ox) / R;
+      let dy = (e.clientY - oy) / R;
+      const l = Math.hypot(dx, dy);
+      if (l > 1) { dx /= l; dy /= l; }
+      target.x = dx;
+      target.y = dy;
+      knob.style.transform = `translate(${dx * R}px, ${dy * R}px)`;
+    });
+    const end = (/** @type {PointerEvent} */ e) => {
+      if (e.pointerId !== id) return;
+      id = null;
+      target.x = 0;
+      target.y = 0;
+      knob.style.transform = '';
+      base.classList.remove('active');
+    };
+    zone.addEventListener('pointerup', end);
+    zone.addEventListener('pointercancel', end);
+  }
+
+  /** @param {KeyboardEvent} e */
+  _key(e) {
+    const code = e.code;
+    if (code === 'Tab' || code === 'Space' || code === 'F5' || code === 'F9') e.preventDefault();
+    if (this.state === 'TITLE' || this.state === 'DEAD' || this.state === 'ENDING') return;
+    const panels = { Tab: 'inventory', KeyI: 'inventory', KeyK: 'skills', KeyJ: 'journal', KeyM: 'map' };
+    const want = /** @type {Record<string, string>} */ (panels)[code];
+    if (code === 'Escape') {
+      // With pointer lock the browser's own Esc release opens the pause menu (pointerlockchange).
+      if (this.state === 'EXPLORE' && !document.pointerLockElement) this.showPause();
+      else if (this.state !== 'EXPLORE' && this.state !== 'PAUSE') this.setState('EXPLORE');
+      return;
+    }
+    if (want) {
+      const map = { inventory: 'INVENTORY', skills: 'SKILLS', journal: 'JOURNAL', map: 'MAP' };
+      if (this.state === /** @type {Record<string, string>} */ (map)[want]) this.setState('EXPLORE');
+      else if (this.state === 'EXPLORE' || this.state in { INVENTORY: 1, SKILLS: 1, JOURNAL: 1, MAP: 1 }) this.openPanel(want);
+      return;
+    }
+    if (code === 'F5') { this.game.save(); return; }
+    if (code === 'F9') { this.loadGame(); return; }
+    if (this.state !== 'EXPLORE') return;
+    if (code === 'KeyE') { this.doInteract(); return; }
+    if (code === 'KeyR') { this.cycleAmmo(); return; }
+    this.input.keyDown(e);
+  }
+
+  cycleAmmo() {
+    const c = this.game.char;
+    const kinds = ['ammo_shard', 'ammo_flare', 'ammo_frost'].filter((a) => c.inventory.count(a) > 0);
+    if (!kinds.length) return;
+    c.ammo = kinds[(kinds.indexOf(c.ammo) + 1) % kinds.length];
+    this.game.notify(`Loaded ${ITEMS[c.ammo].name}.`);
+  }
+
+  doInteract() {
+    if (this.state !== 'EXPLORE') return;
+    const r = this.game.interact();
+    if (!r) return;
+    if (r.open === 'dialogue') this.openDialogue(r.data);
+    else if (r.open === 'loot') this.openLoot(r.data);
+    else if (r.open === 'read') this.openRead(r.data);
+    else if (r.open === 'rest') this.openRest();
+  }
+
+  /** @param {string} name inventory|skills|journal|map|pause */
+  openPanel(name) {
+    if (name === 'inventory') this.openInventory();
+    else if (name === 'skills') this.openSkills();
+    else if (name === 'journal') this.openJournal();
+    else if (name === 'map') this.openMap();
+    else if (name === 'pause') this.showPause();
+  }
+
+  // ----- Title / pause / death / ending -----
+
+  showTitle() {
+    this.state = 'TITLE';
+    this.modal.classList.remove('hidden');
+    this.modal.innerHTML = '';
+    const start = () => {
+      this.audio.init();
+      this.game = new Game(this.audio, this.fixedSeed || 1 + Math.floor(Math.random() * 999999));
+      this.game.newRun();
+      this.setState('EXPLORE');
+    };
+    this.modal.append(h('div', { class: 'panel title' },
+      h('h1', {}, 'AETHERIUM'), h('h3', {}, 'SHARDLANDS'),
+      h('p', {}, 'You wake beneath a brass sky of painted stars. The Sunken Observatory is silent, its Great Astrolabe Gate sealed, and far above, the ley-lines of the Shardlands have begun to drift.'),
+      h('div', { class: 'row' }, btn('New Game', start), btn('Continue', () => this.loadGame(), !Game.hasSave())),
+      h('div', { class: 'controls desktop-only' },
+        ...[['WASD', 'Move · double-tap to Phase Dash'], ['Mouse', 'Look (click to lock pointer)'], ['Left click', 'Attack / cast (strafe = sweep, forward = thrust, still = chop)'],
+          ['Right click', 'Parry (tap) / block (hold)'], ['E', 'Interact, talk, loot'], ['Shift / Space', 'Phase Dash / jump'], ['1-6 · wheel · Q · R', 'Hotbar · cycle · switch ammo'],
+          ['Tab/I · K · J · M', 'Inventory · Skills · Journal · Map'], ['F5 / F9', 'Quick save / load']].map(([k, v]) => [h('b', {}, k), h('span', {}, v)])),
+      h('p', { class: 'small touch-only' }, 'Left thumb moves, right thumb aims. Buttons attack, parry, interact, dash and jump; the drawer opens your pack, skills, journal and map.'),
+      h('p', { class: 'small' }, 'Progress autosaves when you change regions and when you rest.'),
+    ));
+  }
+
+  showPause() {
+    this.panel('PAUSE', 'Paused',
+      h('div', { class: 'col' },
+        btn('Resume', () => this.setState('EXPLORE')),
+        btn('Save game', () => { this.game.save(); this.setState('EXPLORE'); }),
+        btn('Load last save', () => this.loadGame(), !Game.hasSave()),
+        btn('Quit to title', () => this.showTitle())));
+  }
+
+  loadGame() {
+    this.audio.init();
+    const g = Game.load(this.audio);
+    if (!g) return;
+    this.game = g;
+    this.setState('EXPLORE');
+  }
+
+  // ----- Dialogue -----
+
+  /** @param {NPC} npc */
+  openDialogue(npc) {
+    this.talkNpc = npc;
+    npc.talking = true;
+    npc.working = npc.scheduleAt(this.game.hour).phase === 'work';
+    this.dialogue = new Dialogue(this.game, npc);
+    this.game.audio.voice(npc.def.voice, 4);
+    this.renderDialogue(this.dialogue.greeting(), []);
+  }
+
+  /** @param {string} text @param {import('./rpg.js').DialogueOption[]} options */
+  renderDialogue(text, options) {
+    const d = /** @type {Dialogue} */ (this.dialogue);
+    const npc = /** @type {NPC} */ (this.talkNpc);
+    const role = { guildmaster: 'Guildmaster', merchant: 'Merchant', innkeeper: 'Innkeeper', guard: 'Guard', folk: 'Townsfolk' }[npc.def.role] ?? '';
+    this.panel('DIALOGUE', npc.def.name,
+      h('div', { class: 'dlg' },
+        h('div', { class: 'dlg-side' }, icon(npc.def.sprite, 96), h('div', { class: 'small' }, role), h('div', { class: 'topics' }, d.topics().map((t) => btn(t.label, () => this.dlgReply(d.ask(t.id)))))),
+        h('div', { class: 'dlg-main' },
+          h('p', { class: 'dlg-text' }, text),
+          h('div', { class: 'col' }, options.map((o) => btn(o.label, () => this.dlgReply(d.choose(o.id)), !o.enabled))),
+          btn('Goodbye', () => this.setState('EXPLORE')))));
+  }
+
+  /** @param {import('./rpg.js').DialogueReply} r */
+  dlgReply(r) {
+    if (r.action === 'trade') {
+      this.openTrade();
+      return;
+    }
+    this.renderDialogue(r.text, r.options);
+  }
+
+  // ----- Trade -----
+
+  openTrade() {
+    const g = this.game;
+    const npc = /** @type {NPC} */ (this.talkNpc);
+    const shop = npc.def.shop ?? '';
+    const rep = g.factions.rep[SHOPS[shop].town] || 0;
+    let msg = '';
+    const render = () => {
+      const c = g.char;
+      this.panel('TRADE', SHOPS[shop].name,
+        h('p', {}, `Your purse: ${c.shards} Aether Shards. `, h('span', { class: 'warn' }, msg)),
+        h('div', { class: 'cols' },
+          h('div', {}, h('h4', {}, 'For sale'), g.stock(shop).filter((r) => r[1] > 0).map(([id, n]) => h('div', { class: 'row item-row' },
+            icon(ITEMS[id].sprite, 32), h('span', { class: 'grow' }, `${ITEMS[id].name} ×${n}`),
+            btn(`Buy ${buyPrice(c, id, rep)}`, () => { msg = g.buy(shop, id) ?? ''; render(); })))),
+          h('div', {}, h('h4', {}, 'Your pack'), c.inventory.items.filter((it) => ITEMS[it.id].value > 0).map((it) => h('div', { class: 'row item-row' },
+            icon(ITEMS[it.id].sprite, 32), h('span', { class: 'grow' }, `${ITEMS[it.id].name} ×${it.qty}`),
+            btn(`Sell ${sellPrice(c, it.id, rep)}`, () => { msg = g.sell(shop, it.id) ?? ''; render(); }))))),
+        btn('Back to conversation', () => this.renderDialogue('Anything else?', [])));
+    };
+    render();
+  }
+
+  // ----- Loot / read / rest -----
+
+  /** @param {Prop} chest */
+  openLoot(chest) {
+    const g = this.game;
+    const render = () => {
+      const loot = g.world.loot[chest.key];
+      const take = (/** @type {number} */ i) => {
+        const [id, n] = loot[i];
+        g.give(id, n);
+        loot.splice(i, 1);
+        g.audio.pickup();
+        render();
+      };
+      this.panel('LOOT', 'Chest',
+        loot.length ? loot.map(([id, n], i) => h('div', { class: 'row item-row' },
+          icon(id === 'shards' ? 'i_shards' : ITEMS[id].sprite, 32), h('span', { class: 'grow' }, `${id === 'shards' ? 'Aether Shards' : ITEMS[id].name} ×${n}`), btn('Take', () => take(i))))
+          : h('p', {}, 'Empty.'),
+        h('div', { class: 'row' }, btn('Take all', () => { while (loot.length) take(0); }, !loot.length), btn('Close', () => this.setState('EXPLORE'))));
+    };
+    render();
+  }
+
+  /** @param {string} id */
+  openRead(id) {
+    if (id.startsWith('notice_')) {
+      const guild = id.slice(7);
+      const c = this.game.contracts[/** @type {'artificers'} */ (guild)];
+      this.panel('READ', guild === 'artificers' ? "Artificers' Notice Board" : "Wardens' Notice Board",
+        h('p', {}, guild === 'artificers' ? 'WORK FOR MENDERS: relics recovered, supplies brought, parcels carried. Speak to Master Vance in the Guildhall.' : 'WARDENS WANTED: vaults to clear, landmarks to survey, parcels to carry. Speak to Captain Marr in the Lodge.'),
+        h('p', {}, c ? `Your current contract: ${c.title}. ${c.brief}` : 'You hold no contract with this guild.'));
+      return;
+    }
+    const b = BOOKS[id];
+    this.panel('READ', b.title, ...b.text.split('\n\n').map((t) => h('p', { class: 'book' }, t)));
+  }
+
+  openRest() {
+    const g = this.game;
+    const until = Math.round(((6 - g.hour + 24) % 24) || 24);
+    const go = (/** @type {number} */ n) => {
+      const err = g.rest(n);
+      if (err) this.panel('REST', 'Rest', h('p', {}, err));
+      else this.setState('EXPLORE');
+    };
+    this.panel('REST', 'Rest', h('p', {}, 'How long will you rest?'), h('div', { class: 'row' }, btn('1 hour', () => go(1)), btn('4 hours', () => go(4)), btn('8 hours', () => go(8)), btn(`Until dawn (${until}h)`, () => go(until))));
+  }
+
+  // ----- Inventory & crafting -----
+
+  openInventory() {
+    const g = this.game;
+    const c = g.char;
+    const tabs = h('div', { class: 'row tabs' }, btn('Pack', () => { this.invTab = 'pack'; this.openInventory(); }), btn('Alchemy & Tinkering', () => { this.invTab = 'craft'; this.openInventory(); }));
+    if (this.invTab === 'craft') {
+      this.panel('INVENTORY', 'Alchemy & Tinkering', tabs, h('p', { class: 'small' }, 'Combine gathered ingredients. Crafting trains Artificing.'),
+        RECIPES.map((r) => {
+          const out = ITEMS[r.makes[0]];
+          const can = c.skill('artificing') >= r.level && r.needs.every(([id, n]) => c.inventory.count(id) >= n);
+          return h('div', { class: 'row item-row' }, icon(out.sprite, 36),
+            h('div', { class: 'grow' }, h('b', {}, `${out.name}${r.makes[1] > 1 ? ` ×${r.makes[1]}` : ''}`), h('div', { class: 'small' },
+              r.needs.map(([id, n]) => `${ITEMS[id].name} ${c.inventory.count(id)}/${n}`).join(' · '), r.level > 1 ? ` · Artificing ${r.level}` : '')),
+            btn('Craft', () => {
+              const err = craft(c, r);
+              if (err) g.notify(err);
+              else {
+                g.audio.brew();
+                g.exercise('artificing', 1);
+                g.notify(`Crafted ${out.name}.`);
+              }
+              this.openInventory();
+            }, !can));
+        }));
+      return;
+    }
+    const weight = c.inventory.weight();
+    const sel = this.selItem && c.inventory.count(this.selItem) ? this.selItem : null;
+    const equipped = (/** @type {string} */ id) => Object.values(c.equip).includes(id) || c.ammo === id;
+    /** @type {any[]} */
+    let details = [h('p', { class: 'small' }, 'Select an item.')];
+    if (sel) {
+      const d = ITEMS[sel];
+      const isEq = equipped(sel);
+      /** @type {any[]} */
+      const actions = [];
+      if (['weapon', 'offhand', 'armor', 'relic'].includes(d.type)) actions.push(btn(isEq && d.type !== 'weapon' ? 'Unequip' : 'Equip', () => { g.useItem(sel); this.openInventory(); }));
+      if (d.type === 'consumable') actions.push(btn('Use', () => { g.useItem(sel); this.openInventory(); }));
+      if (d.type === 'ammo') actions.push(btn('Load', () => { g.useItem(sel); this.openInventory(); }));
+      if (d.type === 'book') actions.push(btn('Read', () => this.openRead(d.book ?? '')));
+      if (d.type === 'weapon') {
+        actions.push(h('div', { class: 'row' }, h('span', { class: 'small' }, 'Hotbar: '), [0, 1, 2, 3, 4, 5].map((i) => btn(String(i + 1), () => {
+          c.hotbar = c.hotbar.map((s) => (s?.id === sel ? null : s));
+          c.hotbar[i] = { kind: 'item', id: sel };
+          this.openInventory();
+        }))));
+      }
+      if (d.type !== 'quest' && !(isEq && c.inventory.count(sel) <= 1)) {
+        actions.push(btn('Drop', () => {
+          c.inventory.remove(sel, 1);
+          const p = g.player;
+          const prop = g.level.addProp('item', d.sprite, p.x + Math.cos(p.yaw) * 0.8, p.z + Math.sin(p.yaw) * 0.8, { size: 0.6, data: { item: sel, qty: 1 } });
+          g.level._indexProp(prop);
+          this.openInventory();
+        }));
+      }
+      details = [h('div', { class: 'row' }, icon(d.sprite, 64), h('div', {}, h('b', {}, d.name), h('div', { class: 'small' }, `${d.type} · weight ${d.weight} · value ${d.value}`))), h('p', {}, d.desc), h('div', { class: 'row wrap' }, actions)];
+    }
+    const slotNames = { main: 'Main Hand', off: 'Off-Hand / Lantern', armor: 'Armor', relic: 'Relic' };
+    this.panel('INVENTORY', 'Inventory', tabs,
+      h('div', { class: 'cols' },
+        h('div', {},
+          h('div', { class: 'grid' }, c.inventory.items.map((it) => h('button', { class: `cell${it.id === sel ? ' sel' : ''}${equipped(it.id) ? ' eq' : ''}`, type: 'button', title: ITEMS[it.id].name, onclick: () => { this.selItem = it.id; this.openInventory(); } },
+            icon(ITEMS[it.id].sprite, 44), it.qty > 1 ? h('span', { class: 'qty' }, String(it.qty)) : null))),
+          h('p', { class: weight > c.carryCap ? 'warn' : 'small' }, `Weight ${weight.toFixed(1)} / ${c.carryCap}${weight > c.carryCap ? ' (over-encumbered: slow, no dash)' : ''} · ${c.shards} Aether Shards`)),
+        h('div', {},
+          h('h4', {}, 'Equipment'),
+          Object.entries(slotNames).map(([k, label]) => {
+            const id = /** @type {Record<string, string|null>} */ (c.equip)[k];
+            return h('div', { class: 'row item-row' }, id ? icon(ITEMS[id].sprite, 28) : h('span', { class: 'empty-slot' }), h('span', {}, `${label}: ${id ? ITEMS[id].name : '(empty)'}`));
+          }),
+          h('div', { class: 'small' }, `Armour ${c.armor} · Ammo: ${ITEMS[c.ammo].name}`),
+          h('hr', {}), ...details)));
+  }
+
+  // ----- Skills, attributes, perks, runes -----
+
+  openSkills() {
+    const g = this.game;
+    const c = g.char;
+    const owned = Object.keys(ITEMS).filter((id) => ITEMS[id].type === 'rune' && c.inventory.count(id));
+    const spell = spellFor(this.runeSel);
+    this.panel('SKILLS', `Level ${c.level}  ·  ${c.skillUps % 10}/10 skill increases to next level`,
+      h('div', { class: 'cols' },
+        h('div', {},
+          h('h4', {}, `Attributes (${c.attrPoints} points)`),
+          Object.entries(ATTRIBUTES).map(([id, a]) => h('div', { class: 'row item-row' }, h('span', { class: 'grow' }, h('b', {}, `${a.name} ${/** @type {Record<string, number>} */ (c.attrs)[id]}`), h('div', { class: 'small' }, a.desc)),
+            btn('+', () => { /** @type {Record<string, number>} */ (c.attrs)[id]++; c.attrPoints--; this.openSkills(); }, c.attrPoints <= 0))),
+          h('h4', {}, 'Skills (improve by use)'),
+          Object.entries(SKILLS).map(([id, s]) => {
+            const sk = c.skills[id];
+            const need = 3 + sk.level * 2;
+            return h('div', { class: 'item-row' }, h('b', {}, `${s.name} ${c.skill(id)}`), h('div', { class: 'bar' }, h('div', { style: `width:${(sk.xp / need) * 100}%` })), h('div', { class: 'small' }, s.desc));
+          })),
+        h('div', {},
+          h('h4', {}, `Perks (${c.perkPoints} points)`),
+          PERKS.map((p) => {
+            const has = c.has(p.id);
+            const ok = !has && c.perkPoints > 0 && c.skill(p.skill) >= p.need;
+            return h('div', { class: 'row item-row' }, h('span', { class: 'grow' }, h('b', {}, `${p.name}${has ? ' ✓' : ''}`), h('div', { class: 'small' }, `${SKILLS[p.skill].name} ${p.need}: ${p.desc}`)),
+              has ? null : btn('Learn', () => { c.perks.push(p.id); c.perkPoints--; this.openSkills(); }, !ok));
+          }),
+          h('h4', {}, 'Runecasting'),
+          owned.length ? h('div', { class: 'row wrap' }, owned.map((id) => h('button', { class: `cell${this.runeSel.includes(id) ? ' sel' : ''}`, type: 'button', title: ITEMS[id].name, onclick: () => {
+            this.runeSel = this.runeSel.includes(id) ? this.runeSel.filter((r) => r !== id) : [...this.runeSel, id];
+            this.openSkills();
+          } }, icon(id, 40)))) : h('p', { class: 'small' }, 'You carry no runestones yet.'),
+          h('div', { class: 'row' }, h('span', { class: 'grow small' }, this.runeSel.length ? `Combination: ${spell ? SPELLS[spell].name : 'nothing known'}` : 'Select runestones to combine.'),
+            btn('Inscribe', () => {
+              if (!spell) return;
+              if (!c.spells.includes(spell)) {
+                c.spells.push(spell);
+                const free = c.hotbar.indexOf(null);
+                if (free >= 0) c.hotbar[free] = { kind: 'spell', id: spell };
+                g.notify(`Learned ${SPELLS[spell].name}.`);
+                g.audio.cast(spell);
+              }
+              this.runeSel = [];
+              this.openSkills();
+            }, !spell || c.spells.includes(spell ?? ''))),
+          c.spells.map((id) => h('div', { class: 'row item-row' }, h('span', { class: 'grow' }, h('b', {}, `${SPELLS[id].name} (${SPELLS[id].cost} Aether)`), h('div', { class: 'small' }, SPELLS[id].desc)),
+            h('span', { class: 'small' }, 'Hotbar:'), [0, 1, 2, 3, 4, 5].map((i) => btn(String(i + 1), () => {
+              c.hotbar = c.hotbar.map((s) => (s?.id === id ? null : s));
+              c.hotbar[i] = { kind: 'spell', id };
+              this.openSkills();
+            })))))));
+  }
+
+  // ----- Journal -----
+
+  openJournal() {
+    const g = this.game;
+    const quests = Object.values(g.quests.quests);
+    const active = quests.filter((q) => !q.done);
+    const done = quests.filter((q) => q.done);
+    this.panel('JOURNAL', 'Quest Journal',
+      h('div', { class: 'cols' },
+        h('div', {},
+          h('h4', {}, 'Active'),
+          active.length ? active.map((q) => h('div', { class: 'quest' },
+            h('div', { class: 'row' }, h('b', { class: 'grow' }, `${q.kind === 'main' ? '★ ' : ''}${q.title}`), g.quests.tracked === q.id ? h('span', { class: 'small' }, 'tracked') : btn('Track', () => { g.quests.tracked = q.id; this.openJournal(); })),
+            [...q.entries].reverse().map((e) => h('p', { class: 'small' }, `Day ${e.day}: ${e.text}`)))) : h('p', { class: 'small' }, 'Nothing pressing.'),
+          done.length ? h('details', {}, h('summary', {}, `Completed (${done.length})`), done.map((q) => h('p', { class: 'small' }, `✓ ${q.title}`))) : null),
+        h('div', {},
+          h('h4', {}, 'Factions'),
+          Object.entries(FACTIONS).map(([id, name]) => h('div', { class: 'row item-row' }, h('span', { class: 'grow' }, name), h('span', {}, `${g.factions.rep[id] || 0}${id in g.factions.member && g.factions.member[/** @type {'artificers'} */ (id)] ? ' · member' : ''}`))),
+          h('h4', {}, 'Contracts'),
+          ['artificers', 'wardens'].map((k) => {
+            const c = g.contracts[/** @type {'artificers'} */ (k)];
+            return h('p', { class: 'small' }, `${FACTIONS[k]}: ${c ? `${c.title}${g.contractReady(c) ? ' (ready to report)' : ''}` : 'none'}`);
+          }),
+          h('h4', {}, 'Discoveries'),
+          h('p', { class: 'small' }, g.discovered.size ? [...g.discovered].map((id) => g.getLevel('overworld').landmarks.find((l) => l.id === id)?.name ?? id).join(', ') : 'None yet.'))));
+  }
+
+  // ----- Automap -----
+
+  openMap() {
+    const g = this.game;
+    const L = g.level;
+    const size = Math.min(520, window.innerWidth - 60, window.innerHeight - 180);
+    const scale = size / Math.max(L.w, L.h);
+    const cv = /** @type {HTMLCanvasElement} */ (h('canvas', { width: L.w, height: L.h, class: 'map', style: `width:${L.w * scale}px;height:${L.h * scale}px` }));
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    const img = ctx.createImageData(L.w, L.h);
+    /** @type {Record<number, number[]>} */
+    const COL = {
+      [TILE.GRASS]: [46, 90, 58], [TILE.FEN]: [74, 90, 52], [TILE.BASALT]: [58, 58, 70], [TILE.DUST]: [138, 96, 64], [TILE.COBBLE]: [150, 142, 128],
+      [TILE.CLIFF]: [90, 74, 58], [TILE.PLANK]: [122, 80, 48], [TILE.LEY_FLOOR]: [42, 106, 128], [TILE.FLAGSTONE]: [106, 100, 88], [TILE.OBS_FLOOR]: [110, 86, 46],
+    };
+    for (let j = 0; j < L.h; j++) {
+      for (let i = 0; i < L.w; i++) {
+        const k = L.idx(i, j);
+        const o = k * 4;
+        let col = [13, 11, 16];
+        if (L.explored[k]) {
+          col = L.wall[k] ? [26, 20, 16] : COL[L.floorTex[k]] ?? [96, 90, 80];
+          if (L.hazard[k] === HAZARD.CHASM) col = [0, 0, 0];
+          else if (L.hazard[k] === HAZARD.DEEP || L.floorH[k] < L.waterLevel) col = [30, 70, 110];
+          else if (L.hazard[k] === HAZARD.VENT) col = [200, 80, 30];
+          if (L.doorAt[k] >= 0) col = [220, 180, 90];
+          if (L.ceil[k] > 0 && L.outdoor) col = col.map((v) => v * 0.7);
+        }
+        img.data[o] = col[0];
+        img.data[o + 1] = col[1];
+        img.data[o + 2] = col[2];
+        img.data[o + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    const p = g.player;
+    const overlay = /** @type {HTMLCanvasElement} */ (h('canvas', { width: L.w * scale, height: L.h * scale, class: 'map-overlay' }));
+    const oc = overlay.getContext('2d');
+    const draw = () => {
+      if (!oc) return;
+      oc.clearRect(0, 0, overlay.width, overlay.height);
+      oc.font = '600 11px Georgia, serif';
+      oc.textAlign = 'center';
+      /** @param {number} x @param {number} z @param {string} col @param {string} label */
+      const pin = (x, z, col, label) => {
+        oc.fillStyle = col;
+        oc.beginPath();
+        oc.arc(x * scale, z * scale, 4, 0, Math.PI * 2);
+        oc.fill();
+        oc.fillStyle = '#f6e7c1';
+        oc.fillText(label, x * scale, z * scale - 8);
+      };
+      for (const lm of L.landmarks) if (lm.kind === 'town' || g.discovered.has(lm.id)) pin(lm.x, lm.z, lm.kind === 'town' ? '#e8c779' : '#8fb0c0', lm.name);
+      for (const m of g.markers) if (m.level === L.id) pin(m.x, m.z, '#ff8ab0', m.label);
+      const qm = g.quests.trackedMarker();
+      if (qm && qm.level === L.id) pin(qm.x, qm.z, CYAN, 'Quest');
+      oc.save();
+      oc.translate(p.x * scale, p.z * scale);
+      oc.rotate(p.yaw);
+      oc.fillStyle = '#ff5a5a';
+      oc.beginPath();
+      oc.moveTo(9, 0);
+      oc.lineTo(-6, 5);
+      oc.lineTo(-6, -5);
+      oc.closePath();
+      oc.fill();
+      oc.restore();
+    };
+    draw();
+    overlay.addEventListener('click', (e) => {
+      const r = overlay.getBoundingClientRect();
+      const x = (e.clientX - r.left) / scale;
+      const z = (e.clientY - r.top) / scale;
+      const hit = g.markers.findIndex((m) => m.level === L.id && Math.hypot(m.x - x, m.z - z) < 6 / scale + 2);
+      if (hit >= 0) g.markers.splice(hit, 1);
+      else {
+        let label = `Marker ${g.markers.length + 1}`;
+        try {
+          const typed = window.prompt('Name this marker', label);
+          if (typed === null) return;
+          label = typed.trim() || label;
+        } catch { /* prompt blocked: keep the default label */ }
+        g.markers.push({ level: L.id, x, z, label });
+      }
+      draw();
+    });
+    this.panel('MAP', L.outdoor ? 'The Shardlands' : L.name,
+      h('div', { class: 'map-wrap', style: `width:${L.w * scale}px;height:${L.h * scale}px` }, cv, overlay),
+      h('p', { class: 'small' }, 'Click the map to place a marker; click a marker to remove it. Discovered places are labelled.'));
+  }
+
+  // ----- Hotbar (HTML, tappable) -----
+
+  _refreshHotbar() {
+    const bar = $('hotbar');
+    const c = this.game.char;
+    const key = JSON.stringify([c.hotbar, this.game.hotIndex]);
+    if (bar.dataset.key === key) return;
+    bar.dataset.key = key;
+    bar.innerHTML = '';
+    c.hotbar.forEach((s, i) => {
+      const sprite = !s ? null : s.kind === 'item' ? ITEMS[s.id].sprite : SPELLS[s.id].runes[0];
+      bar.append(h('button', { class: `slot${i === this.game.hotIndex ? ' sel' : ''}`, type: 'button', title: s ? (s.kind === 'item' ? ITEMS[s.id].name : SPELLS[s.id].name) : '', onclick: (/** @type {Event} */ e) => { e.stopPropagation(); this.game.selectSlot(i); } },
+        h('span', { class: 'key' }, String(i + 1)), sprite ? icon(sprite, 36) : null));
+    });
+  }
+
+  // ----- Loop -----
+
+  /** @param {number} now */
+  frame(now) {
+    requestAnimationFrame((t) => this.frame(t));
+    const dt = Math.min(0.1, (now - this.last) / 1000);
+    this.last = now;
+    const g = this.game;
+    // Adaptive resolution: trade internal resolution (down to 55% of the device ceiling)
+    // for frame rate when frames run long, and climb back when there is headroom.
+    this.frameAvg += (dt - this.frameAvg) * 0.05;
+    this.scaleT -= dt;
+    if (this.scaleT <= 0 && !document.hidden) {
+      this.scaleT = 0.5;
+      const r = this.renderer;
+      if (this.frameAvg > 1 / 50 && r.renderScale > this.baseScale * 0.55) r.renderScale = Math.max(this.baseScale * 0.55, r.renderScale - 0.05);
+      else if (this.frameAvg < 1 / 58 && r.renderScale < this.baseScale) r.renderScale = Math.min(this.baseScale, r.renderScale + 0.05);
+    }
+    if (this.state === 'EXPLORE') {
+      if (this.lockFailed && !this.touch && this.cursorX !== null && Math.abs(this.cursorX) > 0.8) {
+        this.input.lookX += Math.sign(this.cursorX) * ((Math.abs(this.cursorX) - 0.8) / 0.2) * 2.6 * dt;
+      }
+      this.acc += dt;
+      let steps = 0;
+      while (this.acc >= STEP_DT && steps < 6) {
+        g.update(STEP_DT, this.input.sample());
+        this.acc -= STEP_DT;
+        steps++;
+      }
+      if (steps === 6) this.acc = 0;
+      this.target = g.findInteract();
+      if (g.dead) {
+        this.panel('DEAD', 'You have fallen', h('p', {}, 'The brass falls silent around you.'),
+          h('div', { class: 'row' }, btn('Load last save', () => this.loadGame(), !Game.hasSave()), btn('New game', () => this.showTitle())));
+      } else if (g.flags.ending && !g.flags.endingShown) {
+        g.flags.endingShown = true;
+        g.save(true);
+        this.panel('ENDING', 'The Astrolabe Turns True',
+          h('p', {}, 'The Resonant Core settles into the armillary with a sound like a held breath let go. Ring by ring the Great Astrolabe turns, and far above, every ley-line in the Shardlands draws back to true.'),
+          h('p', {}, 'The lamps of Cinderwick and Oakhaven burn steady tonight. The roads, the vaults and the guilds are still yours to explore.'),
+          btn('Continue exploring', () => this.setState('EXPLORE')));
+      }
+    } else if (this.state === 'TITLE') {
+      g.player.yaw += dt * 0.1;
+      g.time += dt;
+      g._updateEnv(dt);
+      if (!g.streamer.active.size) {
+        const ev = g.streamer.update(g.player.x, g.player.z);
+        g.chunkLoads.push(...ev.load);
+      }
+    }
+    if (g.levelChanged) {
+      g.levelChanged = false;
+      this.renderer.setLevel(g.level);
+    }
+    for (const k of g.chunkUnloads.splice(0)) this.renderer.unloadChunk(k);
+    for (let n = 0; n < 3 && g.chunkLoads.length; n++) this.renderer.loadChunk(/** @type {number} */ (g.chunkLoads.shift()));
+    this._refreshHotbar();
+
+    const p = g.player;
+    this.renderer.render({
+      eye: { x: p.x, y: p.y + p.eye + Math.sin(p.bob * 2) * 0.03, z: p.z }, yaw: p.yaw, pitch: p.pitch, time: g.time,
+      sprites: g.collectSprites(), lights: g.collectLights(), doors: g.level.doors, fx: g.fx, env: g.env,
+    });
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = this.hud.clientWidth;
+    const hh = this.hud.clientHeight;
+    if (this.hud.width !== Math.round(w * dpr) || this.hud.height !== Math.round(hh * dpr)) {
+      this.hud.width = Math.round(w * dpr);
+      this.hud.height = Math.round(hh * dpr);
+    }
+    this.hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.hctx.clearRect(0, 0, w, hh);
+    if (this.state !== 'TITLE') drawHud(this.hctx, g, this.renderer.spriteAtlas, w, hh, this.touch, this.state === 'EXPLORE' ? this.target : null);
+  }
+}
+
+// Two frames let the "Forging…" status paint before texture synthesis blocks the thread.
+requestAnimationFrame(() => requestAnimationFrame(() => {
+  const msg = document.getElementById('boot-error');
+  try {
+    new App();
+    if (msg) msg.textContent = '';
+  } catch (err) {
+    if (msg) msg.textContent = String(/** @type {Error} */ (err).message || err);
+    throw err;
+  }
+}));
