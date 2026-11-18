@@ -320,6 +320,7 @@ export class Player {
     game.audio.cast(id);
     game.fx.parry = Math.max(game.fx.parry, 0.4);
     game.exercise('aether', 1);
+    game.onSpellCast(id);
     game.burst(this.x + Math.cos(this.yaw) * 0.8, this.y + 1.3, this.z + Math.sin(this.yaw) * 0.8, 10, [0.4, 1.2, 1.6], 2);
   }
 }
@@ -341,7 +342,7 @@ export class Enemy {
     const scale = 1 + 0.45 * Math.max(0, sp.tier - 1);
     this.key = sp.key;
     this.kind = sp.kind;
-    this.name = (sp.boss ? 'Elder ' : '') + st.name;
+    this.name = sp.training ? 'Training Automaton' : (sp.boss ? 'Elder ' : '') + st.name;
     this.x = sp.x;
     this.z = sp.z;
     this.y = y;
@@ -349,7 +350,7 @@ export class Enemy {
     this.homeZ = sp.z;
     this.maxHp = Math.round(st.hp * scale * (sp.boss ? 1.8 : 1));
     this.hp = this.maxHp;
-    this.dmg = st.dmg * (1 + 0.3 * Math.max(0, sp.tier - 1));
+    this.dmg = st.dmg * (1 + 0.3 * Math.max(0, sp.tier - 1)) * (sp.training ? 0.5 : 1);
     this.speed = st.speed;
     this.radius = st.radius;
     this.size = st.size * (sp.boss ? 1.2 : 1);

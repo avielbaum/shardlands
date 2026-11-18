@@ -127,7 +127,7 @@ export const SITES = Object.freeze({
  * @property {boolean} gone removed (looted, harvested)
  * @property {Object<string, any>} data
  */
-/** @typedef {{key:string, kind:string, x:number, z:number, tier:number, boss?:boolean}} Spawn */
+/** @typedef {{key:string, kind:string, x:number, z:number, tier:number, boss?:boolean, training?:boolean}} Spawn */
 /** @typedef {{x:number, z:number}} Spot */
 /**
  * @typedef {Object} NpcDef
@@ -535,7 +535,8 @@ function styleWalls(L, rnd, base, variants) {
 export const OBSERVATORY_RETURN = Object.freeze({ x: 26.5, z: 18.5, yaw: -Math.PI / 2 });
 
 /**
- * Four rooms: Awakening Chamber, Hall of Instruments, Ley-Conduit Room, Gate Hall.
+ * Four rooms: Awakening Chamber (Resonance Brazier, starter chest, the Archivist), the
+ * Atrium (training automaton), Ley-Conduit Room (levers, locked chest) and Gate Hall.
  * Three levers drive three anchors; lighting all three unseals the Great Astrolabe Gate.
  * @param {number} seed @returns {Level}
  */
@@ -574,21 +575,26 @@ export function buildObservatory(seed) {
     portal: { level: 'overworld', x: SITES.gate.x + 0.5, z: SITES.gate.z + 3.5, yaw: Math.PI / 2 },
   });
 
-  // Awakening Chamber.
+  // Awakening Chamber: the glowing Resonance Brazier, the starter chest and the Archivist.
   L.addProp('bed', 'bed', 2.6, 2.6, { size: 1.6, data: {} });
-  L.addProp('chest', 'chest', 7.5, 1.7, { size: 1, solid: 0.35, data: { loot: [['lantern', 1], ['bread', 2], ['lockpick', 3]] } });
+  // Far enough from the waking spot (3.6, 4.5) that reaching it means walking there.
+  L.addProp('brazier', 'brazier', 6.6, 7.1, { size: 1.5, solid: 0.45, data: {} });
+  L.lights.push({ x: 6.6, y: 1.4, z: 7.1, r: 0.5, g: 1.2, b: 1.5, flicker: 0.2 });
+  L.addProp('chest', 'chest', 7.5, 1.7, { size: 1, solid: 0.35, data: { starter: true, loot: [['fork', 1], ['lantern', 1], ['rune_lux', 1], ['draught', 2], ['lockpick', 3], ['bread', 2]] } });
   L.addProp('book', 'tablet', 4.5, 7.6, { size: 1.4, data: { book: 'keeper_log' } });
-  // Hall of Instruments.
-  L.addProp('decor', 'pedestal', 18.5, 4.5, { size: 1.1, solid: 0.3 });
-  L.addProp('item', 'i_fork', 18.5, 4.5, { size: 0.8, lift: 0.95, data: { item: 'fork', qty: 1 } });
+  const archivist = { x: 2.3, z: 7.2 };
+  L.npcDefs.push({
+    id: 'archivist', name: 'The Archivist', role: 'archivist', town: 'observatory', sprite: 'archivist', voice: 0.6,
+    faction: null, shop: null, hours: [0, 24, 24], spots: { home: archivist, work: archivist, tavern: archivist },
+  });
+  // The Atrium (Hall of Instruments): a training automaton to practise on.
   L.addProp('book', 'tablet', 11.5, 1.7, { size: 1.4, data: { book: 'on_resonance' } });
   L.addProp('decor', 'barrel', 10.7, 7.4, { size: 1, solid: 0.35 });
   L.addProp('decor', 'barrel', 11.6, 7.6, { size: 1, solid: 0.35 });
-  // Ley-Conduit Room: levers, a locked chest and the Lux runestone.
+  L.spawns.push({ key: 'obs:training', kind: 'mite', x: 16.5, z: 5.5, tier: 0, training: true });
+  // Ley-Conduit Room: levers and a locked chest.
   for (let n = 0; n < 3; n++) L.addProp('lever', 'lever_up', 24.5 + n * 2, 1.6, { size: 1.2, data: { index: n } });
-  L.addProp('chest', 'chest', 22.5, 7.5, { size: 1, solid: 0.35, data: { lockLevel: 1, loot: [['shards', 25], ['draught', 2], ['fen_lotus', 1], ['ember_moss', 1]] } });
-  L.addProp('decor', 'pedestal', 31.5, 7.5, { size: 1.1, solid: 0.3 });
-  L.addProp('item', 'rune_lux', 31.5, 7.5, { size: 0.7, lift: 0.95, data: { item: 'rune_lux', qty: 1 } });
+  L.addProp('chest', 'chest', 22.5, 7.5, { size: 1, solid: 0.35, data: { lockLevel: 1, loot: [['shards', 25], ['tonic', 1], ['fen_lotus', 1], ['ember_moss', 1]] } });
   L.spawns.push({ key: 'obs:mite:0', kind: 'mite', x: 26.5, z: 5.5, tier: 0 });
   L.spawns.push({ key: 'obs:mite:1', kind: 'mite', x: 29.5, z: 4.5, tier: 0 });
   // Gate Hall: anchors, the Great Astrolabe on the dais, and a hint tablet.
@@ -1020,6 +1026,18 @@ export function buildOverworld(seed) {
       } else if (pick < 0.75) L.addProp('decor', 'rock', x, z, { size: 1.2 + pick, solid: 0.5 });
       else L.addProp('decor', 'tree_dead', x, z, { size: 3.6, solid: 0.3 });
     }
+  }
+  for (let n = 0, tries = 0; n < 60 && tries < 6000; tries++) {
+    const i = 4 + Math.floor(rnd() * (N - 8));
+    const j = 4 + Math.floor(rnd() * (N - 8));
+    if (!free(i, j, 3)) continue;
+    const cluster = 1 + Math.floor(rnd() * 3);
+    for (let c = 0; c < cluster; c++) {
+      const x = i + 0.5 + (rnd() - 0.5) * 3;
+      const z = j + 0.5 + (rnd() - 0.5) * 3;
+      if (free(Math.floor(x), Math.floor(z), 3)) L.addProp('decor', 'ruin', x, z, { size: 2.2 + rnd() * 1.4, solid: 0.45 });
+    }
+    n++;
   }
   const herbFor = ['fen_lotus', 'ember_moss', 'ley_bloom'];
   const herbSprite = ['herb_lotus', 'herb_moss', 'herb_bloom'];

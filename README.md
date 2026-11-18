@@ -8,7 +8,19 @@ It takes after the hands-on dungeons and living towns of the classic *Ultima* ga
 
 ## The story
 
-You wake in the **Sunken Observatory**. Find the Brass Lantern and the Resonance Tuning Fork, and work out the three levers that relight the anchors, so the **Great Astrolabe Gate** opens onto the Shardlands. Up there the ley-lines are drifting. Master Vance of the Artificers' Guild in **Cinderwick** knows why: the Astrolabe's **Resonant Core** lies in the Drowned Shrine, out in the fen.
+You wake in the **Sunken Observatory**. Find the Aether Lantern and the Resonance Tuning Fork, and work out the three levers that relight the anchors (or speak a rune in the Gate Hall), so the **Great Astrolabe Gate** opens onto the Shardlands. Up there the ley-lines are drifting. Master Vance of the Artificers' Guild in **Cinderwick** knows why: the Astrolabe's **Resonant Core** lies in the Drowned Shrine, out in the fen.
+
+## Guided tutorial
+
+The title screen has a **Guided Tutorial: ON / OFF** toggle, which is remembered. With it on, a small card at the top of the screen walks you through five steps and moves on by itself as you do each one:
+
+1. **Look & Move** to the glowing Resonance Brazier.
+2. **Interact & Loot** the starter chest: Tuning Fork, Aether Lantern, Lumina Runestone and two Healing Draughts.
+3. **Equip** them from the Inventory, then close it.
+4. **Combat**: attack, parry or dash against the training automaton in the Atrium.
+5. **Open the Gate**: cast a rune in the Gate Hall or pull the Harmonic Levers, then step outside.
+
+The card never blocks the game, and its wording follows your controls (desktop or touch). You can leave at any time with **End Tutorial [Esc / Tap]**, the pause menu, or by asking **The Archivist** beside your bed. Ending early puts any starter gear you haven't looted into your pack and opens the Gate.
 
 ## The world
 
@@ -29,6 +41,7 @@ You wake in the **Sunken Observatory**. Find the Brass Lantern and the Resonance
 | Dialogue | Morrowind-style topics (*Rumours*, *The Observatory*, *Local Trade*, *Nearby Ruins*) plus branching choices with skill checks, e.g. `[Artificing 2] Offer to repair their broken water-pump`. |
 | Quests & factions | A journal for the main storyline, town requests, and procedural contracts from **The Artificers' Guild** and **The Wayfarer's Wardens** (relics, bounties, surveys, deliveries, supplies). |
 | Time | Day and night: one real second is one game minute. Fog and light change with biome and hour. Rest at beds and campfires to pass the time. |
+| Weather | Clear, cloudy, rain and storm, rolled every few in-game hours with odds set by biome. Rain dims the sun and thickens the fog. Storms bring lightning flashes and thunder that rolls in late from far strikes. Rain and wind have their own sound, muffled under a roof. |
 
 ## Controls
 
@@ -65,9 +78,9 @@ Push the folder with `index.html` at the root. Then go to **Settings â†’ Pages â
 |------|------|
 | `index.html` | Canvas, HUD layer, hotbar, modal host, touch controls |
 | `src/main.js` | `Game` (rules, time, levels and streaming, interaction, combat resolution, contracts, quests, save/load), `Input`, HUD, the `App` state machine and every modal |
-| `src/renderer.js` | WebGL 2 renderer. World tiles are 256px texture-array layers (albedo, normal, roughness/specular/cavity/metal) with mipmaps and anisotropic filtering. Pixel edges stay crisp up close. Shading: normal mapping, Blinn-Phong sun plus 16 point lights, a world-space detail texture against visible tiling, and corner ambient occlusion. Sprites get soft blended edges and contact shadows. Outdoors there's a sky with sun glow, and `exp2` height-and-distance fog everywhere. The scene renders to an HDR buffer and is finished with bloom, FXAA, ACES tone mapping and warm/cool grading. Internal resolution adapts to hold 60 FPS. |
+| `src/renderer.js` | WebGL 2 renderer. World tiles are 256px texture-array layers (albedo, normal, roughness/specular/cavity/metal) with mipmaps and anisotropic filtering. Pixel edges stay crisp up close. Shading: normal mapping, Blinn-Phong sun plus 16 point lights, a world-space detail texture against visible tiling, and corner ambient occlusion. Every billboard is a hardware instance of one quad (`drawElementsInstanced`): static trees, ruins, lamps, stalls and wind-swayed grass are baked into one instance buffer per chunk, and moving sprites are sorted each frame. Sprites get soft blended edges and contact shadows. Rain is a GPU particle system placed entirely in the vertex shader. Outdoors there's a sky with sun glow, and `exp2` height-and-distance fog everywhere. The scene renders to an HDR buffer and is finished with bloom, FXAA, ACES tone mapping and warm/cool grading. Internal resolution adapts to hold 60 FPS. |
 | `src/textures.js` | Tileable Perlin, Worley and fBm noise. Painted tiles are grown into 256px albedo, normal and material maps, with stone grain and pits, brass micro-scratches and verdigris patina, mortar crevices, moss creeping from floor seams, wood fibres, wet mud and pebbles. A z-buffered "pixel sculptor" makes the constructs, townsfolk, flora, props, item icons and hand viewmodels, with occlusion, warm and cool rim light, fabric folds and feathered silhouettes. |
-| `src/audio.js` | Web Audio synth: combat, locks, brewing, footsteps by surface, NPC voices, biome ambiences, adaptive music |
+| `src/audio.js` | Web Audio synth: combat, locks, brewing, footsteps by surface, NPC voices, biome ambiences, rain and wind beds, thunder, adaptive music |
 | `src/world.js` | Seeded generators (observatory, overworld, towns, dungeons), the `Level` grid with collision and line of sight, the `ChunkStreamer` |
 | `src/rpg.js` | Items, recipes, runes and spells, character, inventory, quests, contracts, pricing, books, dialogue engine |
 | `src/entities.js` | Player controller, constructs and their AI, orbs, projectiles, scheduled NPCs, particles |

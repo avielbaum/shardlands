@@ -3,11 +3,13 @@
  * layers (albedo, tangent-space normal, roughness/specular/cavity/metal) with mipmaps and
  * anisotropic filtering, a pixel-art-preserving sampler, derivative-based normal mapping,
  * Blinn-Phong sun + 16 point lights, world-space detail grunge, per-vertex corner AO, blob
- * contact shadows, soft-edged sorted sprites and exp2 height/distance fog. The scene renders
+ * contact shadows and exp2 height/distance fog. Every billboard (static clutter per chunk,
+ * grass, and sorted moving sprites) is a hardware instance of one quad (drawElementsInstanced);
+ * rain is a GPU particle system positioned entirely in the vertex shader. The scene renders
  * into an HDR framebuffer; post passes add bloom, FXAA, ACES tone mapping and warm/cool grading.
  */
-import { buildWorldAtlas, buildSpriteAtlas, buildWorldMaterials, buildDetailTexture, uploadTexture, uploadArray, uploadRepeating, spriteUV, MAT_SIZE } from './textures.js';
-import { TILE, CHUNK, Level } from './world.js';
+import { buildWorldAtlas, buildSpriteAtlas, buildWorldMaterials, buildDetailTexture, uploadTexture, uploadArray, uploadRepeating, spriteUV, MAT_SIZE, SPR } from './textures.js';
+import { TILE, CHUNK, Level, hash2 } from './world.js';
 
 /** @typedef {import('./world.js').Door} Door */
 /** @typedef {import('./world.js').Light} Light */
@@ -40,8 +42,9 @@ import { TILE, CHUNK, Level } from './world.js';
  * @property {SpriteDesc[]} sprites
  * @property {Light[]} lights
  * @property {Door[]} doors
- * @property {{dash:number, parry:number, hurt:number}} fx
+ * @property {{dash:number, parry:number, hurt:number, flash?:number}} fx flash = lightning
  * @property {Env} env
+ * @property {{rain:number, wind:number}} [weather] 0..1 each
  */
 
 const FLOATS = 14; // pos3 uv2 normal3 emit1 tint3 sky1 layer1
@@ -88,6 +91,7 @@ uniform vec3 uAmbient;
 uniform vec3 uSunDir;
 uniform vec3 uSunCol;
 uniform float uStore;
+uniform float uAlphaCut;
 out vec4 outColor;
 
 // Crisp texel edges up close (anti-aliased "sharp bilinear"), plain filtering when minified.
@@ -147,7 +151,7 @@ void main() {
   if (uMode == 1) {
     vec2 size = vec2(textureSize(uSpriteTex, 0));
     vec4 t = textureGrad(uSpriteTex, pixelUV(vUV, size), dFdx(vUV), dFdy(vUV));
-    if (t.a < 0.08) discard;
+    if (t.a < uAlphaCut) discard;
     albedo = t.rgb;
     alpha = t.a;
   } else {
@@ -219,6 +223,83 @@ void main() {
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
+// Instanced billboards: one unit quad per instance, faced to the camera here. With uShadow
+// the same instance becomes a ground contact-shadow quad. Grass and foliage tops sway in wind.
+const BILLBOARD_VS = `#version 300 es
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec3 iPos;
+layout(location=2) in vec2 iSize;
+layout(location=3) in vec4 iUV;
+layout(location=4) in vec4 iEmitSkyShadowGround;
+layout(location=5) in vec3 iTint;
+uniform mat4 uViewProj;
+uniform vec2 uCamRight;
+uniform int uShadow;
+uniform float uTime;
+uniform float uWind;
+out vec3 vPos; out vec2 vUV; out vec3 vNormal; out float vEmit; out vec3 vTint; out float vSky; out float vLayer;
+void main() {
+  float radius = iEmitSkyShadowGround.z;
+  vec3 p;
+  if (uShadow == 1) {
+    p = vec3(iPos.x + aCorner.x * 2.0 * radius, iEmitSkyShadowGround.w + 0.03, iPos.z + (aCorner.y * 2.0 - 1.0) * radius);
+    vUV = vec2(aCorner.x + 0.5, aCorner.y);
+    vTint = iTint;
+  } else {
+    float sway = aCorner.y * aCorner.y * uWind * 0.05 * iSize.y * sin(uTime * 1.7 + iPos.x * 0.9 + iPos.z * 1.3);
+    p = iPos + vec3(uCamRight.x, 0.0, uCamRight.y) * (aCorner.x * iSize.x + sway) + vec3(0.0, aCorner.y * iSize.y, 0.0);
+    vUV = vec2(mix(iUV.x, iUV.z, aCorner.x + 0.5), mix(iUV.w, iUV.y, aCorner.y));
+    // Standing sprites darken toward their feet.
+    vTint = iTint * (radius > 0.0 ? mix(0.62, 1.0, aCorner.y) : 1.0);
+  }
+  vPos = p;
+  vNormal = vec3(uCamRight.y, 0.0, -uCamRight.x);
+  vEmit = iEmitSkyShadowGround.x;
+  vSky = iEmitSkyShadowGround.y;
+  vLayer = -1.0;
+  gl_Position = uViewProj * vec4(p, 1.0);
+}`;
+
+// GPU rain: drops are anchored in world space and wrapped in a box around the eye, so no
+// CPU work per drop; each instance id hashes to its own column, phase and speed.
+const RAIN_VS = `#version 300 es
+layout(location=0) in vec2 aCorner;
+uniform mat4 uViewProj;
+uniform vec3 uEye;
+uniform float uTime;
+uniform vec2 uWind;
+uniform vec2 uCamRight;
+out vec2 vC;
+out float vDist;
+float h(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
+void main() {
+  float id = float(gl_InstanceID);
+  const float box = 26.0;
+  const float tall = 14.0;
+  float fx = h(id + 0.13);
+  float fz = h(id + 7.31);
+  float fy = h(id + 3.77);
+  float y = uEye.y + 7.0 - mod(uTime * (11.0 + fy * 4.0) + fy * tall, tall);
+  float x = uEye.x - box * 0.5 + mod(fx * box - uEye.x + box * 0.5, box);
+  float z = uEye.z - box * 0.5 + mod(fz * box - uEye.z + box * 0.5, box);
+  vec3 p = vec3(x, y, z) + vec3(uWind.x * 0.06, 0.55, uWind.y * 0.06) * aCorner.y + vec3(uCamRight.x, 0.0, uCamRight.y) * aCorner.x * 0.035;
+  vC = vec2(aCorner.x + 0.5, aCorner.y);
+  vDist = length(p - uEye);
+  gl_Position = uViewProj * vec4(p, 1.0);
+}`;
+
+const RAIN_FS = `#version 300 es
+precision highp float;
+in vec2 vC;
+in float vDist;
+uniform vec3 uRainCol;
+uniform float uStore;
+out vec4 outColor;
+void main() {
+  float a = (1.0 - abs(vC.x * 2.0 - 1.0)) * smoothstep(0.0, 0.35, vC.y) * 0.4 * smoothstep(13.0, 3.0, vDist);
+  outColor = vec4(uRainCol * uStore, a);
+}`;
+
 // Outdoor sky: horizon haze up to a time-of-day zenith, with a sun disc and glow that bloom.
 const SKY_FS = `#version 300 es
 precision highp float;
@@ -285,7 +366,7 @@ in vec2 vUV;
 uniform sampler2D uScene;
 uniform sampler2D uBloom;
 uniform vec2 uRes;
-uniform float uDash, uParry, uHurt, uTime, uStore, uExposure;
+uniform float uDash, uParry, uHurt, uFlash, uTime, uStore, uExposure;
 out vec4 outColor;
 vec3 S(vec2 uv) { return texture(uScene, uv).rgb / uStore; }
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -329,6 +410,7 @@ void main() {
   }
   col += texture(uBloom, vUV).rgb / uStore * 0.65;
   col += vec3(0.9, 0.7, 0.25) * uParry * 0.2 * (1.0 - r);
+  col += vec3(0.55, 0.6, 0.75) * uFlash * 0.9;
   col *= mix(0.62, 1.0, smoothstep(0.85, 0.3, r));
   col = mix(col, col * vec3(1.4, 0.3, 0.25) + vec3(0.25, 0.0, 0.0), uHurt * smoothstep(0.2, 0.75, r));
   col = aces(col * uExposure);
@@ -339,11 +421,13 @@ void main() {
 
 /** Every uniform each program declares; checked against the shader sources at startup. */
 const UNIFORMS = {
-  scene: ['uViewProj', 'uAlbedo', 'uNormal', 'uMat', 'uDetail', 'uSpriteTex', 'uMode', 'uLightPos', 'uLightCol', 'uLightCount', 'uEye', 'uTime', 'uFog', 'uFogDensity', 'uAmbient', 'uSunDir', 'uSunCol', 'uStore'],
+  scene: ['uViewProj', 'uAlbedo', 'uNormal', 'uMat', 'uDetail', 'uSpriteTex', 'uMode', 'uLightPos', 'uLightCol', 'uLightCount', 'uEye', 'uTime', 'uFog', 'uFogDensity', 'uAmbient', 'uSunDir', 'uSunCol', 'uStore', 'uAlphaCut'],
+  billboard: ['uViewProj', 'uAlbedo', 'uNormal', 'uMat', 'uDetail', 'uSpriteTex', 'uMode', 'uLightPos', 'uLightCol', 'uLightCount', 'uEye', 'uTime', 'uFog', 'uFogDensity', 'uAmbient', 'uSunDir', 'uSunCol', 'uStore', 'uAlphaCut', 'uCamRight', 'uShadow', 'uWind'],
+  rain: ['uViewProj', 'uEye', 'uTime', 'uWind', 'uCamRight', 'uRainCol', 'uStore'],
   sky: ['uInvViewProj', 'uEye', 'uFog', 'uZenith', 'uSunDir', 'uSunCol', 'uStore'],
   bright: ['uScene', 'uTexel', 'uThreshold', 'uStore'],
   blur: ['uSrc', 'uDir'],
-  composite: ['uScene', 'uBloom', 'uRes', 'uDash', 'uParry', 'uHurt', 'uTime', 'uStore', 'uExposure'],
+  composite: ['uScene', 'uBloom', 'uRes', 'uDash', 'uParry', 'uHurt', 'uFlash', 'uTime', 'uStore', 'uExposure'],
 };
 
 /** @param {WebGL2RenderingContext} gl @param {number} type @param {string} src */
@@ -634,6 +718,56 @@ function buildChunk(L, cx, cz, b) {
  * @property {number} h
  */
 
+/** Floats per billboard instance: pos3 size2 uv4 (emit, sky, shadowRadius, ground)4 tint3. */
+const INST = 16;
+
+/** Growable buffer of billboard instances. */
+class Instances {
+  /** @param {number} capacity */
+  constructor(capacity) {
+    this.data = new Float32Array(capacity * INST);
+    this.n = 0;
+  }
+
+  reset() {
+    this.n = 0;
+  }
+
+  /**
+   * @param {number} x @param {number} y bottom @param {number} z @param {number} w @param {number} h @param {number[]} uv
+   * @param {number} emit @param {number} sky @param {number} shadow contact-shadow radius (0 = none) @param {number} ground floor height under it
+   * @param {number[]} tint
+   */
+  push(x, y, z, w, h, uv, emit, sky, shadow, ground, tint) {
+    if ((this.n + 1) * INST > this.data.length) {
+      const next = new Float32Array(this.data.length * 2);
+      next.set(this.data);
+      this.data = next;
+    }
+    const d = this.data;
+    let i = this.n * INST;
+    d[i++] = x; d[i++] = y; d[i++] = z; d[i++] = w; d[i++] = h;
+    d[i++] = uv[0]; d[i++] = uv[1]; d[i++] = uv[2]; d[i++] = uv[3];
+    d[i++] = emit; d[i++] = sky; d[i++] = shadow; d[i++] = ground;
+    d[i++] = tint[0]; d[i++] = tint[1]; d[i++] = tint[2];
+    this.n++;
+  }
+}
+
+/** Decor sprites that glow (cyan-masked). */
+const GLOWING_DECOR = new Set(['vent']);
+
+/**
+ * @typedef {Object} ChunkMesh
+ * @property {{vao:WebGLVertexArrayObject, vbo:WebGLBuffer}} buf static world geometry
+ * @property {number} count world vertices
+ * @property {{vao:WebGLVertexArrayObject, vbo:WebGLBuffer}} clutter instanced decor + grass
+ * @property {number} decor instances that are decor (drawn at any distance, cast shadows)
+ * @property {number} total decor + grass instances
+ * @property {number} cx
+ * @property {number} cz
+ */
+
 export class Renderer {
   /** @param {HTMLCanvasElement} canvas */
   constructor(canvas) {
@@ -650,6 +784,8 @@ export class Renderer {
     const anisoExt = gl.getExtension('EXT_texture_filter_anisotropic');
     const aniso = anisoExt ? Math.min(8, gl.getParameter(anisoExt.MAX_TEXTURE_MAX_ANISOTROPY_EXT)) : 1;
     this.scene = createProgram(gl, SCENE_VS, SCENE_FS, UNIFORMS.scene);
+    this.billboard = createProgram(gl, BILLBOARD_VS, SCENE_FS, UNIFORMS.billboard);
+    this.rain = createProgram(gl, RAIN_VS, RAIN_FS, UNIFORMS.rain);
     this.sky = createProgram(gl, POST_VS, SKY_FS, UNIFORMS.sky);
     this.bright = createProgram(gl, POST_VS, BRIGHT_FS, UNIFORMS.bright);
     this.blur = createProgram(gl, POST_VS, BLUR_FS, UNIFORMS.blur);
@@ -661,17 +797,30 @@ export class Renderer {
     this.detailTex = uploadRepeating(gl, buildDetailTexture(), MAT_SIZE, aniso);
     this.spriteAtlas = buildSpriteAtlas();
     this.spriteTex = uploadTexture(gl, this.spriteAtlas, 4, aniso);
-    /** @type {Map<number, {buf:{vao:WebGLVertexArrayObject, vbo:WebGLBuffer}, count:number, cx:number, cz:number}>} */
+    // Shared unit quad for every instanced draw: x in [-0.5, 0.5], y in [0, 1].
+    this.quadVBO = gl.createBuffer();
+    this.quadIBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5, 0, 0.5, 0, 0.5, 1, -0.5, 1]), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadIBO);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW);
+    this.rainVAO = gl.createVertexArray();
+    gl.bindVertexArray(this.rainVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadIBO);
+    gl.bindVertexArray(null);
+    /** @type {Map<number, ChunkMesh>} */
     this.chunks = new Map();
     /** @type {Level|null} */
     this.level = null;
     this.chunkBatch = new Batch(4096);
+    this.clutter = new Instances(512);
     this.doorBatch = new Batch(256);
     this.doorBuf = this._makeBuffer();
-    this.spriteBatch = new Batch(4096);
-    this.spriteBuf = this._makeBuffer();
-    this.shadowBatch = new Batch(1024);
-    this.shadowBuf = this._makeBuffer();
+    this.sprites = new Instances(1024);
+    this.spriteBuf = this._makeInstanced();
     this.postVAO = gl.createVertexArray();
     /** @type {Target|null} */
     this.sceneRT = null;
@@ -700,13 +849,77 @@ export class Renderer {
     return { vao, vbo };
   }
 
+  /** VAO pairing the shared unit quad with a per-instance buffer (divisor 1). @returns {{vao: WebGLVertexArrayObject, vbo: WebGLBuffer}} */
+  _makeInstanced() {
+    const gl = this.gl;
+    const vao = gl.createVertexArray();
+    const vbo = gl.createBuffer();
+    if (!vao || !vbo) throw new Error('Could not allocate GPU buffers');
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadIBO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    const stride = INST * 4;
+    for (const [l, size, off] of [[1, 3, 0], [2, 2, 12], [3, 4, 20], [4, 4, 36], [5, 3, 52]]) {
+      gl.enableVertexAttribArray(l);
+      gl.vertexAttribPointer(l, size, gl.FLOAT, false, stride, off);
+      gl.vertexAttribDivisor(l, 1);
+    }
+    gl.bindVertexArray(null);
+    return { vao, vbo };
+  }
+
   /** Drop every chunk mesh and switch to another level. @param {Level} level */
   setLevel(level) {
     for (const key of [...this.chunks.keys()]) this.unloadChunk(key);
     this.level = level;
   }
 
-  /** Build and upload one chunk's mesh. @param {number} key */
+  /**
+   * Instanced clutter for one chunk: decor props (trees, rocks, ruins, stalls, lamps, barrels)
+   * followed by procedurally scattered grass tufts on open grass and dry fen.
+   * @param {Level} L @param {number} key @param {number} cx @param {number} cz
+   */
+  _buildClutter(L, key, cx, cz) {
+    const inst = this.clutter;
+    inst.reset();
+    for (const p of L.propChunks.get(key) ?? []) {
+      if (p.kind !== 'decor' || p.gone) continue;
+      const g = L.heightAt(p.x, p.z);
+      inst.push(p.x, g + p.lift, p.z, p.size, p.size, spriteUV(SPR[p.sprite]), GLOWING_DECOR.has(p.sprite) ? 1 : 0, L.covered(p.x, p.z) ? 0 : 1, p.solid ? p.size * 0.3 : 0, g, WHITE);
+    }
+    const decor = inst.n;
+    if (L.outdoor) {
+      const uvA = spriteUV(SPR.grass_a);
+      const uvB = spriteUV(SPR.grass_b);
+      for (let j = cz * CHUNK; j < Math.min((cz + 1) * CHUNK, L.h); j++) {
+        for (let i = cx * CHUNK; i < Math.min((cx + 1) * CHUNK, L.w); i++) {
+          const k = L.idx(i, j);
+          const t = L.floorTex[k];
+          if (L.wall[k] || L.ceil[k] || L.hazard[k] || L.zone[k] >= 0 || L.doorAt[k] >= 0 || L.floorH[k] < L.waterLevel + 0.05) continue;
+          const tufts = t === TILE.GRASS ? 2 : t === TILE.FEN ? 1 : 0;
+          for (let n = 0; n < tufts; n++) {
+            const h1 = hash2(i * 3 + n, j, 77);
+            const h2 = hash2(j * 5 + n, i, 91);
+            const x = i + 0.1 + h1 * 0.8;
+            const z = j + 0.1 + h2 * 0.8;
+            const s = 0.5 + h1 * h2 * 0.5;
+            const g = L.heightAt(x, z);
+            inst.push(x, g - 0.03, z, s * 1.2, s, h2 < 0.12 ? uvB : uvA, 0, 1, 0, g, [0.85 + h1 * 0.25, 0.92 + h2 * 0.18, 0.85]);
+          }
+        }
+      }
+    }
+    const gl = this.gl;
+    const clutter = this._makeInstanced();
+    gl.bindBuffer(gl.ARRAY_BUFFER, clutter.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, inst.data.subarray(0, inst.n * INST), gl.STATIC_DRAW);
+    return { clutter, decor, total: inst.n };
+  }
+
+  /** Build and upload one chunk's mesh and instanced clutter. @param {number} key */
   loadChunk(key) {
     if (!this.level || this.chunks.has(key)) return;
     const cx = key % 1024;
@@ -716,15 +929,19 @@ export class Renderer {
     const buf = this._makeBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf.vbo);
     gl.bufferData(gl.ARRAY_BUFFER, this.chunkBatch.data.subarray(0, this.chunkBatch.n), gl.STATIC_DRAW);
-    this.chunks.set(key, { buf, count: this.chunkBatch.vertexCount, cx, cz });
+    const count = this.chunkBatch.vertexCount;
+    this.chunks.set(key, { buf, count, cx, cz, ...this._buildClutter(this.level, key, cx, cz) });
   }
 
   /** @param {number} key */
   unloadChunk(key) {
     const c = this.chunks.get(key);
     if (!c) return;
-    this.gl.deleteBuffer(c.buf.vbo);
-    this.gl.deleteVertexArray(c.buf.vao);
+    const gl = this.gl;
+    for (const b of [c.buf, c.clutter]) {
+      gl.deleteBuffer(b.vbo);
+      gl.deleteVertexArray(b.vao);
+    }
     this.chunks.delete(key);
   }
 
@@ -819,33 +1036,22 @@ export class Renderer {
   }
 
   /**
-   * Sprites sorted back to front (soft edges blend), darkened toward their feet, plus a
-   * ground contact shadow under every standing sprite.
-   * @param {SpriteDesc[]} sprites @param {number} yaw @param {{x:number, z:number}} eye
+   * Moving sprites as instances, sorted back to front so their soft edges blend; standing
+   * sprites get a contact-shadow radius and the ground height under them.
+   * @param {SpriteDesc[]} sprites @param {{x:number, z:number}} eye
    */
-  _buildSprites(sprites, yaw, eye) {
-    const b = this.spriteBatch;
-    const sh = this.shadowBatch;
-    b.reset();
-    sh.reset();
-    const rx = -Math.sin(yaw);
-    const rz = Math.cos(yaw);
-    const nrm = [-Math.cos(yaw), 0, -Math.sin(yaw)];
+  _buildSprites(sprites, eye) {
+    const inst = this.sprites;
+    inst.reset();
     const order = sprites.map((s) => ({ s, d: (s.x - eye.x) ** 2 + (s.z - eye.z) ** 2 })).sort((a, c) => c.d - a.d);
     const L = this.level;
     for (const { s } of order) {
-      const hx = rx * s.w * 0.5;
-      const hz = rz * s.w * 0.5;
-      const top = s.y + s.h;
       const standing = s.h >= 0.9 && s.emit < 2;
-      const ao = standing ? [1, 1, 0.62, 0.62] : undefined;
-      b.quad([s.x - hx, top, s.z - hz, s.x + hx, top, s.z + hz, s.x + hx, s.y, s.z + hz, s.x - hx, s.y, s.z - hz], spriteUV(s.frame), nrm, s.emit, s.tint, s.sky, -1, ao);
-      if (standing && L) {
-        const r = s.w * 0.3;
-        const g = L.heightAt(s.x, s.z) + 0.03;
-        sh.quad([s.x - r, g, s.z - r, s.x + r, g, s.z - r, s.x + r, g, s.z + r, s.x - r, g, s.z + r], FULL_UV, [0, 1, 0], 0, WHITE, 1, -1);
-      }
+      inst.push(s.x, s.y, s.z, s.w, s.h, spriteUV(s.frame), s.emit, s.sky, standing ? s.w * 0.3 : 0, L ? L.heightAt(s.x, s.z) : s.y, s.tint);
     }
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.spriteBuf.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, inst.data.subarray(0, inst.n * INST), gl.DYNAMIC_DRAW);
   }
 
   /** Pick the lights nearest the eye, apply flicker, pack into uniform arrays. @param {Light[]} lights @param {{x:number,y:number,z:number}} eye @param {number} time */
@@ -861,6 +1067,29 @@ export class Renderer {
     return n;
   }
 
+  /**
+   * Uniforms shared by the world and billboard programs (both use SCENE_FS).
+   * @param {Record<string, WebGLUniformLocation>} u @param {Float32Array} viewProj @param {RenderView} v @param {number} lights
+   */
+  _common(u, viewProj, v, lights) {
+    const gl = this.gl;
+    const env = v.env;
+    gl.uniformMatrix4fv(u.uViewProj, false, viewProj);
+    gl.uniform3fv(u.uLightPos, this.lightPos);
+    gl.uniform3fv(u.uLightCol, this.lightCol);
+    gl.uniform1i(u.uLightCount, lights);
+    gl.uniform3f(u.uEye, v.eye.x, v.eye.y, v.eye.z);
+    gl.uniform1f(u.uTime, v.time);
+    gl.uniform3fv(u.uFog, env.fog);
+    gl.uniform1f(u.uFogDensity, env.fogDensity);
+    gl.uniform3fv(u.uAmbient, env.ambient);
+    gl.uniform3fv(u.uSunDir, env.sunDir);
+    gl.uniform3fv(u.uSunCol, env.sunCol);
+    gl.uniform1f(u.uStore, this.store);
+    gl.uniform1f(u.uAlphaCut, 0.5);
+    [u.uAlbedo, u.uNormal, u.uMat, u.uDetail, u.uSpriteTex].forEach((loc, i) => gl.uniform1i(loc, i));
+  }
+
   /** @param {{vao: WebGLVertexArrayObject, vbo: WebGLBuffer}} buf @param {Batch} batch */
   _drawBatch(buf, batch) {
     if (!batch.n) return;
@@ -869,6 +1098,14 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, batch.data.subarray(0, batch.n), gl.DYNAMIC_DRAW);
     gl.bindVertexArray(buf.vao);
     gl.drawArrays(gl.TRIANGLES, 0, batch.vertexCount);
+  }
+
+  /** @param {WebGLVertexArrayObject} vao @param {number} count */
+  _drawInstances(vao, count) {
+    if (count <= 0) return;
+    const gl = this.gl;
+    gl.bindVertexArray(vao);
+    gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, count);
   }
 
   /** Draw a fullscreen pass into a target (or the canvas). @param {Target|null} rt */
@@ -887,11 +1124,14 @@ export class Renderer {
     const scene = /** @type {Target} */ (this.sceneRT);
     const bloomA = /** @type {Target} */ (this.bloomA);
     const bloomB = /** @type {Target} */ (this.bloomB);
-    const { u } = this.scene;
+    const L = this.level;
     const cp = Math.cos(v.pitch);
     const fwd = [Math.cos(v.yaw) * cp, Math.sin(v.pitch), Math.sin(v.yaw) * cp];
     const viewProj = multiply(perspective((70 * Math.PI) / 180, scene.w / scene.h, 0.05, 140), viewMatrix([v.eye.x, v.eye.y, v.eye.z], fwd));
     const env = v.env;
+    const rain = v.weather ? v.weather.rain : 0;
+    const wind = v.weather ? v.weather.wind : 0;
+    const camRight = [-Math.sin(v.yaw), Math.cos(v.yaw)];
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, scene.fbo);
     gl.viewport(0, 0, scene.w, scene.h);
@@ -901,7 +1141,7 @@ export class Renderer {
     gl.depthMask(true);
     gl.disable(gl.CULL_FACE);
     gl.disable(gl.BLEND);
-    if (this.level && this.level.outdoor) {
+    if (L && L.outdoor) {
       // Sky first, without touching depth; daylight is read from the sun colour.
       const day = Math.min(1, Math.max(0, env.sunCol[1]));
       const zen = [env.fog[0] * 0.35 + (0.3 - env.fog[0] * 0.35) * day, env.fog[1] * 0.4 + (0.5 - env.fog[1] * 0.4) * day, env.fog[2] * 0.6 + (0.86 - env.fog[2] * 0.6) * day];
@@ -921,54 +1161,83 @@ export class Renderer {
       gl.enable(gl.DEPTH_TEST);
       gl.depthMask(true);
     }
-    gl.useProgram(this.scene.prog);
-    gl.uniformMatrix4fv(u.uViewProj, false, viewProj);
+
     const n = this._packLights(v.lights, v.eye, v.time);
-    gl.uniform3fv(u.uLightPos, this.lightPos);
-    gl.uniform3fv(u.uLightCol, this.lightCol);
-    gl.uniform1i(u.uLightCount, n);
-    gl.uniform3f(u.uEye, v.eye.x, v.eye.y, v.eye.z);
-    gl.uniform1f(u.uTime, v.time);
-    gl.uniform3fv(u.uFog, env.fog);
-    gl.uniform1f(u.uFogDensity, env.fogDensity);
-    gl.uniform3fv(u.uAmbient, env.ambient);
-    gl.uniform3fv(u.uSunDir, env.sunDir);
-    gl.uniform3fv(u.uSunCol, env.sunCol);
-    gl.uniform1f(u.uStore, this.store);
-    const units = [[u.uAlbedo, gl.TEXTURE_2D_ARRAY, this.albedoTex], [u.uNormal, gl.TEXTURE_2D_ARRAY, this.normalTex], [u.uMat, gl.TEXTURE_2D_ARRAY, this.matTex],
-      [u.uDetail, gl.TEXTURE_2D, this.detailTex], [u.uSpriteTex, gl.TEXTURE_2D, this.spriteTex]];
-    units.forEach(([loc, target, tex], i) => {
+    const textures = [[gl.TEXTURE_2D_ARRAY, this.albedoTex], [gl.TEXTURE_2D_ARRAY, this.normalTex], [gl.TEXTURE_2D_ARRAY, this.matTex], [gl.TEXTURE_2D, this.detailTex], [gl.TEXTURE_2D, this.spriteTex]];
+    textures.forEach(([target, tex], i) => {
       gl.activeTexture(gl.TEXTURE0 + i);
       gl.bindTexture(/** @type {number} */ (target), /** @type {WebGLTexture} */ (tex));
-      gl.uniform1i(/** @type {WebGLUniformLocation} */ (loc), i);
     });
 
+    // World geometry and doors.
+    const u = this.scene.u;
+    gl.useProgram(this.scene.prog);
+    this._common(u, viewProj, v, n);
     gl.uniform1i(u.uMode, MODE.WORLD);
     const fx = Math.cos(v.yaw);
     const fz = Math.sin(v.yaw);
+    /** @type {ChunkMesh[]} */
+    const visible = [];
     for (const c of this.chunks.values()) {
       const dx = (c.cx + 0.5) * CHUNK - v.eye.x;
       const dz = (c.cz + 0.5) * CHUNK - v.eye.z;
       const d = Math.hypot(dx, dz);
       if (d > CHUNK * 1.5 && (dx * fx + dz * fz) / d < -0.35) continue;
+      visible.push(c);
       gl.bindVertexArray(c.buf.vao);
       gl.drawArrays(gl.TRIANGLES, 0, c.count);
     }
     this._buildDoors(v.doors, v.time);
     this._drawBatch(this.doorBuf, this.doorBatch);
 
-    this._buildSprites(v.sprites, v.yaw, v.eye);
+    // Instanced clutter (alpha-tested, opaque): grass only within 36 units.
+    const bu = this.billboard.u;
+    gl.useProgram(this.billboard.prog);
+    this._common(bu, viewProj, v, n);
+    gl.uniform2f(bu.uCamRight, camRight[0], camRight[1]);
+    gl.uniform1f(bu.uWind, 0.3 + wind);
+    gl.uniform1i(bu.uMode, MODE.SPRITE);
+    gl.uniform1i(bu.uShadow, 0);
+    for (const c of visible) {
+      const d = Math.hypot((c.cx + 0.5) * CHUNK - v.eye.x, (c.cz + 0.5) * CHUNK - v.eye.z);
+      this._drawInstances(c.clutter.vao, d < 36 ? c.total : c.decor);
+    }
+
+    // Contact shadows (clutter and moving sprites), then the sorted, soft-edged sprites.
+    this._buildSprites(v.sprites, v.eye);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
     gl.enable(gl.POLYGON_OFFSET_FILL);
     gl.polygonOffset(-1, -4);
-    gl.uniform1i(u.uMode, MODE.SHADOW);
-    this._drawBatch(this.shadowBuf, this.shadowBatch);
+    gl.uniform1i(bu.uMode, MODE.SHADOW);
+    gl.uniform1i(bu.uShadow, 1);
+    for (const c of visible) this._drawInstances(c.clutter.vao, c.decor);
+    this._drawInstances(this.spriteBuf.vao, this.sprites.n);
     gl.disable(gl.POLYGON_OFFSET_FILL);
     gl.depthMask(true);
-    gl.uniform1i(u.uMode, MODE.SPRITE);
-    this._drawBatch(this.spriteBuf, this.spriteBatch);
+    gl.uniform1i(bu.uShadow, 0);
+    gl.uniform1i(bu.uMode, MODE.SPRITE);
+    gl.uniform1f(bu.uAlphaCut, 0.08);
+    this._drawInstances(this.spriteBuf.vao, this.sprites.n);
+
+    // GPU rain: every drop positioned in the vertex shader from its instance id.
+    if (L && L.outdoor && rain > 0.01 && !L.covered(v.eye.x, v.eye.z)) {
+      const ru = this.rain.u;
+      gl.useProgram(this.rain.prog);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      gl.depthMask(false);
+      gl.uniformMatrix4fv(ru.uViewProj, false, viewProj);
+      gl.uniform3f(ru.uEye, v.eye.x, v.eye.y, v.eye.z);
+      gl.uniform1f(ru.uTime, v.time);
+      gl.uniform2f(ru.uWind, wind * 2.5, wind * 1.2);
+      gl.uniform2f(ru.uCamRight, camRight[0], camRight[1]);
+      gl.uniform3f(ru.uRainCol, env.ambient[0] * 1.8 + env.sunCol[0] * 0.3, env.ambient[1] * 1.8 + env.sunCol[1] * 0.3, env.ambient[2] * 2 + env.sunCol[2] * 0.3);
+      gl.uniform1f(ru.uStore, this.store);
+      gl.bindVertexArray(this.rainVAO);
+      gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, Math.round(rain * 2400));
+      gl.depthMask(true);
+    }
     gl.disable(gl.BLEND);
     gl.disable(gl.DEPTH_TEST);
 
@@ -1002,6 +1271,7 @@ export class Renderer {
     gl.uniform1f(cu.uDash, v.fx.dash);
     gl.uniform1f(cu.uParry, v.fx.parry);
     gl.uniform1f(cu.uHurt, v.fx.hurt);
+    gl.uniform1f(cu.uFlash, v.fx.flash ?? 0);
     gl.uniform1f(cu.uTime, v.time);
     gl.uniform1f(cu.uStore, this.store);
     gl.uniform1f(cu.uExposure, 1.2);

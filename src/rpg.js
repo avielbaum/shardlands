@@ -74,7 +74,7 @@ export const ITEMS = {
   fork: { name: 'Resonance Tuning Fork', type: 'weapon', sprite: 'i_fork', weight: 3, value: 40, weapon: 'melee', damage: 14, desc: 'A singing brass fork. Sweep, thrust or chop with it; time a strike to turn orbs back on their makers.' },
   scatter: { name: 'Prism Scattergun', type: 'weapon', sprite: 'i_scatter', weight: 6, value: 220, weapon: 'ranged', damage: 9, pellets: 3, spread: 0.12, speed: 22, desc: 'Splits ammunition into a fan of three. Shots ricochet off walls.' },
   crossbow: { name: 'Alchemical Crossbow', type: 'weapon', sprite: 'i_crossbow', weight: 5, value: 180, weapon: 'ranged', damage: 26, pellets: 1, spread: 0, speed: 30, desc: 'A single heavy bolt that banks off stone.' },
-  lantern: { name: 'Brass Lantern', type: 'offhand', sprite: 'i_lantern', weight: 2, value: 30, light: true, desc: 'A steady amber light, carried in the off hand.' },
+  lantern: { name: 'Aether Lantern', type: 'offhand', sprite: 'i_lantern', weight: 2, value: 30, light: true, desc: 'A steady amber light, carried in the off hand.' },
   buckler: { name: 'Riveted Buckler', type: 'offhand', sprite: 'i_buckler', weight: 4, value: 90, armor: 3, parry: 0.1, desc: '+3 armour and a wider parry window.' },
   coat: { name: 'Padded Fen Coat', type: 'armor', sprite: 'i_coat', weight: 5, value: 60, armor: 4, desc: 'Quilted canvas; light and warm.' },
   cuirass: { name: 'Brass Cuirass', type: 'armor', sprite: 'i_cuirass', weight: 12, value: 260, armor: 10, desc: 'Heavy riveted brass. Turns blades.' },
@@ -96,7 +96,7 @@ export const ITEMS = {
   book_almanac: { name: "A Fen-Walker's Almanac", type: 'book', sprite: 'i_book', weight: 1, value: 20, book: 'book_almanac', desc: 'A field guide to the fen.' },
   book_ley: { name: 'Treatise on Ley Resonance', type: 'book', sprite: 'i_book', weight: 1, value: 30, book: 'book_ley', desc: 'Dry, but true.' },
   book_colossus: { name: 'The Fall of the Brass Colossus', type: 'book', sprite: 'i_book', weight: 1, value: 20, book: 'book_colossus', desc: 'A tavern ballad, written down.' },
-  rune_lux: { name: 'Runestone: Lux', type: 'rune', sprite: 'rune_lux', weight: 0.5, value: 80, desc: 'The rune of light.' },
+  rune_lux: { name: 'Lumina Runestone (Lux)', type: 'rune', sprite: 'rune_lux', weight: 0.5, value: 80, desc: 'The rune of light.' },
   rune_vita: { name: 'Runestone: Vita', type: 'rune', sprite: 'rune_vita', weight: 0.5, value: 120, desc: 'The rune of life.' },
   rune_vis: { name: 'Runestone: Vis', type: 'rune', sprite: 'rune_vis', weight: 0.5, value: 120, desc: 'The rune of force.' },
   rune_aperio: { name: 'Runestone: Aperio', type: 'rune', sprite: 'rune_aperio', weight: 0.5, value: 160, desc: 'The rune of opening.' },
@@ -531,6 +531,11 @@ export class Dialogue {
     const d = this.def;
     const hour = g.hour;
     const tod = hour < 12 ? 'Morning' : hour < 18 ? 'Afternoon' : 'Evening';
+    if (d.role === 'archivist') {
+      return g.tutorialActive
+        ? 'Ah, you wake. I am the Archivist. I can guide you through the Observatory, or, if you would rather find your own way, simply say so.'
+        : 'The instruments are quiet. Ask what you will.';
+    }
     if (d.id === 'vance' && g.mainStage === 20) return `${tod}. You have the look of someone who climbed out of the Observatory. I've been waiting for one of you. Ask me about the ley-lines.`;
     if (d.role === 'guard') return `${tod}, traveller. Keep your blade sheathed inside the walls.`;
     if (d.role === 'innkeeper') return `Welcome to ${d.town === 'cinderwick' ? 'the Molten Mug' : 'the Rooted Lantern'}! Food, drink, a bed: what'll it be?`;
@@ -543,6 +548,14 @@ export class Dialogue {
   topics() {
     const g = this.game;
     const d = this.def;
+    if (d.role === 'archivist') {
+      const a = [
+        { id: 'background', label: 'Who are you?' }, { id: 'observatory', label: 'The Observatory' },
+        { id: 'gate', label: 'The Astrolabe Gate' }, { id: 'runes', label: 'Runecasting' },
+      ];
+      if (g.tutorialActive) a.push({ id: 'end_tutorial', label: 'End the tutorial' });
+      return a;
+    }
     const t = [
       { id: 'background', label: 'Who are you?' }, { id: 'rumors', label: 'Rumours' }, { id: 'observatory', label: 'The Observatory' },
       { id: 'trade', label: 'Local Trade' }, { id: 'ruins', label: 'Nearby Ruins' },
@@ -580,6 +593,7 @@ export class Dialogue {
           innkeeper: "I pour, I cook, I listen. Mostly I listen.",
           guard: `I watch the ${d.town === 'cinderwick' ? 'Cinderwick' : 'Oakhaven'} roads, and you, now.`,
           folk: `${d.name}. Born here, likely die here, hopefully not today.`,
+          archivist: 'A cataloguing engine. The Keeper wound me before the anchors drifted, and I have been counting stars in the dark since.',
         };
         return { text: /** @type {Record<string, string>} */ (lines)[d.role] || lines.folk, options: [] };
       }
@@ -588,6 +602,7 @@ export class Dialogue {
         return { text: RUMORS[h], options: [] };
       }
       case 'observatory':
+        if (d.role === 'archivist') return { text: 'Four chambers: this one, the Atrium where the training automaton waits, the Conduit Room with its levers, and the Gate Hall beneath the Great Astrolabe.', options: [] };
         return { text: g.mainStage >= 100 ? 'Since the Astrolabe turned true again, the lamps have stopped flickering. That was you, wasn\'t it?' : 'The Sunken Observatory? South of the crossroads, under the brass ring. It\'s been quiet for a generation. Now the lamps flicker every night.', options: [] };
       case 'trade':
         return { text: d.town === 'cinderwick' ? 'Cinderwick lives on brass and basalt. Tobin sells tools and ammunition, Brann forges arms. Bring scrap; everyone wants scrap.' : 'Oakhaven trades in herbs and timber. Pell brews draughts and tonics, Quill fletches bolts. Ley Blooms fetch a fair price.', options: [] };
@@ -632,6 +647,12 @@ export class Dialogue {
         return this._ley();
       case 'chasm':
         return { text: 'The Hollow Spire stands inside a ring of chasm in the eastern Badlands. Nobody crosses without Feather Step: Levis and Vis together. Pell sells a Levis stone, or finish your first contract with me and I\'ll give you mine.', options: [] };
+      case 'gate':
+        return { text: 'The Great Astrolabe Gate answers its three anchors. Pull the levers in the Conduit Room until all three sing, or speak a rune in the Gate Hall and they may answer you directly.', options: [] };
+      case 'runes':
+        return { text: 'Carry a runestone, then inscribe it from your Skills (K, or SKILLS on touch). Lux alone is Lumina, a light. Spells sit on your hotbar; select one and attack to cast.', options: [] };
+      case 'end_tutorial':
+        return { text: 'You wish to go your own way? I will open the Gate and see that your gear is in your pack.', options: [this.opt('end_tutorial_yes', 'Yes: open the Gate and let me go'), this.opt('no', 'Keep guiding me')] };
       case 'pump':
         return {
           text: "My water-pump's seized again. The whole east side drinks from it, and I can't make head nor tail of the gears.",
@@ -684,6 +705,10 @@ export class Dialogue {
     const c = g.char;
     const d = this.def;
     if (id === 'no') return { text: 'As you like.', options: [] };
+    if (id === 'end_tutorial_yes') {
+      g.endTutorial();
+      return { text: 'Then go. The Gate stands open and your gear is in your pack. The Shardlands are yours.', options: [] };
+    }
     if (id === 'rent') {
       g.addShards(-10);
       g.flags.rent = d.town;

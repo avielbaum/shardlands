@@ -1,6 +1,7 @@
 /**
  * @file Game state and rules, fixed-timestep loop, game-state machine (EXPLORE, DIALOGUE,
- * INVENTORY, SKILLS, JOURNAL, MAP, TRADE, LOOT, READ, REST, PAUSE, DEAD, ENDING), input
+ * INVENTORY, SKILLS, JOURNAL, MAP, TRADE, LOOT, READ, REST, PAUSE, DEAD, ENDING), the guided
+ * tutorial coordinator, dynamic weather, input
  * orchestration (keyboard, mouse with Pointer Lock plus a free-look fallback, dual touch
  * joysticks), the diegetic HUD, modal UIs and the localStorage save/load manager.
  */
@@ -34,6 +35,52 @@ const SAVE_KEY = 'aetherium-shardlands-save-v1';
 /** Lever -> anchors it toggles (left, heart, right). */
 const LEVER_MAP = [[0, 1], [1], [1, 2]];
 const ANCHOR_START = [false, true, false];
+
+/**
+ * Guided tutorial steps. Each has a title and desktop / touch prompts; the coordinator in
+ * Game.updateTutorial() advances them automatically as the player completes each action.
+ */
+export const TUTORIAL_STEPS = Object.freeze([
+  {
+    title: 'Look & Move',
+    desktop: 'Look around with the mouse and walk with WASD to the glowing Resonance Brazier.',
+    touch: 'Aim with your right thumb and walk with your left thumb to the glowing Resonance Brazier.',
+  },
+  {
+    title: 'Interact & Loot',
+    desktop: 'Face the chest by the north wall and press E. Take the Tuning Fork, Aether Lantern and Lumina Runestone.',
+    touch: 'Face the chest by the north wall and tap USE. Take the Tuning Fork, Aether Lantern and Lumina Runestone.',
+  },
+  {
+    title: 'Equip',
+    desktop: 'Open your pack with I or Tab, check the Tuning Fork and Aether Lantern are equipped, then close it.',
+    touch: 'Tap PACK, check the Tuning Fork and Aether Lantern are equipped, then close it with ✕.',
+  },
+  {
+    title: 'Combat, Parry & Dash',
+    desktop: 'Open the east door into the Atrium. Strike the training automaton with Left Click, parry its lunge with Right Click, Phase Dash with Shift.',
+    touch: 'Open the east door into the Atrium. Strike the training automaton with ATTACK, parry its lunge with PARRY, dodge with DASH.',
+  },
+  {
+    title: 'Runes & the Gate',
+    desktop: 'Inscribe Lumina in Skills (K) and cast it in the Gate Hall, or pull the Harmonic Levers in the Conduit Room until all three anchors sing. Then step through the Great Astrolabe Gate.',
+    touch: 'Inscribe Lumina in SKILLS and cast it in the Gate Hall, or pull the Harmonic Levers in the Conduit Room until all three anchors sing. Then step through the Great Astrolabe Gate.',
+  },
+]);
+
+/** Weather kinds: target rain and wind, and the label shown under the clock. */
+const WEATHER = {
+  clear: { rain: 0, wind: 0.15, label: 'Clear' },
+  cloudy: { rain: 0, wind: 0.35, label: 'Overcast' },
+  rain: { rain: 0.6, wind: 0.4, label: 'Rain' },
+  storm: { rain: 1, wind: 0.85, label: 'Storm' },
+};
+/** Chance of each weather kind per biome (fen, badlands, wood). */
+const WEATHER_ODDS = [
+  [['clear', 0.3], ['cloudy', 0.25], ['rain', 0.3], ['storm', 0.15]],
+  [['clear', 0.5], ['cloudy', 0.35], ['rain', 0.1], ['storm', 0.05]],
+  [['clear', 0.4], ['cloudy', 0.3], ['rain', 0.22], ['storm', 0.08]],
+];
 /** @param {number} v @param {number} a @param {number} b */
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 /** @param {number[]} a @param {number[]} b @param {number} t */
@@ -110,7 +157,9 @@ export class Game {
     this.flowOx = 0;
     this.flowOz = 0;
     this.flow = new Int16Array(48 * 48);
-    this.fx = { dash: 0, parry: 0, hurt: 0 };
+    this.fx = { dash: 0, parry: 0, hurt: 0, flash: 0 };
+    /** Dynamic weather (not saved: it rerolls on load). */
+    this.weather = { kind: /** @type {keyof typeof WEATHER} */ ('clear'), rain: 0, wind: 0.15, next: 0, thunderT: 8 };
     /** @type {{text:string, t:number}[]} */
     this.notes = [];
     this.hotIndex = 0;
@@ -123,8 +172,9 @@ export class Game {
     this.hitmarker = 0;
   }
 
-  /** Start a fresh run: awaken in the Sunken Observatory. */
-  newRun() {
+  /** Start a fresh run: awaken in the Sunken Observatory. @param {boolean} [tutorial] guided tutorial on */
+  newRun(tutorial = false) {
+    this.flags.tutorial = { active: tutorial, step: 0, sawInventory: false, parried: false };
     this.quests.start('main', 'The Unquiet Ley', 'main');
     this.setMain(10, 'I awoke in the Sunken Observatory. The Great Astrolabe Gate is sealed; the Keeper\'s log speaks of a Fork, three levers and three anchors.');
     this.enterLevel('observatory', this.level.spawn.x, this.level.spawn.z, this.level.spawn.yaw);
@@ -136,6 +186,10 @@ export class Game {
 
   get day() {
     return Math.floor(this.minutes / 1440) + 1;
+  }
+
+  get tutorialActive() {
+    return !!this.flags.tutorial?.active;
   }
 
   get mainStage() {
@@ -272,6 +326,7 @@ export class Game {
         if (!this.discovered.has(lm.id) && Math.hypot(lm.x - p.x, lm.z - p.z) < lm.r) this.discover(lm.id, lm.name);
       }
       if (this.flags.rent && this.minutes > this.flags.rentUntil) this.flags.rent = null;
+      if (this.tutorialActive) this.updateTutorial();
     }
     this.fx.dash = Math.max(0, this.fx.dash - dt * 3);
     this.fx.parry = Math.max(0, this.fx.parry - dt * 2.5);
@@ -289,6 +344,7 @@ export class Game {
       this.ambienceKey = amb + night;
       this.audio.setAmbience(amb, night);
     }
+    this._updateWeather(dt);
     this._updateEnv(dt);
     if (c.hp <= 0) this._die();
     if (this.pendingTravel) {
@@ -339,8 +395,14 @@ export class Game {
       fog = mix3(fog, [0.75, 0.42, 0.28], dusk * 0.45);
       const sunCol = mix3([0, 0, 0], [1.0, 0.9, 0.75], day).map((v, k) => v + [0.5, 0.2, 0.05][k] * dusk * 0.6);
       const l = Math.hypot(Math.cos(ang), Math.max(0.15, sy), 0.35);
+      // Weather greys the haze, thickens it, dims the sun and the sky light.
+      const wet = this.weather.rain;
+      const overcast = Math.max(wet, this.weather.kind === 'cloudy' ? 0.45 : 0);
+      fog = mix3(fog, [0.42 * day + 0.05, 0.45 * day + 0.06, 0.5 * day + 0.1], overcast * 0.6);
       target = {
-        fog, fogDensity: dens * (day < 0.3 ? 1.4 : 1), ambient: mix3([0.15, 0.16, 0.26], [0.36, 0.37, 0.42], Math.max(day, dusk * 0.6)), sunCol,
+        fog, fogDensity: dens * (day < 0.3 ? 1.4 : 1) * (1 + wet * 0.9),
+        ambient: mix3([0.15, 0.16, 0.26], [0.36, 0.37, 0.42], Math.max(day, dusk * 0.6)).map((v) => v * (1 - overcast * 0.25)),
+        sunCol: sunCol.map((v) => v * (1 - overcast * 0.65)),
         sunDir: [Math.cos(ang) / l, Math.max(0.15, sy) / l, 0.35 / l],
       };
     }
@@ -351,6 +413,107 @@ export class Game {
     e.sunCol = mix3(e.sunCol, target.sunCol, k);
     e.sunDir = target.sunDir;
     e.fogDensity += (target.fogDensity - e.fogDensity) * k;
+  }
+
+  /**
+   * Weather: every few in-game hours roll a new kind from the current biome's odds, ease
+   * rain and wind toward it, and throw lightning (flash + distance-delayed thunder) in storms.
+   * @param {number} dt
+   */
+  _updateWeather(dt) {
+    const w = this.weather;
+    const L = this.level;
+    if (this.minutes >= w.next) {
+      const biome = L.outdoor && L.biomeAt ? L.biomeAt(this.player.x, this.player.z) : 2;
+      let r = Math.random();
+      const odds = WEATHER_ODDS[biome];
+      w.kind = /** @type {keyof typeof WEATHER} */ ((odds.find(([, pr]) => (r -= /** @type {number} */ (pr)) < 0) ?? odds[0])[0]);
+      w.next = this.minutes + 120 + Math.random() * 180;
+    }
+    const target = WEATHER[w.kind];
+    w.rain += clamp(target.rain - w.rain, -dt * 0.05, dt * 0.05);
+    w.wind += clamp(target.wind - w.wind, -dt * 0.05, dt * 0.05);
+    this.fx.flash = Math.max(0, this.fx.flash - dt * 3);
+    if (w.kind === 'storm' && w.rain > 0.6) {
+      w.thunderT -= dt;
+      if (w.thunderT <= 0) {
+        w.thunderT = 6 + Math.random() * 12;
+        const delay = 0.2 + Math.random() * 2.5;
+        if (L.outdoor) this.fx.flash = 1 - delay / 3.5;
+        this.audio.thunder(delay);
+      }
+    }
+    this.audio.setWeather(w.rain, w.wind, !L.outdoor || L.covered(this.player.x, this.player.z));
+  }
+
+  // -------------------------------------------------------------------------
+  // Guided tutorial
+  // -------------------------------------------------------------------------
+
+  /** Advance the tutorial when the current step's action is done. */
+  updateTutorial() {
+    const t = this.flags.tutorial;
+    const c = this.char;
+    const L = this.level;
+    const done = [
+      () => L.props.some((pr) => pr.kind === 'brazier' && Math.hypot(pr.x - this.player.x, pr.z - this.player.z) < 2.6),
+      () => c.inventory.count('fork') > 0 && c.inventory.count('lantern') > 0 && c.inventory.count('rune_lux') > 0,
+      () => t.sawInventory && c.equip.main === 'fork' && c.equip.off === 'lantern',
+      () => !!this.world.killed['obs:training'] || t.parried,
+      () => L.id === 'overworld',
+    ][t.step];
+    if (!done || !done()) return;
+    t.step++;
+    this.audio.chime(1320 + t.step * 120);
+    if (t.step >= TUTORIAL_STEPS.length) {
+      t.active = false;
+      this.notify('Tutorial complete. The Shardlands are yours.');
+      this.audio.quest();
+    }
+  }
+
+  /**
+   * End the tutorial now: open the Great Astrolabe Gate and hand over any starter gear still
+   * in the starter chest (Tuning Fork, Aether Lantern, Lumina Runestone, 2 Healing Draughts).
+   */
+  endTutorial() {
+    const t = this.flags.tutorial;
+    if (!t || !t.active) return;
+    t.active = false;
+    const obs = this.getLevel('observatory');
+    const chest = obs.props.find((pr) => pr.kind === 'chest' && pr.data.starter);
+    if (chest) {
+      const loot = this.world.loot[chest.key] ?? chest.data.loot ?? [];
+      for (const [id, n] of loot) this.give(id, n);
+      this.world.loot[chest.key] = [];
+      chest.sprite = 'chest_open';
+    }
+    this._openGate(obs, 'Tutorial ended. The Great Astrolabe Gate stands open.');
+  }
+
+  /**
+   * Unseal the Great Astrolabe Gate (lever puzzle, a rune in the Gate Hall, or ending the tutorial).
+   * @param {Level} obs the observatory level @param {string} message
+   */
+  _openGate(obs, message) {
+    if (this.flags.gateOpen) return;
+    this.flags.gateOpen = true;
+    const gate = obs.doors.find((d) => d.puzzle);
+    if (gate) {
+      gate.locked = false;
+      gate.shut = false;
+      this.world.doors[gate.key] = { locked: false, shut: false };
+    }
+    this.audio.gateOpen();
+    this.notify(message);
+  }
+
+  /** A rune spoken in the Gate Hall resonates the anchors: an alternative to the levers. @param {string} spell */
+  onSpellCast(spell) {
+    const L = this.level;
+    if (L.id !== 'observatory' || this.flags.gateOpen) return;
+    if (L.zone[L.idx(Math.floor(this.player.x), Math.floor(this.player.z))] !== 3) return;
+    this._openGate(L, `The anchors answer your ${SPELLS[spell].name}. The Great Astrolabe Gate grinds open!`);
   }
 
   /** Breadth-first distance field (48x48 window around the player) for enemies without sight. */
@@ -569,6 +732,7 @@ export class Game {
       this.fx.parry = 1;
       this.exercise('blade', 1.5);
       this.notify('Parried!');
+      if (this.flags.tutorial) this.flags.tutorial.parried = true;
       return false;
     }
     if (attacker && p.blocking) {
@@ -604,6 +768,7 @@ export class Game {
       this.burst(o.x, o.y, o.z, 8, [1.6, 1.3, 0.5], 2);
     }
     if (any) {
+      if (this.flags.tutorial) this.flags.tutorial.parried = true;
       this.audio.deflect();
       this.fx.parry = 1;
       this.exercise('blade', 1);
@@ -949,6 +1114,7 @@ export class Game {
       case 'book': return 'Read Tablet';
       case 'bed': return p.data.rent ? 'Sleep (rented bed)' : p.data.owned ? 'Sleep (someone\'s bed)' : 'Rest';
       case 'campfire': return 'Rest by the fire';
+      case 'brazier': return 'Warm yourself at the Resonance Brazier';
       case 'lever': return 'Pull Lever';
       case 'item': return `Take ${ITEMS[p.data.item]?.name ?? 'item'}`;
       case 'herb': return `Harvest ${ITEMS[p.data.item].name}`;
@@ -1001,6 +1167,7 @@ export class Game {
         if (p.data.rent && this.flags.rent !== p.data.rent) { this.notify('Rent a bed from the innkeeper first.'); return null; }
         return { open: 'rest' };
       case 'campfire':
+      case 'brazier':
         return { open: 'rest' };
       case 'lever':
         this._pullLever(p);
@@ -1087,18 +1254,7 @@ export class Game {
     this.flags.levers[i] = !this.flags.levers[i];
     this.audio.creak();
     this.audio.chime(this.flags.levers[i] ? 1320 : 990);
-    const lit = this._anchors();
-    if (lit.every(Boolean) && !this.flags.gateOpen) {
-      this.flags.gateOpen = true;
-      const gate = this.level.doors.find((d) => d.puzzle);
-      if (gate) {
-        gate.locked = false;
-        gate.shut = false;
-        this.world.doors[gate.key] = { locked: false, shut: false };
-      }
-      this.audio.gateOpen();
-      this.notify('All three anchors sing. The Great Astrolabe Gate grinds open!');
-    }
+    if (this._anchors().every(Boolean)) this._openGate(this.level, 'All three anchors sing. The Great Astrolabe Gate grinds open!');
   }
 
   _useGateCore() {
@@ -1211,10 +1367,11 @@ export class Game {
     /** @type {SpriteDesc[]} */
     const out = [];
     const lit = this._anchors();
-    const glowy = new Set(['pylon', 'stones', 'herb_bloom', 'herb_moss', 'tablet', 'anchor', 'gate_core', 'vent', 'campfire_a', 'stairs', 'rune_lux', 'rune_vita', 'rune_vis', 'rune_aperio', 'rune_levis', 'i_core', 'i_crystal']);
+    const glowy = new Set(['brazier', 'pylon', 'stones', 'herb_bloom', 'herb_moss', 'tablet', 'anchor', 'gate_core', 'vent', 'campfire_a', 'stairs', 'rune_lux', 'rune_vita', 'rune_vis', 'rune_aperio', 'rune_levis', 'i_core', 'i_crystal']);
     for (const k of this.streamer.active) {
       for (const pr of L.propChunks.get(k) ?? []) {
-        if (pr.gone) continue;
+        // Decor (trees, rocks, ruins, stalls, lamps...) is hardware-instanced by the renderer per chunk.
+        if (pr.gone || pr.kind === 'decor') continue;
         if ((pr.x - p.x) ** 2 + (pr.z - p.z) ** 2 > 75 * 75) continue;
         let sprite = pr.sprite;
         let tint = [1, 1, 1];
@@ -1496,6 +1653,7 @@ function tube(c, x, y, w, frac, col, label) {
  * @param {number} w @param {number} h @param {boolean} touch @param {Interactable|null} target
  */
 function drawHud(c, g, atlas, w, h, touch, target) {
+  const tutorialOn = g.tutorialActive;
   const p = g.player;
   const ch = g.char;
   // Viewmodels: weapon or casting hand on the right, lantern on the left.
@@ -1605,7 +1763,14 @@ function drawHud(c, g, atlas, w, h, touch, target) {
   c.font = '600 12px Georgia, serif';
   c.fillText(`Day ${g.day}  ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`, w - 16, touch ? 100 : 22);
   c.fillText(g.locationName(), w - 16, touch ? 116 : 38);
-  let ey = touch ? 132 : 56;
+  if (g.level.outdoor) {
+    c.fillStyle = 'rgba(246,231,193,0.75)';
+    c.font = '600 11px Georgia, serif';
+    c.fillText(WEATHER[g.weather.kind].label, w - 16, touch ? 129 : 51);
+    c.fillStyle = IVORY;
+    c.font = '600 12px Georgia, serif';
+  }
+  let ey = touch ? 146 : 68;
   for (const [k, v] of Object.entries(ch.effects)) {
     const name = { lumina: 'Lumina', feather: 'Feather Step', oil_ember: 'Ember oil', oil_frost: 'Frost oil' }[/** @type {'lumina'} */ (k)] ?? k;
     c.fillStyle = k === 'feather' && v < 3 ? '#ff8a5a' : CYAN;
@@ -1615,7 +1780,8 @@ function drawHud(c, g, atlas, w, h, touch, target) {
   // Notifications.
   c.textAlign = 'left';
   const nx = touch ? 70 : 12;
-  const ny = touch ? 186 : 60;
+  // Notifications sit below the tutorial card while it is showing.
+  const ny = (touch ? 186 : 60) + (tutorialOn ? (touch ? 70 : 96) : 0);
   g.notes.forEach((n, i) => {
     c.globalAlpha = Math.min(1, n.t);
     c.fillStyle = 'rgba(0,0,0,0.55)';
@@ -1687,6 +1853,17 @@ class App {
     /** @type {string[]} */
     this.runeSel = [];
     this.modal = $('modal');
+    /** Guided tutorial preference for the next New Game (remembered between visits). */
+    this.tutorialPref = true;
+    try { this.tutorialPref = localStorage.getItem('shardlands-tutorial') !== '0'; } catch { /* storage blocked: default on */ }
+    this.tutCard = $('tutorial');
+    for (const ev of ['click', 'pointerdown']) {
+      $('tut-end').addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.endTutorial();
+      });
+    }
     /** Render-scale ceiling for this device; adaptive resolution works below it. */
     this.baseScale = 1;
     /** Smoothed frame time (seconds) and countdown to the next resolution adjustment. */
@@ -1869,7 +2046,12 @@ class App {
     const panels = { Tab: 'inventory', KeyI: 'inventory', KeyK: 'skills', KeyJ: 'journal', KeyM: 'map' };
     const want = /** @type {Record<string, string>} */ (panels)[code];
     if (code === 'Escape') {
-      // With pointer lock the browser's own Esc release opens the pause menu (pointerlockchange).
+      // Esc ends a running tutorial immediately; otherwise it pauses (with pointer lock the
+      // browser's own Esc release opens the pause menu, which also offers End Tutorial).
+      if (this.game.tutorialActive && (this.state === 'EXPLORE' || this.state === 'PAUSE')) {
+        this.endTutorial();
+        return;
+      }
       if (this.state === 'EXPLORE' && !document.pointerLockElement) this.showPause();
       else if (this.state !== 'EXPLORE' && this.state !== 'PAUSE') this.setState('EXPLORE');
       return;
@@ -1924,13 +2106,21 @@ class App {
     const start = () => {
       this.audio.init();
       this.game = new Game(this.audio, this.fixedSeed || 1 + Math.floor(Math.random() * 999999));
-      this.game.newRun();
+      this.game.newRun(this.tutorialPref);
       this.setState('EXPLORE');
     };
+    const toggle = h('button', { class: 'brass-btn', type: 'button', 'aria-pressed': String(this.tutorialPref) }, `Guided Tutorial: ${this.tutorialPref ? 'ON' : 'OFF'}`);
+    toggle.addEventListener('click', () => {
+      this.tutorialPref = !this.tutorialPref;
+      toggle.textContent = `Guided Tutorial: ${this.tutorialPref ? 'ON' : 'OFF'}`;
+      toggle.setAttribute('aria-pressed', String(this.tutorialPref));
+      try { localStorage.setItem('shardlands-tutorial', this.tutorialPref ? '1' : '0'); } catch { /* storage blocked: keep for this session */ }
+    });
     this.modal.append(h('div', { class: 'panel title' },
       h('h1', {}, 'AETHERIUM'), h('h3', {}, 'SHARDLANDS'),
       h('p', {}, 'You wake beneath a brass sky of painted stars. The Sunken Observatory is silent, its Great Astrolabe Gate sealed, and far above, the ley-lines of the Shardlands have begun to drift.'),
       h('div', { class: 'row' }, btn('New Game', start), btn('Continue', () => this.loadGame(), !Game.hasSave())),
+      h('div', { class: 'row' }, toggle),
       h('div', { class: 'controls desktop-only' },
         ...[['WASD', 'Move · double-tap to Phase Dash'], ['Mouse', 'Look (click to lock pointer)'], ['Left click', 'Attack / cast (strafe = sweep, forward = thrust, still = chop)'],
           ['Right click', 'Parry (tap) / block (hold)'], ['E', 'Interact, talk, loot'], ['Shift / Space', 'Phase Dash / jump'], ['1-6 · wheel · Q · R', 'Hotbar · cycle · switch ammo'],
@@ -1944,9 +2134,32 @@ class App {
     this.panel('PAUSE', 'Paused',
       h('div', { class: 'col' },
         btn('Resume', () => this.setState('EXPLORE')),
+        this.game.tutorialActive ? btn('End Tutorial', () => this.endTutorial()) : null,
         btn('Save game', () => { this.game.save(); this.setState('EXPLORE'); }),
         btn('Load last save', () => this.loadGame(), !Game.hasSave()),
         btn('Quit to title', () => this.showTitle())));
+  }
+
+  /** Terminate the tutorial now and return to unrestricted play. */
+  endTutorial() {
+    this.game.endTutorial();
+    this._refreshTutorial();
+    if (this.state !== 'EXPLORE') this.setState('EXPLORE');
+  }
+
+  /** Show, hide and fill the tutorial card for the current step and input mode. */
+  _refreshTutorial() {
+    const t = this.game.flags.tutorial;
+    const show = !!t?.active && this.state !== 'TITLE';
+    this.tutCard.classList.toggle('hidden', !show);
+    if (!show) return;
+    const step = TUTORIAL_STEPS[t.step];
+    const key = `${t.step}:${this.touch}`;
+    if (this.tutCard.dataset.key === key) return;
+    this.tutCard.dataset.key = key;
+    $('tut-step').textContent = `Tutorial ${t.step + 1}/${TUTORIAL_STEPS.length}: ${step.title}`;
+    $('tut-text').textContent = this.touch ? step.touch : step.desktop;
+    $('tut-end').textContent = this.touch ? 'End Tutorial [Tap]' : 'End Tutorial [Esc]';
   }
 
   loadGame() {
@@ -2068,6 +2281,7 @@ class App {
 
   openInventory() {
     const g = this.game;
+    if (g.flags.tutorial) g.flags.tutorial.sawInventory = true;
     const c = g.char;
     const tabs = h('div', { class: 'row tabs' }, btn('Pack', () => { this.invTab = 'pack'; this.openInventory(); }), btn('Alchemy & Tinkering', () => { this.invTab = 'craft'; this.openInventory(); }));
     if (this.invTab === 'craft') {
@@ -2386,11 +2600,13 @@ class App {
     for (const k of g.chunkUnloads.splice(0)) this.renderer.unloadChunk(k);
     for (let n = 0; n < 3 && g.chunkLoads.length; n++) this.renderer.loadChunk(/** @type {number} */ (g.chunkLoads.shift()));
     this._refreshHotbar();
+    this._refreshTutorial();
 
     const p = g.player;
     this.renderer.render({
       eye: { x: p.x, y: p.y + p.eye + Math.sin(p.bob * 2) * 0.03, z: p.z }, yaw: p.yaw, pitch: p.pitch, time: g.time,
       sprites: g.collectSprites(), lights: g.collectLights(), doors: g.level.doors, fx: g.fx, env: g.env,
+      weather: { rain: g.weather.rain, wind: g.weather.wind },
     });
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const w = this.hud.clientWidth;

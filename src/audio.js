@@ -1,6 +1,7 @@
 /**
  * @file Web Audio procedural synthesizer: weapon impacts, alchemy brews, lockpick clicks,
- * footsteps by surface, NPC voice-chirps, biome ambiences and adaptive combat music. No samples.
+ * footsteps by surface, NPC voice-chirps, biome ambiences, weather (rain, wind, thunder)
+ * and adaptive combat music. No samples.
  */
 
 /**
@@ -59,6 +60,8 @@ export class AudioEngine {
     /** current ambience profile */
     this.ambience = 'observatory';
     this.night = false;
+    /** @type {{rain:GainNode, wind:GainNode, windFilter:BiquadFilterNode}|null} */
+    this.weather = null;
   }
 
   /** Create/resume the context. Must be called from a user gesture. */
@@ -313,6 +316,50 @@ export class AudioEngine {
     src.start();
     this.amb = { filter, gain };
     this.setAmbience(this.ambience, this.night);
+    // Weather beds: hissing rain and a low, gusting wind, both silent until setWeather().
+    /** @param {BiquadFilterType} type @param {number} freq @param {number} q */
+    const bed = (type, freq, q) => {
+      const n = ctx.createBufferSource();
+      n.buffer = this.noiseBuf;
+      n.loop = true;
+      const f = ctx.createBiquadFilter();
+      f.type = type;
+      f.frequency.value = freq;
+      f.Q.value = q;
+      const g = ctx.createGain();
+      g.gain.value = 0;
+      n.connect(f).connect(g).connect(/** @type {GainNode} */ (this.ambBus));
+      n.start(0, Math.random());
+      return { f, g };
+    };
+    const rain = bed('highpass', 1400, 0.4);
+    const wind = bed('lowpass', 420, 1.2);
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 0.13;
+    const depth = ctx.createGain();
+    depth.gain.value = 260;
+    lfo.connect(depth).connect(wind.f.frequency);
+    lfo.start();
+    this.weather = { rain: rain.g, wind: wind.g, windFilter: wind.f };
+  }
+
+  /**
+   * Fade the rain and wind beds. Indoors pass sheltered = true for a muffled patter.
+   * @param {number} rain 0..1 @param {number} wind 0..1 @param {boolean} sheltered
+   */
+  setWeather(rain, wind, sheltered) {
+    const ctx = this.ctx;
+    if (!ctx || !this.weather) return;
+    const t = ctx.currentTime;
+    this.weather.rain.gain.setTargetAtTime(rain * (sheltered ? 0.05 : 0.22), t, 0.8);
+    this.weather.wind.gain.setTargetAtTime(wind * (sheltered ? 0.03 : 0.16), t, 1.2);
+  }
+
+  /** A thunder crack and rolling rumble, delayed by distance (seconds). @param {number} delay */
+  thunder(delay) {
+    const bus = this.ambBus;
+    this._noise(0.25, { gain: 0.35 * Math.max(0.3, 1 - delay / 4), type: 'bandpass', freq: 900, q: 0.6, when: delay, bus });
+    this._noise(3.2, { gain: 0.45, type: 'lowpass', freq: 140, freqEnd: 60, attack: 0.15, when: delay + 0.08, bus });
   }
 
   /**

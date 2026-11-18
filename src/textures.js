@@ -12,8 +12,8 @@ const WORLD_ROWS = 4;
 export const SPRITE_FRAME = 128;
 const SPRITE_COLS = 8;
 const ATLAS_W = 1024;
-const ATLAS_H = 2048;
-const VIEW_Y = 1536;
+const ATLAS_H = 2176;
+const VIEW_Y = 1664;
 
 /** Sprite frame names, in atlas order. */
 export const SPRITE_NAMES = Object.freeze([
@@ -29,6 +29,7 @@ export const SPRITE_NAMES = Object.freeze([
   'i_draught', 'i_tonic', 'i_oil_ember', 'i_oil_frost', 'i_bread', 'i_apple', 'i_scrap', 'i_crystal',
   'i_salt', 'i_lockpick', 'i_key', 'i_book', 'rune_lux', 'rune_vita', 'rune_vis', 'rune_aperio',
   'rune_levis', 'i_ammo_shard', 'i_ammo_flare', 'i_ammo_frost', 'i_core', 'i_relic', 'i_parcel', 'i_shards',
+  'grass_a', 'grass_b', 'brazier', 'archivist', 'archivist_walk', 'ruin',
 ]);
 /** @type {Readonly<Record<string, number>>} sprite name -> frame index */
 export const SPR = Object.freeze(Object.fromEntries(SPRITE_NAMES.map((n, i) => [n, i])));
@@ -1892,6 +1893,36 @@ function sculptRune(S, rune) {
   S.inlay(arcPts(64, 66, 34, 31, Math.PI * 1.1, Math.PI * 1.4), 1.3, 1.5);
 }
 
+/** Grass tuft for instanced ground clutter. @param {Sculpt} S @param {boolean} flowers */
+function sculptGrass(S, flowers) {
+  for (let k = 0; k < 14; k++) {
+    const x = 30 + ((k * 37) % 68);
+    const top = 58 + ((k * 23) % 40);
+    const lean = (((k * 13) % 11) - 5) * 1.6;
+    S.capsule([x, 127, 0], [x + lean, top, 2 + (k % 3)], 2.2, 0.6, PAL2.leaf);
+  }
+  if (flowers) for (const [x, y] of [[44, 70], [70, 62], [86, 78]]) S.sphere(x, y, 8, 3, x % 2 === 0 ? PAL.gGold : PAL2.lotus);
+}
+/** The Resonance Brazier: a brass bowl of cyan ley-fire on a tripod. @param {Sculpt} S */
+function sculptBrazier(S) {
+  for (const [x0, x1] of [[40, 54], [88, 74], [64, 64]]) S.capsule([x0, 126, x0 === 64 ? -6 : 2], [x1, 84, 4], 3, 2.2, PAL.brass);
+  S.sphere(64, 80, 0, 30, PAL.brass, { sy: 0.45, clip: (_x, y) => y > 76 });
+  S.ring(64, 76, 4, 30, 2.6, 1.35, 0, PAL.brass);
+  rivetRing(S, 64, 84, 10, 24, 5, 10, 1.4);
+  for (const [x, y, r] of [[64, 66, 16], [54, 56, 10], [74, 54, 11], [64, 40, 9], [60, 28, 5]]) S.sphere(x, y, 12, r, PAL.gCyan, { emit: true });
+  S.sphere(64, 64, 26, 6, PAL.gWhite, { emit: true });
+}
+
+/** A broken, ivy-clad column for ruin clutter. @param {Sculpt} S */
+function sculptRuin(S) {
+  S.box(30, 112, 68, 15, 0, PAL2.lime, 4);
+  S.capsule([64, 112, 0], [62, 34, 0], 17, 15, PAL2.lime);
+  for (let k = -2; k <= 2; k++) S.scratch([64 + k * 6, 40, 64 + k * 6.5, 110], 0.62, 1);
+  S.carve([44, 20, 58, 40, 66, 30, 76, 44, 84, 20]);
+  S.sphere(96, 118, 4, 11, PAL2.lime, { sy: 0.7 });
+  for (const [x, y] of [[52, 60], [58, 74], [70, 88], [74, 100], [50, 96]]) S.sphere(x, y, 16, 5, PAL.verdigris, { sx: 1.3, sy: 0.8 });
+}
+
 /** Fill every sprite frame, keyed by name. @param {CanvasRenderingContext2D} ctx */
 function sculptSprites(ctx) {
   /** @type {Record<string, (S: Sculpt) => void>} */
@@ -1939,6 +1970,7 @@ function sculptSprites(ctx) {
       S.sphere(64, 64, 6, 9, PAL.gWhite, { emit: true });
     },
     bead: (S) => { S.sphere(64, 64, 0, 15, PAL.gBead, { emit: true }); S.sphere(62, 62, 12, 4, PAL.gWhite, { emit: true }); },
+    grass_a: (S) => sculptGrass(S, false), grass_b: (S) => sculptGrass(S, true), brazier: sculptBrazier, ruin: sculptRuin,
     tree_ley: sculptLeyTree, tree_pine: sculptPine, tree_dead: sculptDeadTree, reeds: sculptReeds, rock: sculptRock,
     chest: (S) => sculptChest(S, false), chest_open: (S) => sculptChest(S, true),
     campfire_a: (S) => sculptCampfire(S, 0), campfire_b: (S) => sculptCampfire(S, 1), bed: sculptBed,
@@ -2120,6 +2152,7 @@ function sculptSprites(ctx) {
     ['master', { coat: PAL2.crimson, robe: true, goggles: true, hair: PAL2.hairGrey, beard: true, sash: PAL.brass }],
     ['keeper', { coat: PAL2.cream, legs: PAL2.wood, apron: true, mug: true, skin: PAL2.skinDark, beard: true }],
     ['captain', { coat: PAL2.forest, legs: PAL.leather, hat: 'cap', sash: PAL.leather, spear: true, hair: PAL2.hairRed }],
+    ['archivist', { coat: PAL2.slate, robe: true, goggles: true, hat: 'hood', sash: PAL.brass, skin: PAL.brass, hair: PAL.obsidian }],
   ]);
   for (const [name, o] of people) {
     art[name] = (S) => sculptPerson(S, o);
