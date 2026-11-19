@@ -2178,25 +2178,27 @@ export function buildSpriteAtlas() {
 export const MAT_SIZE = 512;
 
 /**
- * Tileable Perlin gradient noise over a period of `cells` lattice cells per unit square.
- * @param {number} cells @param {number} seed @returns {(u:number, v:number) => number} value in about [-1, 1]
+ * Tileable Perlin gradient noise over a period of `cells` lattice cells per unit square
+ * (`cellsY` down the v axis, for stretched fibres and strands).
+ * @param {number} cells @param {number} seed @param {number} [cellsY]
+ * @returns {(u:number, v:number) => number} value in about [-1, 1]
  */
-export function makePerlin(cells, seed) {
-  const gx = new Float32Array(cells * cells);
-  const gy = new Float32Array(cells * cells);
-  for (let k = 0; k < cells * cells; k++) {
+export function makePerlin(cells, seed, cellsY = cells) {
+  const gx = new Float32Array(cells * cellsY);
+  const gy = new Float32Array(cells * cellsY);
+  for (let k = 0; k < cells * cellsY; k++) {
     const a = hash2(k % cells, Math.floor(k / cells), seed) * Math.PI * 2;
     gx[k] = Math.cos(a);
     gy[k] = Math.sin(a);
   }
   /** @param {number} i @param {number} j @param {number} dx @param {number} dy */
   const dot = (i, j, dx, dy) => {
-    const k = (((j % cells) + cells) % cells) * cells + (((i % cells) + cells) % cells);
+    const k = (((j % cellsY) + cellsY) % cellsY) * cells + (((i % cells) + cells) % cells);
     return gx[k] * dx + gy[k] * dy;
   };
   return (u, v) => {
     const x = u * cells;
-    const y = v * cells;
+    const y = v * cellsY;
     const i = Math.floor(x);
     const j = Math.floor(y);
     const fx = x - i;
@@ -2335,6 +2337,270 @@ const GRADE = {
 };
 
 /**
+ * Character material layers, appended after the 24 world tiles in the same texture arrays:
+ * homespun wool, aged skin, worn leather and hair (their albedo a neutral grey, mean sRGB
+ * CHAR_BASE, carrying only weave, pores, grain and strands, tinted by each outfit), plus a
+ * fully coloured eye layer with five iris colours.
+ */
+export const CHAR_LAYER = { WOOL: 24, SKIN: 25, LEATHER: 26, HAIR: 27, EYE: 28 };
+const CHAR_LAYER_COUNT = 5;
+/**
+ * The eye layer holds one EYE_TILE-pixel square per iris colour (hazel, slate grey, amber, dark
+ * brown, muted green), four to a row: the eyeball is projected straight on from the front, so
+ * the tile centre is the pupil and a point at radius EYE_SPAN pixels lies on the equator.
+ */
+export const EYE_TILE = 128;
+export const EYE_SPAN = 60;
+/** Mean sRGB value (0..1) of the character layers' albedo, so tints can be computed relative to it. */
+export const CHAR_BASE = 0.6;
+
+/**
+ * Synthesize the character layers into the shared scratch buffers and bake each one.
+ * @param {number} N layer edge @param {number} first first character layer index
+ * @param {{grainF: Float32Array, poreF: Float32Array, midF: Float32Array, lowF: Float32Array}} F shared noise fields
+ * @param {{h: Float32Array, col: Float32Array, rough: Float32Array, spec: Float32Array, metal: Float32Array}} B scratch buffers
+ * @param {(t: number, bump: number) => void} bake
+ */
+function synthCharacterLayers(N, first, F, B, bake) {
+  const { grainF, poreF, midF, lowF } = F;
+  const { h, col, rough, spec, metal } = B;
+  const M = N - 1;
+  const base = CHAR_BASE * 255;
+  metal.fill(0);
+  /** @param {(u:number, v:number) => number} fn */
+  const field = (fn) => {
+    const a = new Float32Array(N * N);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) a[y * N + x] = fn(x / N, y / N);
+    return a;
+  };
+  /** @param {(u:number, v:number) => number[]} fn @param {number} k */
+  const worleyField = (fn, k) => {
+    const a = new Float32Array(N * N);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) a[y * N + x] = fn(x / N, y / N)[k];
+    return a;
+  };
+  /** @param {number} p @param {number} r @param {number} g @param {number} b */
+  const put = (p, r, g, b) => { col[p * 3] = r; col[p * 3 + 1] = g; col[p * 3 + 2] = b; };
+
+  // --- Homespun wool: 2/2 twill of slubbed threads (4 px pitch), fibre fuzz, pilling, worn and
+  // felted patches where the weave flattens and fades, and darker grime stains.
+  const pill = makeWorley(44, 7101);
+  const pillF = worleyField(pill, 0);
+  const fuzzF = field(makeFbm(96, 2, 7102));
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const p = y * N + x;
+      const cx = x >> 2;
+      const cy = y >> 2;
+      const fx = ((x & 3) + 0.5) / 4;
+      const fy = ((y & 3) + 0.5) / 4;
+      const warpUp = ((cx + cy) & 3) < 2;
+      // Slubs: each thread thickens and thins along its length.
+      const slub = warpUp ? poreF[y * N + ((cx * 4 + 2) & M)] : poreF[((cy * 4 + 2) & M) * N + x];
+      const across = Math.sin((warpUp ? fx : fy) * Math.PI);
+      const along = Math.sin((warpUp ? fy : fx) * Math.PI);
+      const wear = Math.max(0, Math.min(1, (midF[p] - 0.12) * 3));
+      const thread = Math.pow(across, 0.65 - slub * 0.2) * (0.82 + 0.18 * along);
+      const fuzz = fuzzF[p];
+      let hh = thread * (0.3 - wear * 0.15) + fuzz * (0.12 + wear * 0.1) + grainF[p] * 0.1;
+      // Per-thread dye variation; warp and weft differ slightly so the twill diagonal reads.
+      const dye = 0.95 + hash2(warpUp ? cx : cy, warpUp ? 1 : 2, 7103) * 0.08 + (warpUp ? 0.015 : -0.015);
+      let shade = dye * (0.9 + thread * 0.14) * (1 + fuzz * 0.14 + grainF[p] * 0.1) * (1 + wear * 0.14);
+      let ro = 0.9 + fuzz * 0.05 - wear * 0.04;
+      let tint = [1, 1, 1];
+      if (pillF[p] < 0.13) {
+        const k = (0.13 - pillF[p]) / 0.13;
+        hh += k * 0.3;
+        shade *= 1 + k * 0.12;
+        ro = 0.98;
+      }
+      const stain = Math.max(0, -lowF[p] - 0.18) * 2.2;
+      if (stain > 0) {
+        const k = Math.min(0.55, stain);
+        shade *= 1 - k * 0.45;
+        tint = [1, 0.94, 0.85];
+        ro -= k * 0.1;
+      }
+      put(p, base * shade * tint[0], base * shade * tint[1], base * shade * tint[2]);
+      h[p] = hh;
+      rough[p] = ro;
+      spec[p] = 0.18;
+    }
+  }
+  bake(first, 3.4);
+
+  // --- Aged skin: isotropic pores and fine micro-relief, mottled warm and sallow blotches, and
+  // sparse age spots (no directional grain). Chroma stays near neutral; the skin tone supplies the hue.
+  const poreW = makeWorley(120, 7201);
+  const poreD = worleyField(poreW, 0);
+  const lineA = field(makePerlin(6, 7202, 44));
+  const lineB = field(makePerlin(44, 7203, 6));
+  const spots = makeWorley(18, 7204);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const p = y * N + x;
+      const pore = Math.max(0, 0.22 - poreD[p]) / 0.22;
+      // Fine isotropic micro-relief: the two stretched fields cross, so neither direction wins.
+      const crease = Math.max(0, 0.05 - Math.abs(lineA[p] * lineB[p])) * 20 * 0.25;
+      const hh = 0.5 + grainF[p] * 0.08 + poreF[p] * 0.04 - pore * 0.22 - crease * 0.12;
+      const flush = midF[p];
+      const sallow = lowF[p];
+      let r = 1 + flush * 0.1 - pore * 0.05;
+      let g = 1 - flush * 0.04 + sallow * 0.03 - pore * 0.06;
+      let b = 1 - flush * 0.06 - sallow * 0.05 - pore * 0.06;
+      const [s1, , sid] = spots(x / N, y / N);
+      if (s1 < 0.16 && hash2(sid, 9, 7205) > 0.72) {
+        const k = (0.16 - s1) / 0.16;
+        r *= 1 - k * 0.18;
+        g *= 1 - k * 0.24;
+        b *= 1 - k * 0.3;
+      }
+      const shade = 0.97 + grainF[p] * 0.06 - crease * 0.08;
+      put(p, base * r * shade, base * g * shade, base * b * shade);
+      h[p] = hh;
+      rough[p] = Math.min(0.65, Math.max(0.52, 0.56 + pore * 0.07 + midF[p] * 0.04));
+      spec[p] = 0.4 - pore * 0.15;
+    }
+  }
+  bake(first + 1, 3.2);
+
+  // --- Worn leather: pebbled Worley grain with cracked creases, long flex folds, scuffs that
+  // lighten and roughen the surface, and darker oiled patches.
+  const peb = makeWorley(56, 7301);
+  const fold = field(makePerlin(4, 7302, 22));
+  const scuff = new Float32Array(N * N).fill(1);
+  const rnd = (/** @type {number} */ k, /** @type {number} */ s) => hash2(k, s, 7303);
+  for (let k = 0; k < 160; k++) {
+    const x0 = rnd(k, 1) * N;
+    const y0 = rnd(k, 2) * N;
+    const a = rnd(k, 3) * Math.PI;
+    const len = 10 + rnd(k, 4) * 60;
+    for (let s2 = 0; s2 < len; s2++) {
+      const px = Math.floor(x0 + Math.cos(a) * s2) & M;
+      const py = Math.floor(y0 + Math.sin(a) * s2) & M;
+      scuff[py * N + px] = Math.min(scuff[py * N + px], 0.2 + 0.8 * Math.abs(s2 / len - 0.5) * 2);
+    }
+  }
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const p = y * N + x;
+      const [f1, f2] = peb(x / N, y / N);
+      const crack = Math.max(0, 0.06 - (f2 - f1)) / 0.06;
+      const flex = Math.max(0, 0.07 - Math.abs(fold[p])) / 0.07;
+      const worn = Math.max(0, Math.min(1, (midF[p] - 0.1) * 2.5));
+      const sc = 1 - scuff[p];
+      const hh = 0.5 + (0.35 - Math.min(0.35, f1)) * 0.5 * (1 - worn * 0.6) - crack * 0.1 - flex * 0.14 + grainF[p] * 0.05 - sc * 0.03;
+      const oil = Math.max(0, -lowF[p]) * 0.6;
+      const shade = (0.95 + grainF[p] * 0.1) * (1 - crack * 0.3 - flex * 0.22) * (1 + worn * 0.22 + sc * 0.25) * (1 - oil * 0.35);
+      put(p, base * shade * (1 + worn * 0.04), base * shade, base * shade * (1 - worn * 0.05));
+      h[p] = hh;
+      rough[p] = 0.55 + worn * 0.18 + sc * 0.2 + crack * 0.15 - oil * 0.2;
+      spec[p] = 0.55 - worn * 0.2;
+    }
+  }
+  bake(first + 2, 3.6);
+
+  // --- Hair: stretched noise strands running down v, gathered into clumps, with stray light
+  // strands and dark gaps between locks.
+  const strandA = field(makePerlin(160, 7401, 3));
+  const strandB = field(makePerlin(96, 7402, 6));
+  const clump = field(makePerlin(14, 7403, 2));
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const p = y * N + x;
+      const s = strandA[p] * 0.6 + strandB[p] * 0.4;
+      const c = clump[p];
+      const gap = Math.max(0, 0.08 - Math.abs(c)) / 0.08;
+      const hh = 0.5 + s * 0.3 + c * 0.2 - gap * 0.25;
+      const stray = strandA[p] > 0.55 ? 1.25 : 1;
+      const shade = (0.78 + s * 0.38) * (1 - gap * 0.45) * stray;
+      put(p, base * shade, base * shade, base * shade);
+      h[p] = hh;
+      rough[p] = 0.5 + gap * 0.2 - s * 0.06;
+      spec[p] = 0.5;
+    }
+  }
+  bake(first + 3, 2.4);
+
+  // --- Eyes, front-projected (see EYE_TILE): an off-white sclera, warm grey-pink toward the corners
+  // with faint veins, and shadowed across its top third by the lid and brow; a radial-fibred iris
+  // (warmer collarette, darker crypts, a dark limbal ring) around a crisp pupil. Wet throughout.
+  const IRIS = [
+    [[0.56, 0.38, 0.16], [0.34, 0.4, 0.22]],
+    [[0.46, 0.5, 0.54], [0.3, 0.35, 0.41]],
+    [[0.72, 0.5, 0.17], [0.5, 0.32, 0.1]],
+    [[0.32, 0.19, 0.1], [0.19, 0.11, 0.07]],
+    [[0.46, 0.5, 0.27], [0.27, 0.38, 0.27]],
+  ];
+  const fibre = field(makePerlin(180, 7501, 6));
+  const fibre2 = field(makePerlin(96, 7502, 10));
+  const crypt = makeWorley(40, 7503);
+  const vein = field(makePerlin(14, 7504, 40));
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const p = y * N + x;
+      const tile = Math.floor(y / EYE_TILE) * (N / EYE_TILE) + Math.floor(x / EYE_TILE);
+      const b = Math.min(IRIS.length - 1, tile);
+      const [inner, outer] = IRIS[b];
+      const sx = ((x % EYE_TILE) + 0.5 - EYE_TILE / 2) / EYE_SPAN;
+      const sy = (EYE_TILE / 2 - (y % EYE_TILE) - 0.5) / EYE_SPAN;
+      const rho = Math.hypot(sx, sy);
+      // Polar angle from the pupil (0) to the equator (1), and the direction around the axis.
+      const q = Math.asin(Math.min(1, rho)) / (Math.PI / 2);
+      const ph = Math.atan2(sy, sx);
+      const up = Math.sin(ph) * Math.min(1, rho * 2);
+      // Lid and brow shadow over the top third; warm pink-grey toward the left and right corners.
+      const shadow = 1 - 0.42 * Math.max(0, Math.min(1, (up - 0.25) / 0.6)) - 0.12 * Math.max(0, Math.min(1, (q - 0.3) / 0.5));
+      const corner = Math.abs(Math.cos(ph)) ** 3 * Math.max(0, Math.min(1, (q - 0.33) / 0.4));
+      let r;
+      let g;
+      let bl;
+      let hh = 0.5;
+      if (q < 0.25) {
+        // Iris (about 12 mm across): radius 0..1 from pupil edge to limbus.
+        const pr = 0.09 + 0.008 * fibre2[p];
+        const t = Math.max(0, (q - pr) / (0.25 - pr));
+        const f = fibre[p] * 0.6 + fibre2[p] * 0.4;
+        const [c1, , cid] = crypt(x / N, y / N);
+        const cr = c1 < 0.22 && hash2(cid, 3, 7505) > 0.5 && t > 0.2 && t < 0.8 ? (0.22 - c1) / 0.22 : 0;
+        const k = Math.min(1, t * 1.25);
+        const col = [0, 1, 2].map((i) => inner[i] + (outer[i] - inner[i]) * k);
+        const collar = Math.exp(-(((t - 0.32) / 0.08) ** 2)) * 0.18;
+        const limb = 1 - 0.75 * Math.max(0, Math.min(1, (t - 0.82) / 0.18)) ** 1.3;
+        const lum = (0.95 + f * 0.32 + collar) * (1 - cr * 0.35) * limb;
+        r = col[0] * lum;
+        g = col[1] * lum;
+        bl = col[2] * lum;
+        if (q < pr) {
+          const e = Math.max(0, Math.min(1, (pr - q) / 0.012));
+          r = r * (1 - e) + 0.018 * e;
+          g = g * (1 - e) + 0.015 * e;
+          bl = bl * (1 - e) + 0.014 * e;
+        }
+        hh = 0.5 + f * 0.04 - cr * 0.05;
+      } else {
+        // Sclera: soft off-white, never pure white.
+        const fade = Math.max(0, Math.min(1, (q - 0.25) / 0.03));
+        const v = Math.max(0, 0.05 - Math.abs(vein[p])) / 0.05;
+        const veinK = v * corner * 0.5;
+        r = 0.84 - corner * 0.02 - veinK * 0.05;
+        g = 0.81 - corner * 0.12 - veinK * 0.3;
+        bl = 0.76 - corner * 0.11 - veinK * 0.3;
+        const lb = [IRIS[b][1][0] * 0.25, IRIS[b][1][1] * 0.25, IRIS[b][1][2] * 0.25];
+        r = lb[0] + (r - lb[0]) * fade;
+        g = lb[1] + (g - lb[1]) * fade;
+        bl = lb[2] + (bl - lb[2]) * fade;
+      }
+      put(p, 255 * r * shadow, 255 * g * shadow, 255 * bl * shadow);
+      h[p] = hh;
+      rough[p] = 0.08;
+      spec[p] = 0.45;
+    }
+  }
+  bake(first + 4, 1.2);
+}
+
+/**
  * Grow every painted 128px world tile into 512px PBR layers: albedo, tangent-space normal and
  * roughness/specular/cavity/metal. The painted tile is softened first (so pixel-art steps and
  * dithering become smooth gradients), graded toward a muted naturalistic palette, then detailed
@@ -2347,7 +2613,8 @@ export function buildWorldMaterials(base) {
   const N = MAT_SIZE;
   const M = N - 1;
   const T = TILE_SIZE;
-  const layers = WORLD_COLS * WORLD_ROWS;
+  const tiles = WORLD_COLS * WORLD_ROWS;
+  const layers = tiles + CHAR_LAYER_COUNT;
   const bctx = base.getContext('2d');
   if (!bctx) throw new Error('2D canvas is not available');
   const src = bctx.getImageData(0, 0, base.width, base.height).data;
@@ -2387,7 +2654,51 @@ export function buildWorldMaterials(base) {
   const soft = new Float32Array(T * T * 3);
   const tmp = new Float32Array(T * T * 3);
 
-  for (let t = 0; t < layers; t++) {
+  /**
+   * Pack one layer: normals from height (wrapping central differences), cavity from the local
+   * height deficit (also darkening the albedo), and roughness/specular/cavity/metal.
+   * @param {number} t layer @param {number} bump normal strength
+   */
+  const bake = (t, bump) => {
+    const base4 = t * N * N * 4;
+    for (let y = 0; y < N; y++) {
+      const ym = ((y - 1) & M) * N;
+      const yp = ((y + 1) & M) * N;
+      const y4m = ((y - 4) & M) * N;
+      const y4p = ((y + 4) & M) * N;
+      const y6m = ((y - 6) & M) * N;
+      const y6p = ((y + 6) & M) * N;
+      const yr = y * N;
+      for (let x = 0; x < N; x++) {
+        const p = yr + x;
+        const xm = (x - 1) & M;
+        const xp = (x + 1) & M;
+        const x4m = (x - 4) & M;
+        const x4p = (x + 4) & M;
+        const dx = (h[yr + xp] - h[yr + xm]) * bump;
+        const dy = (h[yp + x] - h[ym + x]) * bump;
+        const l = Math.hypot(dx, dy, 1);
+        const avg = (h[yr + ((x - 6) & M)] + h[yr + ((x + 6) & M)] + h[y6m + x] + h[y6p + x] + h[y4m + x4m] + h[y4p + x4p] + h[y4p + x4m] + h[y4m + x4p]) / 8;
+        const cav = Math.max(0.4, Math.min(1, 1 - (avg - h[p]) * 2.4));
+        const ao = 0.72 + 0.28 * cav;
+        const o = base4 + p * 4;
+        albedo[o] = Math.max(0, Math.min(255, col[p * 3] * ao));
+        albedo[o + 1] = Math.max(0, Math.min(255, col[p * 3 + 1] * ao));
+        albedo[o + 2] = Math.max(0, Math.min(255, col[p * 3 + 2] * ao));
+        albedo[o + 3] = 255;
+        normal[o] = (-dx / l) * 127.5 + 127.5;
+        normal[o + 1] = (-dy / l) * 127.5 + 127.5;
+        normal[o + 2] = (1 / l) * 127.5 + 127.5;
+        normal[o + 3] = 255;
+        mat[o] = Math.max(0.04, Math.min(1, rough[p])) * 255;
+        mat[o + 1] = Math.max(0, Math.min(1, spec[p])) * 255;
+        mat[o + 2] = cav * 255;
+        mat[o + 3] = metal[p] * 255;
+      }
+    }
+  };
+
+  for (let t = 0; t < tiles; t++) {
     const S = SURFACES[t] ?? { kind: 'stone', bump: 3, rough: 0.8, spec: 0.1 };
     const G = GRADE[S.kind];
     const ox = (t % WORLD_COLS) * T;
@@ -2580,45 +2891,9 @@ export function buildWorldMaterials(base) {
         metal[p] = me;
       }
     }
-    // Normals from height (wrapping central differences) and cavity from local height deficit.
-    const base4 = t * N * N * 4;
-    const bump = S.bump * 2.6;
-    for (let y = 0; y < N; y++) {
-      const ym = ((y - 1) & M) * N;
-      const yp = ((y + 1) & M) * N;
-      const y4m = ((y - 4) & M) * N;
-      const y4p = ((y + 4) & M) * N;
-      const y6m = ((y - 6) & M) * N;
-      const y6p = ((y + 6) & M) * N;
-      const yr = y * N;
-      for (let x = 0; x < N; x++) {
-        const p = yr + x;
-        const xm = (x - 1) & M;
-        const xp = (x + 1) & M;
-        const x4m = (x - 4) & M;
-        const x4p = (x + 4) & M;
-        const dx = (h[yr + xp] - h[yr + xm]) * bump;
-        const dy = (h[yp + x] - h[ym + x]) * bump;
-        const l = Math.hypot(dx, dy, 1);
-        const avg = (h[yr + ((x - 6) & M)] + h[yr + ((x + 6) & M)] + h[y6m + x] + h[y6p + x] + h[y4m + x4m] + h[y4p + x4p] + h[y4p + x4m] + h[y4m + x4p]) / 8;
-        const cav = Math.max(0.4, Math.min(1, 1 - (avg - h[p]) * 2.4));
-        const ao = 0.72 + 0.28 * cav;
-        const o = base4 + p * 4;
-        albedo[o] = Math.max(0, Math.min(255, col[p * 3] * ao));
-        albedo[o + 1] = Math.max(0, Math.min(255, col[p * 3 + 1] * ao));
-        albedo[o + 2] = Math.max(0, Math.min(255, col[p * 3 + 2] * ao));
-        albedo[o + 3] = 255;
-        normal[o] = (-dx / l) * 127.5 + 127.5;
-        normal[o + 1] = (-dy / l) * 127.5 + 127.5;
-        normal[o + 2] = (1 / l) * 127.5 + 127.5;
-        normal[o + 3] = 255;
-        mat[o] = Math.max(0.04, Math.min(1, rough[p])) * 255;
-        mat[o + 1] = Math.max(0, Math.min(1, spec[p])) * 255;
-        mat[o + 2] = cav * 255;
-        mat[o + 3] = metal[p] * 255;
-      }
-    }
+    bake(t, S.bump * 2.6);
   }
+  synthCharacterLayers(N, tiles, { grainF, poreF, midF, lowF }, { h, col, rough, spec, metal }, bake);
   return { size: N, layers, albedo, normal, mat };
 }
 

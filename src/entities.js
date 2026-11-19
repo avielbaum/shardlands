@@ -809,6 +809,16 @@ export class NPC {
     this.thinkT = 0;
     /** Facing for the 3D model (radians, forward = cos, sin). */
     this.face = this.anim;
+    // Deterministic look per person: which variant of the outfit's body and palette, and a
+    // slight difference in build. The Archivist is unique.
+    let h = 2166136261;
+    for (const ch of def.id) h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0;
+    this.variant = def.sprite === 'archivist' ? 0 : h % 2;
+    this.build = 0.97 + ((h >>> 8) % 61) / 1000;
+    /** Head tracking: how strongly the NPC watches the player (0..1), and the eased yaw and pitch toward them. */
+    this.gaze = 0;
+    this.look = 0;
+    this.lookUp = 0;
   }
 
   /** Where this NPC wants to be at a given hour. @param {number} hour 0..24 @returns {{spot:{x:number, z:number}, phase:string}} */
@@ -830,6 +840,19 @@ export class NPC {
     this.anim += dt;
     this.thinkT -= dt;
     const L = game.level;
+    // Watch the player when they come close and stand in front, easing in and out; the head
+    // turns at most about 63 degrees, and tilts toward their eye height.
+    const pl = game.player;
+    const pdx = pl.x - this.x;
+    const pdz = pl.z - this.z;
+    const pd = Math.hypot(pdx, pdz);
+    const want = angleDiff(Math.atan2(pdz, pdx), this.face);
+    const sees = this.talking || (pd < 4.5 && Math.abs(want) < 2.1);
+    const ease = Math.min(1, dt * 4);
+    this.gaze += ((sees ? 1 : 0) - this.gaze) * Math.min(1, dt * 2.5);
+    this.look += (Math.max(-1.1, Math.min(1.1, sees ? want : 0)) - this.look) * ease;
+    const up = Math.atan2(pl.y + pl.eye - (this.y + 1.62), Math.max(0.6, pd));
+    this.lookUp += (Math.max(-0.45, Math.min(0.45, sees ? up : 0)) - this.lookUp) * ease;
     if (this.thinkT <= 0) {
       this.thinkT = 1.5;
       const { spot, phase } = this.scheduleAt(game.hour);
@@ -883,7 +906,8 @@ export class NPC {
       x: this.x, y: this.y, z: this.z, w: 1.9, h: 1.9, frame: SPR[name], emit: this.def.sprite === 'master' ? 1 : 0, tint: [1, 1, 1], sky: level.covered(this.x, this.z) ? 0 : 1,
       model: {
         rig: this.def.sprite, yaw: this.face, t: this.anim, walk: this.moving ? 1 : 0, phase: this.anim * 8.4,
-        act: this.talking ? 'talk' : '', k: 0, stagger: 0, dead: 0, scale: 1,
+        act: this.talking ? 'talk' : '', k: 0, stagger: 0, dead: 0, scale: this.build,
+        gaze: this.gaze, look: this.look, lookUp: this.lookUp, variant: this.variant,
       },
     };
   }

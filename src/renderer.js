@@ -10,12 +10,15 @@
  * creases indoors and out. Exponential distance fog plus analytic height mist with drifting
  * density, GPU rain, bloom, FXAA, ACES filmic tone mapping and grading finish the frame.
  */
-import { buildWorldAtlas, buildSpriteAtlas, buildWorldMaterials, buildDetailTexture, uploadArray, uploadRepeating, SPRITE_NAMES } from './textures.js';
+import { buildWorldAtlas, buildSpriteAtlas, buildWorldMaterials, buildDetailTexture, uploadArray, uploadRepeating, SPRITE_NAMES, CHAR_LAYER } from './textures.js';
 import { TILE, CHUNK, Level, hash2 } from './world.js';
 import {
   Mesh, VERT, MAX_BONES, ident, mul, trs, buildModel, hasModel, nominalSize, isItemModel, VARIANTS, grassTuft, buildRoof,
   buildDoorFrame, getRig, poseRig, getViewmodel, RIG_NAMES,
 } from './models.js';
+
+/** Townsfolk rigs that come in two looks (constructs and the Archivist have one). */
+const HUMAN_VARIANTS = new Set(['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard', 'master', 'keeper', 'captain']);
 
 /** @typedef {import('./world.js').Door} Door */
 /** @typedef {import('./world.js').Light} Light */
@@ -121,7 +124,10 @@ void main() {
   vTintEmit = iC;
   vH = wp.y - iA.y;
 #else
-  mat4 B = uBones[int(aMisc.y + 0.5)];
+  // Bone slot packs the main bone, a second bone (x16) and its weight (x256, 0..255).
+  int bi = int(aMisc.y + 0.5);
+  float bw = float(bi >> 8) / 255.0;
+  mat4 B = uBones[bi & 15] * (1.0 - bw) + uBones[(bi >> 4) & 15] * bw;
   vec4 wp = B * vec4(aPos, 1.0);
   vNormal = mat3(B) * aNormal;
   vSky = aMisc.x * uSky;
@@ -244,7 +250,9 @@ vec3 envBRDF(vec3 F0, float r, float NoV) {
 // Cook-Torrance: GGX distribution, Smith-Schlick visibility, Schlick Fresnel; Lambert diffuse.
 // wrap > 0 marks organic matter (skin, cloth, leaves): light bleeds past the terminator, warmed
 // as if scattered beneath the surface, and thin parts glow faintly when backlit.
-vec3 shade(vec3 N, vec3 V, vec3 L, vec3 diff, vec3 F0, float rough, float wrap) {
+// sss (skin) widens the red channel's wrap and warms the bleed toward haemoglobin red where the
+// surface curves tightly (ears, nostrils, lids), the way pre-integrated skin shading does.
+vec3 shade(vec3 N, vec3 V, vec3 L, vec3 diff, vec3 F0, float rough, float wrap, float sss) {
   vec3 H = normalize(L + V);
   float NoLr = dot(N, L);
   float NoL = max(NoLr, 0.0);
@@ -259,8 +267,11 @@ vec3 shade(vec3 N, vec3 V, vec3 L, vec3 diff, vec3 F0, float rough, float wrap) 
   float Vis = 0.25 / ((NoV * (1.0 - k) + k) * (NoL * (1.0 - k) + k));
   vec3 F = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
   float wrapped = max((NoLr + wrap) / (1.0 + wrap), 0.0);
-  vec3 bleed = diff * max(wrapped - NoL, 0.0) * vec3(1.0, 0.62, 0.48);
-  vec3 trans = diff * pow(max(dot(-V, L), 0.0), 6.0) * wrap * 0.5;
+  float wr = wrap * (1.0 + sss);
+  float wrappedR = max((NoLr + wr) / (1.0 + wr), 0.0);
+  vec3 bc = mix(vec3(1.0, 0.62, 0.48), vec3(1.0, 0.34, 0.22), sss);
+  vec3 bleed = diff * max(vec3(wrappedR, wrapped, wrapped) - NoL, 0.0) * bc;
+  vec3 trans = diff * pow(max(dot(-V, L), 0.0), 6.0) * wrap * (0.5 + sss) * mix(vec3(1.0), bc, sss);
   return (diff * (1.0 - F) + PI * D * Vis * F) * NoL + bleed + trans;
 }
 
@@ -278,7 +289,12 @@ void main() {
   float wrap = 0.0;
   vec3 emission = vec3(0.0);
   float water = 0.0;
+  float sheen = 0.0;
+  float sss = 0.0;
+  // Character layers (wool, skin, leather, hair) live on moving, two-sided cloth and bodies.
+  bool charL = layer > ${CHAR_LAYER.WOOL - 0.5};
   if (layer >= 0.0) {
+    if (charL && dot(N, V) < 0.0) N = -N;
     vec2 uv = vUV;
     if (vMat.w > 2.5) { uv += vec2(uTime * 0.035, uTime * 0.021); water = 1.0; }
     vec3 suv = vec3(uv, layer);
@@ -290,13 +306,40 @@ void main() {
     cav = mm.b;
     metal = mm.a;
     N = perturb(N, vPos, uv, nm.xyz * 2.0 - 1.0);
-    // World-space detail grunge, projected on the dominant axis, hides tiling.
-    vec3 an = abs(vNormal);
-    vec2 duv = an.y > 0.7 ? vPos.xz : (an.x > an.z ? vPos.zy : vPos.xy);
-    vec3 d1 = texture(uDetail, duv * 0.23).rgb;
-    vec3 d2 = texture(uDetail, duv * 0.047).rgb;
-    albedo = lin(texel) * (1.0 + (d1.r - 0.5) * 0.22) * (1.0 + (d2.g - 0.5) * 0.3) * vCol;
-    rough = clamp(rough + (d1.b - 0.5) * 0.18, 0.04, 1.0);
+    if (layer > ${CHAR_LAYER.EYE - 0.5}) {
+      // Eyes: their own colour and lid shadow, a wet cornea (very low roughness) for catchlights.
+      albedo = lin(texel) * vCol;
+      wrap = 0.08;
+    } else if (layer > ${CHAR_LAYER.SKIN - 0.5} && layer < ${CHAR_LAYER.SKIN + 0.5}) {
+      // Skin: isotropic pores and blotches from its own layer (no cloth grunge), subsurface wrap,
+      // and scattering that rises with curvature (normal change per metre across the pixel).
+      albedo = lin(texel) * vCol;
+      float curv = length(fwidth(normalize(vNormal))) / max(length(fwidth(vPos)), 1e-5);
+      sss = clamp(0.3 + curv * 0.009, 0.3, 1.0);
+      wrap = 0.45;
+      rough = clamp(rough, 0.52, 0.65);
+    } else if (charL) {
+      // Object-space triplanar grunge (sticks to the moving body), dirt climbing the hems and
+      // boots, and per-material light wrap: felted wool and skin scatter, leather barely does.
+      vec3 w3 = pow(abs(normalize(vNormal)), vec3(4.0));
+      w3 /= dot(w3, vec3(1.0));
+      vec3 p1 = vObj * 5.0;
+      vec4 dd = texture(uDetail, p1.yz) * w3.x + texture(uDetail, p1.xz) * w3.y + texture(uDetail, p1.xy) * w3.z;
+      albedo = lin(texel) * (0.88 + dd.g * 0.24) * vCol;
+      float grime = clamp(smoothstep(0.5, 0.0, vH) * 0.75 + (dd.g - 0.7) * 0.45, 0.0, 1.0);
+      albedo = mix(albedo, albedo * vec3(0.55, 0.47, 0.39), grime * 0.55);
+      rough = clamp(rough + (dd.b - 0.5) * 0.12 + grime * 0.1, 0.05, 1.0);
+      wrap = layer < ${CHAR_LAYER.SKIN - 0.5} ? 0.5 : (layer < ${CHAR_LAYER.LEATHER - 0.5} ? 0.42 : (layer < ${CHAR_LAYER.HAIR - 0.5} ? 0.18 : 0.3));
+      sheen = layer < ${CHAR_LAYER.SKIN - 0.5} ? 0.55 : (layer > ${CHAR_LAYER.HAIR - 0.5} ? 0.25 : 0.0);
+    } else {
+      // World-space detail grunge, projected on the dominant axis, hides tiling.
+      vec3 an = abs(vNormal);
+      vec2 duv = an.y > 0.7 ? vPos.xz : (an.x > an.z ? vPos.zy : vPos.xy);
+      vec3 d1 = texture(uDetail, duv * 0.23).rgb;
+      vec3 d2 = texture(uDetail, duv * 0.047).rgb;
+      albedo = lin(texel) * (1.0 + (d1.r - 0.5) * 0.22) * (1.0 + (d2.g - 0.5) * 0.3) * vCol;
+      rough = clamp(rough + (d1.b - 0.5) * 0.18, 0.04, 1.0);
+    }
     if (vMat.w > 0.5 && vMat.w < 2.5) {
       // Cyan-dominant or near-white texels glow; stone, steel and brass highlights do not.
       float mask = vMat.w > 1.5 ? 1.0 : clamp(smoothstep(0.2, 0.45, max(texel.g, texel.b) - texel.r) + smoothstep(0.9, 0.98, min(texel.r, min(texel.g, texel.b))), 0.0, 1.0);
@@ -344,10 +387,12 @@ void main() {
   vec3 col = (diff * hemi + env * envBRDF(F0, rough, NoV)) * cav;
   // Grazing Fresnel rim on worn metal, glass and wet or polished surfaces.
   col += env * pow(1.0 - NoV, 5.0) * (metal * 0.5 + (1.0 - rough) * 0.35) * cav;
+  // Fibre sheen: wool and hair catch soft light along their silhouettes.
+  col += diff * (hemi + uSunCol * vSky * 0.25) * pow(1.0 - max(dot(N, V), 0.0), 3.0) * sheen * cav;
 
   if (vSky > 0.0) {
     float ndl = dot(N, uSunDir);
-    if (ndl > -wrap) col += shade(N, V, uSunDir, diff, F0, rough, wrap) * uSunCol * shadowAt(vPos, N, max(ndl, 0.0)) * vSky;
+    if (ndl > -wrap * (1.0 + sss)) col += shade(N, V, uSunDir, diff, F0, rough, wrap, sss) * uSunCol * shadowAt(vPos, N, max(ndl, 0.0)) * vSky;
   }
   for (int i = 0; i < MAX_LIGHTS; i++) {
     if (i >= uLightCount) break;
@@ -358,7 +403,7 @@ void main() {
     vec3 Ld = L / max(d, 1e-4);
     float win = clamp(1.0 - d2 * d2 / 65536.0, 0.0, 1.0);
     float att = win * win / (1.0 + 0.3 * d2);
-    col += (shade(N, V, Ld, diff, F0, max(rough, 0.12), wrap) + diff * 0.06) * uLightCol[i] * att;
+    col += (shade(N, V, Ld, diff, F0, max(rough, 0.07), wrap, sss) + diff * 0.06) * uLightCol[i] * att;
   }
   if (water > 0.0) {
     float fres = pow(1.0 - NoV, 4.0);
@@ -1119,7 +1164,11 @@ export class Renderer {
     this.models = new Map();
     /** @type {Map<string, {vao: WebGLVertexArrayObject, vbo: WebGLBuffer, ebo: WebGLBuffer, count: number, itype: number}>} skinned rigs and viewmodels */
     this.skinned = new Map();
+    /** Dialogue portraits by rig and size (PNG data URLs). @type {Map<string, string>} */
+    this.portraits = new Map();
     this.bones = new Float32Array(MAX_BONES * 16);
+    /** Skinning matrices (pose x inverse bind) uploaded for a rig. */
+    this.skinMats = new Float32Array(MAX_BONES * 16);
     this.identBones = new Float32Array(MAX_BONES * 16);
     for (let i = 0; i < MAX_BONES; i++) this.identBones.set(ident(), i * 16);
     this.postVAO = gl.createVertexArray();
@@ -1142,7 +1191,9 @@ export class Renderer {
     // while the title screen is up instead of hitching the first time one comes into view.
     /** @type {(() => void)[]} */
     const warm = [];
-    for (const n of RIG_NAMES) warm.push(() => getRig(n), () => getRig(n, true));
+    for (const n of RIG_NAMES) {
+      for (let v = 0; v < (HUMAN_VARIANTS.has(n) ? 2 : 1); v++) warm.push(() => getRig(n, false, v), () => getRig(n, true, v));
+    }
     for (const n of ['tree_ley', 'tree_pine', 'tree_dead', 'rock', 'ruin']) for (let k = 0; k < 4; k++) warm.push(() => this._cpuModel(`${n}#${k}`), () => this._cpuModel(`${n}#${k}~`));
     for (const id of ['fork', 'scatter', 'crossbow', 'cast', 'lantern']) warm.push(() => getViewmodel(id));
     const step = () => {
@@ -1608,10 +1659,11 @@ export class Renderer {
     const gl = this.gl;
     for (const { s, m } of chars) {
       const far = !lit || Math.hypot(s.x - eye.x, s.z - eye.z) > CHAR_LOD_DIST;
-      const rig = getRig(m.rig, far);
-      const gpu = this._skinned(`rig:${m.rig}${far ? '~' : ''}`, () => rig.mesh);
+      const v = m.variant ?? 0;
+      const rig = getRig(m.rig, far, v);
+      const gpu = this._skinned(`rig:${m.rig}#${v}${far ? '~' : ''}`, () => rig.mesh);
       const n = poseRig(rig, m, s.x, s.y, s.z, this.bones);
-      gl.uniformMatrix4fv(u.uBones, false, this.bones.subarray(0, Math.max(n, 1) * 16));
+      gl.uniformMatrix4fv(u.uBones, false, this._skin(rig, n));
       if (lit) {
         gl.uniform1f(u.uSky, s.sky);
         gl.uniform3fv(u.uTint, s.tint);
@@ -1620,6 +1672,15 @@ export class Renderer {
       }
       this._drawIndexed(gpu);
     }
+  }
+
+  /**
+   * Skinning matrices for a posed rig: each bone's pose times its inverse bind.
+   * @param {import('./models.js').Rig} rig @param {number} n bones posed @returns {Float32Array}
+   */
+  _skin(rig, n) {
+    for (let i = 0; i < n; i++) mul(this.bones.subarray(i * 16, i * 16 + 16), rig.invBind.subarray(i * 16, i * 16 + 16), this.skinMats.subarray(i * 16, i * 16 + 16));
+    return this.skinMats.subarray(0, Math.max(n, 1) * 16);
   }
 
   /**
@@ -1923,6 +1984,129 @@ export class Renderer {
     this._pass(null);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindVertexArray(null);
+  }
+
+  /**
+   * Head-and-shoulders portrait of a character rig for the dialogue panel, lit like a
+   * lantern-lit study (warm key, cool fill, rim from behind) with the full PBR shader, rendered
+   * offscreen at twice the size, then tone-mapped to a transparent PNG. Cached per rig and size.
+   * @param {string} rigName @param {number} [size] CSS pixels @param {number} [variant] which look
+   * @returns {string} data URL, or '' if it could not be drawn
+   */
+  portrait(rigName, size = 112, variant = 0) {
+    const cacheKey = `${rigName}#${variant}@${size}`;
+    const hit = this.portraits.get(cacheKey);
+    if (hit !== undefined) return hit;
+    const gl = this.gl;
+    const px = size * 2;
+    let url = '';
+    /** @type {Target|null} */
+    let rt = null;
+    try {
+      rt = this._target(null, px, px, true);
+      const rig = getRig(rigName, false, variant);
+      const gpu = this._skinned(`rig:${rigName}#${variant}`, () => rig.mesh);
+      // t = 2.6 s falls between blinks (see poseRig).
+      /** @type {import('./models.js').ModelDesc} */
+      const desc = { rig: rigName, yaw: Math.PI / 2, t: 2.6, walk: 0, phase: 0, act: '', k: 0, stagger: 0, dead: 0, scale: 1 };
+      const n = poseRig(rig, desc, 0, 0, 0, this.bones);
+      // Frame on the face (head bone is index 2), aiming a little low to take in the shoulders.
+      const H = this.bones.subarray(32, 48);
+      const hp = [0, 0.13, 0.05];
+      const fc = [0, 1, 2].map((i) => H[i] * hp[0] + H[4 + i] * hp[1] + H[8 + i] * hp[2] + H[12 + i]);
+      const look = [fc[0], fc[1] - 0.08, fc[2]];
+      const eye = [look[0] + Math.sin(0.42) * 0.72, look[1] + 0.05, look[2] + Math.cos(0.42) * 0.72];
+      const d = [look[0] - eye[0], look[1] - eye[1], look[2] - eye[2]];
+      const dl = Math.hypot(d[0], d[1], d[2]);
+      const vp = mul(perspective((30 * Math.PI) / 180, 1, 0.05, 10), viewMatrix(eye, d.map((c) => c / dl)));
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo);
+      gl.viewport(0, 0, px, px);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+      gl.disable(gl.CULL_FACE);
+      /** @type {[number, WebGLTexture|null][]} */
+      const textures = [[gl.TEXTURE_2D_ARRAY, this.albedoTex], [gl.TEXTURE_2D_ARRAY, this.normalTex], [gl.TEXTURE_2D_ARRAY, this.matTex], [gl.TEXTURE_2D, this.detailTex], [gl.TEXTURE_2D, this.shadowTex]];
+      textures.forEach(([target, tex], i) => {
+        gl.activeTexture(gl.TEXTURE0 + i);
+        gl.bindTexture(target, tex);
+      });
+      const lp = new Float32Array(MAX_LIGHTS * 3);
+      const lc = new Float32Array(MAX_LIGHTS * 3);
+      const lights = [[-0.62, 0.36, 0.3, 2.2, 1.4, 0.72], [0.62, 0.0, 0.4, 0.2, 0.27, 0.42], [0.25, 0.3, -0.55, 1.3, 1.1, 0.85]];
+      lights.forEach((l, i) => {
+        lp.set([fc[0] + l[0], fc[1] + l[1], fc[2] + l[2]], i * 3);
+        lc.set([l[3], l[4], l[5]], i * 3);
+      });
+      const u = this.mesh.u;
+      gl.useProgram(this.mesh.prog);
+      gl.uniformMatrix4fv(u.uViewProj, false, vp);
+      gl.uniform3fv(u.uLightPos, lp);
+      gl.uniform3fv(u.uLightCol, lc);
+      gl.uniform1i(u.uLightCount, lights.length);
+      gl.uniform3f(u.uEye, eye[0], eye[1], eye[2]);
+      gl.uniform1f(u.uTime, desc.t);
+      gl.uniform1f(u.uWind, 0);
+      gl.uniform3fv(u.uFog, [0, 0, 0]);
+      gl.uniform3fv(u.uZenith, [0, 0, 0]);
+      gl.uniform1f(u.uFogDensity, 0);
+      gl.uniform3fv(u.uAmbient, [0.05, 0.05, 0.065]);
+      gl.uniform3fv(u.uSunDir, [0, 1, 0]);
+      gl.uniform3fv(u.uSunCol, [0, 0, 0]);
+      gl.uniform1f(u.uStore, this.store);
+      gl.uniform1f(u.uWet, 0);
+      gl.uniformMatrix4fv(u.uShadowMat, false, ident());
+      gl.uniform1f(u.uShadowOn, 0);
+      [u.uAlbedo, u.uNormal, u.uMat, u.uDetail, u.uShadowMap].forEach((loc, i) => gl.uniform1i(loc, i));
+      gl.uniformMatrix4fv(u.uBones, false, this._skin(rig, n));
+      gl.uniform1f(u.uSky, 0);
+      gl.uniform3fv(u.uTint, WHITE);
+      gl.uniform1f(u.uEmit, 1);
+      gl.uniform1f(u.uBase, 0);
+      this._drawIndexed(gpu);
+      gl.bindVertexArray(null);
+
+      // Read back, average 2x2, ACES tone map and gamma, flip to top-down rows.
+      const raw = this.hdr ? new Float32Array(px * px * 4) : new Uint8Array(px * px * 4);
+      gl.readPixels(0, 0, px, px, gl.RGBA, this.hdr ? gl.FLOAT : gl.UNSIGNED_BYTE, raw);
+      const scale = (this.hdr ? 1 : 1 / 255) / this.store;
+      const aces = (/** @type {number} */ x) => Math.min(1, Math.max(0, (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)));
+      const cv = document.createElement('canvas');
+      cv.width = cv.height = size;
+      const c2 = cv.getContext('2d');
+      if (!c2) throw new Error('2D canvas is not available');
+      const img = c2.createImageData(size, size);
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const acc = [0, 0, 0, 0];
+          for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+            const s = ((px - 1 - (y * 2 + oy)) * px + x * 2 + ox) * 4;
+            for (let k = 0; k < 4; k++) acc[k] += raw[s + k] * (k < 3 ? scale : this.hdr ? 1 : 1 / 255);
+          }
+          const a = acc[3] / 4;
+          const o = (y * size + x) * 4;
+          for (let k = 0; k < 3; k++) img.data[o + k] = Math.pow(aces(acc[k] / 4 / Math.max(a, 1e-3)), 1 / 2.2) * 255;
+          img.data[o + 3] = Math.min(1, a) * 255;
+        }
+      }
+      c2.putImageData(img, 0, 0);
+      url = cv.toDataURL('image/png');
+    } catch (err) {
+      console.warn('Portrait unavailable:', err);
+      url = '';
+    } finally {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (rt) {
+        gl.deleteFramebuffer(rt.fbo);
+        gl.deleteTexture(rt.tex);
+        if (rt.depth) gl.deleteTexture(rt.depth);
+      }
+    }
+    this.portraits.set(cacheKey, url);
+    return url;
   }
 
   /**

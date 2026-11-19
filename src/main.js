@@ -10,6 +10,8 @@ import {
   BIOME_NAMES, SITES, mulberry32,
 } from './world.js';
 import { Renderer } from './renderer.js';
+import { setBodies } from './models.js';
+import { loadBodies } from './meshes.js';
 import { AudioEngine } from './audio.js';
 import { SPR, spriteRect } from './textures.js';
 import { Player, Enemy, Orb, NPC, Particle, angleDiff } from './entities.js';
@@ -681,6 +683,16 @@ export class Game {
         this.level.move(a, (-dx / d) * push, (-dz / d) * push, a.radius, a.y, false, true);
         this.level.move(b, (dx / d) * push, (dz / d) * push, b.radius, b.y, false, true);
       }
+    }
+    // Townsfolk are solid: the player is pushed out of their radius (they hold their ground).
+    const p = this.player;
+    for (const n of this.npcs) {
+      const dx = p.x - n.x;
+      const dz = p.z - n.z;
+      const d = Math.hypot(dx, dz);
+      const min = p.radius + n.radius;
+      if (d >= min || d < 1e-4 || Math.abs(p.y - n.y) > 1.5) continue;
+      this.level.move(p, (dx / d) * (min - d), (dz / d) * (min - d), p.radius, p.y, false, true);
     }
   }
 
@@ -2523,6 +2535,15 @@ class App {
     this.renderDialogue(this.dialogue.greeting(), []);
   }
 
+  /**
+   * The speaker's 3D portrait (their rig rendered with the full PBR shader), falling back to the
+   * sprite icon if it cannot be drawn. @param {NPC} npc
+   */
+  portraitOf(npc) {
+    const url = this.renderer.portrait(npc.def.sprite, 112, npc.variant);
+    return url ? h('img', { src: url, width: 112, height: 112, class: 'portrait', alt: '' }) : icon(npc.def.sprite, 96);
+  }
+
   /** @param {string} text @param {import('./rpg.js').DialogueOption[]} options */
   renderDialogue(text, options) {
     const d = /** @type {Dialogue} */ (this.dialogue);
@@ -2530,7 +2551,7 @@ class App {
     const role = { guildmaster: 'Guildmaster', merchant: 'Merchant', innkeeper: 'Innkeeper', guard: 'Guard', folk: 'Townsfolk' }[npc.def.role] ?? '';
     this.panel('DIALOGUE', npc.def.name,
       h('div', { class: 'dlg' },
-        h('div', { class: 'dlg-side' }, icon(npc.def.sprite, 96), h('div', { class: 'small' }, role), h('div', { class: 'topics' }, d.topics().map((t) => btn(t.label, () => this.dlgReply(d.ask(t.id)))))),
+        h('div', { class: 'dlg-side' }, this.portraitOf(npc), h('div', { class: 'small' }, role), h('div', { class: 'topics' }, d.topics().map((t) => btn(t.label, () => this.dlgReply(d.ask(t.id)))))),
         h('div', { class: 'dlg-main' },
           h('p', { class: 'dlg-text' }, text),
           h('div', { class: 'col' }, options.map((o) => btn(o.label, () => this.dlgReply(d.choose(o.id)), !o.enabled))),
@@ -2978,9 +2999,16 @@ class App {
   }
 }
 
-// Two frames let the "Forging…" status paint before texture synthesis blocks the thread.
-requestAnimationFrame(() => requestAnimationFrame(() => {
+// Two frames let the "Forging…" status paint before texture synthesis blocks the thread. The
+// sculpted base meshes load first; without them (offline file://, missing assets) townsfolk fall
+// back to the procedural bodies.
+requestAnimationFrame(() => requestAnimationFrame(async () => {
   const msg = document.getElementById('boot-error');
+  try {
+    setBodies(await loadBodies());
+  } catch (err) {
+    console.warn('Base meshes unavailable; using procedural bodies.', err);
+  }
   try {
     new App();
     if (msg) msg.textContent = '';
