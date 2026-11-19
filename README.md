@@ -48,7 +48,7 @@ The title screen has a **Guided Tutorial: ON / OFF** toggle, which is remembered
 4. **Combat**: attack, parry or dash against the training automaton in the Atrium.
 5. **Open the Gate**: cast a rune in the Gate Hall or pull the Harmonic Levers, then step outside.
 
-The card never blocks the game, and its wording follows your controls (desktop or touch). You can leave at any time with **End Tutorial [Esc / Tap]**, the pause menu, or by asking **The Archivist** beside your bed. Ending early puts any starter gear you haven't looted into your pack and opens the Gate.
+The card never blocks the game, and its wording follows your controls (desktop or touch). You can leave at any time with the **End Tutorial** button on the card, the pause menu (Esc), or by asking **The Archivist** beside your bed. Ending early puts any starter gear you haven't looted into your pack and opens the Gate.
 
 ## The world
 

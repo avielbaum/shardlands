@@ -88,6 +88,30 @@ const WEATHER_ODDS = [
 ];
 /** @param {number} v @param {number} a @param {number} b */
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+/** Cap on live particles; the oldest are dropped first. */
+const MAX_PARTICLES = 300;
+/** BFS neighbour offsets for the flow field. */
+const FLOW_DI = [1, -1, 0, 0];
+const FLOW_DJ = [0, 0, 1, -1];
+/** @param {{alive: boolean}} o */
+const isAlive = (o) => o.alive;
+/** @param {{deadT: number}} e */
+const stillFalling = (e) => e.deadT < 1.6;
+
+/**
+ * Remove entries failing `keep` in place (order preserved, no allocation), then drop the
+ * oldest entries beyond `max`.
+ * @template T @param {T[]} arr @param {(v: T) => boolean} keep @param {number} [max]
+ */
+function compact(arr, keep, max = Infinity) {
+  let n = 0;
+  for (let i = 0; i < arr.length; i++) if (keep(arr[i])) arr[n++] = arr[i];
+  if (n > max) {
+    arr.copyWithin(0, n - max, n);
+    n = max;
+  }
+  arr.length = n;
+}
 /** @param {number[]} a @param {number[]} b @param {number} t */
 const mix3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
 
@@ -164,6 +188,8 @@ export class Game {
     this.flowOx = 0;
     this.flowOz = 0;
     this.flow = new Int16Array(48 * 48);
+    /** Reused BFS queue for _computeFlow. */
+    this.flowQueue = new Int32Array(48 * 48);
     this.fx = { dash: 0, parry: 0, hurt: 0, flash: 0 };
     /** Dynamic weather (saved; thunderT is transient). */
     this.weather = { kind: /** @type {keyof typeof WEATHER} */ ('clear'), rain: 0, wind: 0.15, next: 0, thunderT: 8 };
@@ -337,15 +363,16 @@ export class Game {
     for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 4900) e.update(edt, this);
     this._separate();
     for (const e of this.enemies) if (!e.alive && e.state !== 'fall') this.fallen.push(e);
-    this.fallen = this.fallen.filter((e) => (e.deadT += dt) < 1.6);
-    this.enemies = this.enemies.filter((e) => e.alive);
+    for (const e of this.fallen) e.deadT += dt;
+    compact(this.fallen, stillFalling);
+    compact(this.enemies, isAlive);
     for (const n of this.npcs) n.update(dt, this, Math.hypot(n.x - p.x, n.z - p.z) < 50);
     for (const o of this.orbs) o.update(o.owner === 'enemy' ? edt : dt, this);
     for (const s of this.projectiles) s.update(dt, this);
     for (const q of this.particles) q.update(dt, L.heightAt(q.x, q.z));
-    this.orbs = this.orbs.filter((o) => o.alive);
-    this.projectiles = this.projectiles.filter((s) => s.alive);
-    this.particles = this.particles.filter((q) => q.alive).slice(-300);
+    compact(this.orbs, isAlive);
+    compact(this.projectiles, isAlive);
+    compact(this.particles, isAlive, MAX_PARTICLES);
 
     this.revealT -= dt;
     if (this.revealT <= 0) {
@@ -563,23 +590,27 @@ export class Game {
     this.flowOz = oz;
     const f = this.flow;
     f.fill(32767);
-    const q = [];
+    // Each cell is enqueued at most once, so an N*N queue never overflows.
+    const q = this.flowQueue;
+    let tail = 0;
     const si = Math.floor(p.x) - ox;
     const sj = Math.floor(p.z) - oz;
     f[sj * N + si] = 0;
-    q.push(sj * N + si);
-    for (let h = 0; h < q.length; h++) {
+    q[tail++] = sj * N + si;
+    for (let h = 0; h < tail; h++) {
       const cur = q[h];
       const i = cur % N;
       const j = (cur / N) | 0;
       const ch = L.floorH[L.idx(clamp(i + ox, 0, L.w - 1), clamp(j + oz, 0, L.h - 1))];
-      for (const [ni, nj] of [[i + 1, j], [i - 1, j], [i, j + 1], [i, j - 1]]) {
+      for (let d = 0; d < 4; d++) {
+        const ni = i + FLOW_DI[d];
+        const nj = j + FLOW_DJ[d];
         if (ni < 0 || nj < 0 || ni >= N || nj >= N) continue;
         const n = nj * N + ni;
         if (f[n] <= f[cur] + 1) continue;
         if (L.blocked(ni + ox, nj + oz, ch, false, true)) continue;
         f[n] = f[cur] + 1;
-        q.push(n);
+        q[tail++] = n;
       }
     }
   }
@@ -2069,6 +2100,8 @@ class App {
     /** @type {number|null} */
     this.cursorX = null;
     this.expectUnlock = false;
+    /** When the pause menu last opened (ms), to ignore the Esc that released pointer lock. */
+    this.pausedAt = 0;
     /** @type {Interactable|null} */
     this.target = null;
     /** @type {Dialogue|null} */
@@ -2122,8 +2155,8 @@ class App {
     } catch { /* unsupported: free-look fallback handles it */ }
   }
 
-  /** @param {AppState} s */
-  setState(s) {
+  /** @param {AppState} s @param {boolean} [relock] re-request pointer lock on returning to play */
+  setState(s, relock = true) {
     const was = this.state;
     this.state = s;
     this.input.clearHeld();
@@ -2137,7 +2170,7 @@ class App {
       if (this.talkNpc) this.talkNpc.talking = false;
       this.talkNpc = null;
       this.dialogue = null;
-      if (was !== 'EXPLORE') this.lock();
+      if (was !== 'EXPLORE' && relock) this.lock();
     }
     this._refreshHotbar();
   }
@@ -2147,8 +2180,12 @@ class App {
     this.state !== s && this.setState(s);
     this.modal.innerHTML = '';
     this.modal.classList.remove('hidden');
-    const close = s === 'DEAD' || s === 'TITLE' ? null : h('button', { class: 'close brass-btn', type: 'button', onclick: () => this.setState('EXPLORE') }, '✕');
-    this.modal.append(h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', {}, title), close), h('div', { class: 'panel-body' }, ...body)));
+    const close = s === 'DEAD' || s === 'TITLE' ? null : h('button', { class: 'close brass-btn', type: 'button', 'aria-label': 'Close', onclick: () => this.setState('EXPLORE') }, '✕');
+    const head = h('h2', { id: 'panel-title', tabindex: '-1' }, title);
+    this.modal.append(h('div', { class: 'panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'panel-title' }, h('div', { class: 'panel-head' }, head, close), h('div', { class: 'panel-body' }, ...body)));
+    // Move keyboard focus into the dialog: its first button, else the heading.
+    const first = /** @type {HTMLElement|null} */ (this.modal.querySelector('.panel-body button:not([disabled])'));
+    (first || head).focus({ preventScroll: true });
   }
 
   _bind() {
@@ -2276,14 +2313,17 @@ class App {
     const panels = { Tab: 'inventory', KeyI: 'inventory', KeyK: 'skills', KeyJ: 'journal', KeyM: 'map' };
     const want = /** @type {Record<string, string>} */ (panels)[code];
     if (code === 'Escape') {
-      // Esc ends a running tutorial immediately; otherwise it pauses (with pointer lock the
-      // browser's own Esc release opens the pause menu, which also offers End Tutorial).
-      if (this.game.tutorialActive && (this.state === 'EXPLORE' || this.state === 'PAUSE')) {
-        this.endTutorial();
-        return;
-      }
+      // Esc pauses (with pointer lock the browser's own Esc release opens the pause menu) and
+      // a second Esc resumes. Ending the tutorial is left to its explicit buttons.
       if (this.state === 'EXPLORE' && !document.pointerLockElement) this.showPause();
-      else if (this.state !== 'EXPLORE' && this.state !== 'PAUSE') this.setState('EXPLORE');
+      else if (this.state === 'PAUSE') {
+        // The same keypress that released pointer lock may still arrive after the pause opened.
+        if (performance.now() - this.pausedAt < 250) return;
+        // Esc is not a user activation, so pointer lock cannot be re-requested here; the next
+        // click on the view recaptures the mouse.
+        this.setState('EXPLORE', false);
+        if (!this.touch && !this.lockFailed) this.game.notify('Click the view to resume mouse look.');
+      } else if (this.state !== 'EXPLORE') this.setState('EXPLORE');
       return;
     }
     if (want) {
@@ -2478,6 +2518,7 @@ class App {
   }
 
   showPause() {
+    this.pausedAt = performance.now();
     this.panel('PAUSE', 'Paused',
       h('div', { class: 'col' },
         btn('Resume', () => this.setState('EXPLORE')),
@@ -2512,7 +2553,7 @@ class App {
     this.tutCard.dataset.key = key;
     $('tut-step').textContent = `Tutorial ${t.step + 1}/${TUTORIAL_STEPS.length}: ${step.title}`;
     $('tut-text').textContent = this.touch ? step.touch : step.desktop;
-    $('tut-end').textContent = this.touch ? 'End Tutorial [Tap]' : 'End Tutorial [Esc]';
+    $('tut-end').textContent = this.touch ? 'End Tutorial [Tap]' : 'End Tutorial';
   }
 
   loadGame() {
@@ -3011,7 +3052,7 @@ requestAnimationFrame(() => requestAnimationFrame(async () => {
   }
   try {
     new App();
-    if (msg) msg.textContent = '';
+    if (msg) { msg.textContent = ''; msg.style.display = 'none'; }
   } catch (err) {
     if (msg) msg.textContent = String(/** @type {Error} */ (err).message || err);
     throw err;
