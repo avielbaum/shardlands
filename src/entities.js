@@ -39,6 +39,12 @@ export function angleDiff(a, b) {
 /** @param {number} v @param {number} lo @param {number} hi */
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
+/** Display names of timed effects, for the "has faded" notes. @type {Record<string, string>} */
+const EFFECT_NAMES = {
+  feather: 'Feather Step', lumina: 'Lumina', oil_ember: 'Ember oil', oil_frost: 'Frost oil', oil_whet: 'Whetstone oil',
+  stasis: 'Temporal Stasis', sight: 'Astral Sight', surge: 'Ley-Surge', stride: 'Phantom Stride', supernova: 'Supernova Strike',
+};
+
 /** Turn angle a toward b by at most step radians. @param {number} a @param {number} b @param {number} step */
 const turnToward = (a, b, step) => a + clamp(angleDiff(b, a), -step, step);
 
@@ -96,12 +102,13 @@ export class Player {
 
     // Vitals.
     if (!this.blocking) c.stamina = Math.min(c.maxStamina, c.stamina + 22 * dt);
-    c.mana = Math.min(c.maxMana, c.mana + (0.8 + c.attrs.intellect * 0.08) * dt);
+    const still = Math.hypot(this.vx, this.vz) < 0.3;
+    c.mana = Math.min(c.maxMana, c.mana + (0.8 + c.attrs.intellect * 0.08) * (c.birthsign === 'spire' && still ? 1.35 : 1) * dt);
     for (const k of Object.keys(c.effects)) {
       c.effects[k] -= dt;
       if (c.effects[k] <= 0) {
         delete c.effects[k];
-        game.notify(`${k === 'feather' ? 'Feather Step' : k === 'lumina' ? 'Lumina' : k === 'oil_ember' ? 'Ember oil' : 'Frost oil'} has faded.`);
+        game.notify(`${EFFECT_NAMES[k] ?? k} has faded.`);
       }
     }
 
@@ -115,16 +122,17 @@ export class Player {
     if (ml > 1) { mx /= ml; my /= ml; }
     const hz = L.hazardAt(this.x, this.z);
     const deep = hz === HAZARD.DEEP && !flying;
-    if (input.dash && this.dashT <= 0 && c.stamina >= 20 && !c.encumbered) {
+    const dashCost = c.profession === 'strider' ? 17 : 20;
+    if (input.dash && this.dashT <= 0 && c.stamina >= dashCost && !c.encumbered) {
       let dx = fx * my - fz * mx;
       let dz = fz * my + fx * mx;
       const l = Math.hypot(dx, dz);
       if (l < 0.01) { dx = fx; dz = fz; } else { dx /= l; dz /= l; }
       this.dashX = dx;
       this.dashZ = dz;
-      this.dashT = 0.17;
+      this.dashT = c.birthsign === 'hound' ? 0.2125 : 0.17;
       this.iframes = Math.max(this.iframes, 0.32);
-      c.stamina -= 20;
+      c.stamina -= dashCost;
       game.audio.dash();
       game.fx.dash = 1;
     }
@@ -133,7 +141,7 @@ export class Player {
       this.vx = this.dashX * 15;
       this.vz = this.dashZ * 15;
     } else {
-      const sp = 4.6 * (c.encumbered ? 0.5 : 1) * (deep ? 0.55 : 1) * (this.blocking ? 0.55 : 1);
+      const sp = 4.6 * (c.encumbered ? 0.5 : 1) * (deep ? 0.55 : 1) * (this.blocking ? 0.55 : 1) * (c.birthsign === 'hound' ? 1.15 : 1) * (c.effects.stride ? 1.5 : 1);
       const k = 1 - Math.exp(-dt * 12);
       this.vx += ((fx * my - fz * mx) * sp - this.vx) * k;
       this.vz += ((fz * my + fx * mx) * sp - this.vz) * k;
@@ -233,7 +241,7 @@ export class Player {
     const c = game.char;
     const kind = input.moveX !== 0 ? 'sweep' : input.moveY > 0 ? 'thrust' : 'chop';
     const s = SWINGS[kind];
-    let mult = s.mult * (c.stamina >= s.stam ? 1 : 0.5) * (c.has('heavy') ? 1.25 : 1) * (this.riposte ? 2 : 1);
+    let mult = s.mult * (c.stamina >= s.stam ? 1 : 0.5) * (c.has('heavy') ? 1.25 : 1) * (this.riposte ? 2 : 1) * (c.effects.oil_whet ? 1.25 : 1);
     c.stamina = Math.max(0, c.stamina - s.stam);
     this.riposte = false;
     this.attackCd = s.cd;
@@ -252,7 +260,7 @@ export class Player {
       const d = Math.hypot(dx, dz);
       if (d > s.reach + e.radius || Math.abs(e.y - this.y) > 2.5) continue;
       if (d > 0.01 && (dx * fx + dz * fz) / d < s.cos) continue;
-      game.damageEnemy(e, dmg, this.x, this.z, kind === 'chop' ? 2.5 : 4, { burn: !!c.effects.oil_ember, slow: !!c.effects.oil_frost });
+      game.damageEnemy(e, dmg, this.x, this.z, kind === 'chop' ? 2.5 : 4, { burn: !!c.effects.oil_ember, slow: !!c.effects.oil_frost, player: true });
       hit = true;
     }
     if (hit) {
@@ -284,7 +292,7 @@ export class Player {
       const sp = w.speed ?? 24;
       const cp = Math.cos(this.pitch);
       game.projectiles.push(new Projectile(this.x + Math.cos(a) * 0.4, this.y + 1.35, this.z + Math.sin(a) * 0.4,
-        Math.cos(a) * cp * sp, Math.sin(this.pitch) * sp, Math.sin(a) * cp * sp, base, kind, c.has('ricochet') ? 2 : 1, id === 'crossbow'));
+        Math.cos(a) * cp * sp, Math.sin(this.pitch) * sp, Math.sin(a) * cp * sp, base, kind, (c.has('ricochet') ? 2 : 1) + (c.equip.relic && ITEMS[c.equip.relic].lens ? 1 : 0), id === 'crossbow'));
     }
     this.attackCd = id === 'crossbow' ? 0.9 : 0.75;
     this.recoil = 1;
@@ -299,14 +307,15 @@ export class Player {
   _cast(id, game) {
     const c = game.char;
     const s = SPELLS[id];
-    const cost = Math.round(s.cost * (c.has('efficient') ? 0.75 : 1));
+    const cost = c.effects.surge ? 0 : Math.round(s.cost * (c.has('efficient') ? 0.75 : 1));
     if (c.mana < cost) {
       game.notify('Not enough Aether.');
       this.attackCd = 0.3;
       return;
     }
     const lore = c.skill('aether');
-    const power = 1 + lore * 0.12 + c.attrs.intellect * 0.03;
+    const nova = c.effects.supernova ? 3 : 1;
+    const power = (1 + lore * 0.12 + c.attrs.intellect * 0.03) * nova;
     let ok = true;
     if (id === 'lumina') c.effects.lumina = 120 + lore * 10;
     else if (id === 'mending') c.hp = Math.min(c.maxHp, c.hp + 22 * power);
@@ -318,6 +327,10 @@ export class Player {
       return;
     }
     c.mana -= cost;
+    if (nova > 1) {
+      delete c.effects.supernova;
+      game.notify('Supernova!');
+    }
     this.castT = 0.4;
     this.attackCd = 0.6;
     game.audio.cast(id);
@@ -383,6 +396,12 @@ export class Enemy {
     this.face = Math.random() * Math.PI * 2;
     /** Seconds since death, for the collapse animation. */
     this.deadT = 0;
+    /** Seconds left standing down under Command Resonance. */
+    this.charmT = 0;
+    /** Distance walked since the last footfall sound, and where it was measured from. */
+    this.stride = 0;
+    this.px = sp.x;
+    this.pz = sp.z;
   }
 
   get awake() {
@@ -399,6 +418,14 @@ export class Enemy {
     const p = game.player;
     this.anim += dt;
     this.flash = Math.max(0, this.flash - dt);
+    // Footfalls follow the distance actually walked (chasing, knockback or heading home).
+    this.stride += Math.hypot(this.x - this.px, this.z - this.pz);
+    this.px = this.x;
+    this.pz = this.z;
+    if (this.stride > (this.kind === 'golem' ? 1.6 : this.kind === 'mite' ? 0.6 : 0.9)) {
+      this.stride = 0;
+      if (this.state !== 'fall') game.audio.enemyStep(this.kind, this);
+    }
     if (this.state === 'fall') {
       this.y -= 7 * dt;
       this.t -= dt;
@@ -418,6 +445,17 @@ export class Enemy {
       this.losT = 0.25;
       this.los = dist < 18 && L.los(this.x, this.z, p.x, p.z);
     }
+    const hidden = !!game.char.effects.stride;
+    if (hidden) this.los = false;
+    if (this.charmT > 0) {
+      // Command Resonance: stand down, idle in place, ignore the player.
+      this.charmT -= dt;
+      this.y = L.heightAt(this.x, this.z);
+      if (this.state !== 'dormant' && this.state !== 'home') this.state = 'recover';
+      this.t = 0.2;
+      return;
+    }
+    if (hidden && this.state !== 'dormant' && this.state !== 'home') this.state = 'home';
     if (this.state === 'home') this.face = turnToward(this.face, Math.atan2(this.homeZ - this.z, this.homeX - this.x), dt * 6);
     else if (this.state === 'lunge') this.face = Math.atan2(this.lz, this.lx);
     else if (this.state !== 'dormant') this.face = turnToward(this.face, Math.atan2(dz, dx), dt * (this.kind === 'golem' ? 3 : 7));
@@ -508,7 +546,7 @@ export class Enemy {
         if (this.los && dist < 3.6) {
           this.state = 'windup';
           this.t = this.kind === 'mite' ? 0.45 : 0.55;
-          game.audio.telegraph('stalker');
+          game.audio.telegraph('stalker', this);
         }
     }
   }
@@ -537,7 +575,7 @@ export class Enemy {
     if (this.fireT <= 0 && this.los && dist < 14) {
       this.state = 'charge';
       this.t = 0.55;
-      game.audio.telegraph('weaver');
+      game.audio.telegraph('weaver', this);
     }
   }
 
@@ -549,7 +587,7 @@ export class Enemy {
         if (this.t <= 0) {
           this.state = 'recover';
           this.t = 1.1;
-          game.audio.slam();
+          game.audio.slam(this);
           game.burst(this.x, this.y + 0.2, this.z, 16, [0.4, 0.9, 1.3], 4);
           if (dist < 3) game.hurtPlayer(this.dmg, this);
         }
@@ -564,7 +602,7 @@ export class Enemy {
         if (this.los && dist < 2.5) {
           this.state = 'windup';
           this.t = 0.85;
-          game.audio.telegraph('warden');
+          game.audio.telegraph('warden', this);
         }
     }
   }
@@ -579,6 +617,7 @@ export class Enemy {
     let tint = [1, 1, 1];
     if (this.flash > 0) tint = [3, 3, 3];
     else if (this.state === 'windup' && Math.sin(this.anim * 40) > 0) tint = [1.7, 1.7, 2];
+    else if (this.charmT > 0) tint = [0.75, 1.4, 0.9];
     else if (this.shielded) tint = [0.7, 1.1, 1.9];
     else if (this.burn > 0) tint = [1.6, 0.9, 0.6];
     else if (this.slow > 0) tint = [0.7, 1.0, 1.5];
@@ -651,7 +690,7 @@ export class Orb {
     }
     for (const e of game.enemies) {
       if (e.alive && Math.hypot(e.x - this.x, e.z - this.z) < e.radius + 0.25) {
-        game.damageEnemy(e, this.dmg * 3.5, this.x, this.z, 4, {});
+        game.damageEnemy(e, this.dmg * 3.5, this.x, this.z, 4, { player: true });
         this.alive = false;
         game.burst(this.x, this.y, this.z, 10, col, 2.5);
         return;
@@ -695,7 +734,7 @@ export class Projectile {
       return false;
     }
     this.bounced++;
-    game.audio.ricochet();
+    game.audio.ricochet(this);
     return true;
   }
 
@@ -729,7 +768,7 @@ export class Projectile {
         if (!e.alive || Math.hypot(e.x - this.x, e.z - this.z) > e.radius + 0.18) continue;
         if (this.y < e.y - 0.2 || this.y > e.y + e.size) continue;
         const bonus = this.bounced && game.char.has('ricochet') ? 1.2 : 1;
-        game.damageEnemy(e, this.dmg * bonus, this.x - this.vx * 0.02, this.z - this.vz * 0.02, this.bolt ? 2 : 0.8, { burn: this.ammo === 'flare', slow: this.ammo === 'frost' });
+        game.damageEnemy(e, this.dmg * bonus, this.x - this.vx * 0.02, this.z - this.vz * 0.02, this.bolt ? 2 : 0.8, { burn: this.ammo === 'flare', slow: this.ammo === 'frost', player: true });
         if (this.bounced) {
           game.exercise('artificing', 1);
           game.notify('Bank shot!');

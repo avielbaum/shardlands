@@ -7,7 +7,7 @@
  */
 import {
   buildObservatory, buildOverworld, buildDungeon, Level, ChunkStreamer, HAZARD, STEP, TILE,
-  BIOME_NAMES, SITES,
+  BIOME_NAMES, SITES, mulberry32,
 } from './world.js';
 import { Renderer } from './renderer.js';
 import { AudioEngine } from './audio.js';
@@ -15,7 +15,8 @@ import { SPR, spriteRect } from './textures.js';
 import { Player, Enemy, Orb, NPC, Particle, angleDiff } from './entities.js';
 import {
   Character, QuestLog, Dialogue, ITEMS, RECIPES, SPELLS, SKILLS, ATTRIBUTES, PERKS, FACTIONS, SHOPS, BOOKS,
-  makeContract, buyPrice, sellPrice, craft, spellFor,
+  makeContract, buyPrice, sellPrice, craft, spellFor, PROFESSIONS, BIRTHSIGNS, DESTINY_QUIZ, OMENS, omenChoices, readDestiny,
+  randomName, applyOrigin,
 } from './rpg.js';
 
 /** @typedef {import('./entities.js').FrameInput} FrameInput */
@@ -32,6 +33,8 @@ import {
 
 const STEP_DT = 1 / 60;
 const SAVE_KEY = 'aetherium-shardlands-save-v1';
+/** Last character identity chosen, to pre-fill the next creation screen. */
+const IDENTITY_KEY = 'shardlands-identity';
 /** Lever -> anchors it toggles (left, heart, right). */
 const LEVER_MAP = [[0, 1], [1], [1, 2]];
 const ANCHOR_START = [false, true, false];
@@ -48,13 +51,13 @@ export const TUTORIAL_STEPS = Object.freeze([
   },
   {
     title: 'Interact & Loot',
-    desktop: 'Face the chest by the north wall and press E. Take the Tuning Fork, Aether Lantern and Lumina Runestone.',
-    touch: 'Face the chest by the north wall and tap USE. Take the Tuning Fork, Aether Lantern and Lumina Runestone.',
+    desktop: 'Face the chest by the north wall and press E. Take the Tuning Fork, Aether Lantern and Lumina Runestone, and the tools of your old trade.',
+    touch: 'Face the chest by the north wall and tap USE. Take the Tuning Fork, Aether Lantern and Lumina Runestone, and the tools of your old trade.',
   },
   {
     title: 'Equip',
-    desktop: 'Open your pack with I or Tab, check the Tuning Fork and Aether Lantern are equipped, then close it.',
-    touch: 'Tap PACK, check the Tuning Fork and Aether Lantern are equipped, then close it with ✕.',
+    desktop: 'Open your pack with I or Tab, check the Tuning Fork and Aether Lantern are equipped, then close it. Your Birthsign Power waits on R; resting recharges it.',
+    touch: 'Tap PACK, check the Tuning Fork and Aether Lantern are equipped, then close it with ✕. Your Birthsign Power waits on POWER; resting recharges it.',
   },
   {
     title: 'Combat, Parry & Dash',
@@ -172,11 +175,26 @@ export class Game {
     this.env = { fog: [0.03, 0.03, 0.07], fogDensity: 0.07, ambient: [0.07, 0.07, 0.12], sunDir: [0, 1, 0], sunCol: [0, 0, 0] };
     this.ambienceKey = '';
     this.hitmarker = 0;
+    /** Props the Astrolabe birthsign has already chimed for (this session). @type {Set<string>} */
+    this.pinged = new Set();
   }
 
   /** Start a fresh run: awaken in the Sunken Observatory. @param {boolean} [tutorial] guided tutorial on */
-  newRun(tutorial = false) {
+  /**
+   * Start a fresh run. With an origin, the profession's bonuses and the birthsign apply, and the
+   * profession's gear waits in the starter chest beside the core tools (ending the tutorial
+   * early hands over the whole chest).
+   * @param {boolean} [tutorial] @param {import('./rpg.js').Origin|null} [origin]
+   */
+  newRun(tutorial = false, origin = null) {
     this.flags.tutorial = { active: tutorial, step: 0, sawInventory: false, parried: false };
+    if (origin) {
+      applyOrigin(this.char, origin);
+      const chest = this.level.props.find((pr) => pr.kind === 'chest' && pr.data.starter);
+      const gear = PROFESSIONS[this.char.profession]?.gear ?? [];
+      if (chest) this.world.loot[chest.key] = [...chest.data.loot, ...gear];
+      if (this.char.birthsign === 'crown') for (const f of Object.keys(this.factions.rep)) this.factions.rep[f] += 15;
+    }
     this.quests.start('main', 'The Unquiet Ley', 'main');
     this.setMain(10, 'I awoke in the Sunken Observatory. The Great Astrolabe Gate is sealed; the Keeper\'s log speaks of a Fork, three levers and three anchors.');
     this.enterLevel('observatory', this.level.spawn.x, this.level.spawn.z, this.level.spawn.yaw);
@@ -287,6 +305,9 @@ export class Game {
     const L = this.level;
     const c = this.char;
     p.update(dt, input, this);
+    c.powerCD = Math.max(0, c.powerCD - dt);
+    // Temporal Stasis: enemies and their orbs move at 35% speed.
+    const edt = c.effects.stasis ? dt * 0.35 : dt;
 
     for (const d of L.doors) {
       d.hold = Math.max(0, d.hold - dt);
@@ -302,6 +323,7 @@ export class Game {
       const ev = this.streamer.update(p.x, p.z);
       this.chunkLoads.push(...ev.load);
       this.chunkUnloads.push(...ev.unload);
+      this.audio.setEmitters(this._soundEmitters());
     }
     this.flowT -= dt;
     if (this.flowT <= 0) {
@@ -310,13 +332,13 @@ export class Game {
     }
 
     this._shields();
-    for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 4900) e.update(dt, this);
+    for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 4900) e.update(edt, this);
     this._separate();
     for (const e of this.enemies) if (!e.alive && e.state !== 'fall') this.fallen.push(e);
     this.fallen = this.fallen.filter((e) => (e.deadT += dt) < 1.6);
     this.enemies = this.enemies.filter((e) => e.alive);
     for (const n of this.npcs) n.update(dt, this, Math.hypot(n.x - p.x, n.z - p.z) < 50);
-    for (const o of this.orbs) o.update(dt, this);
+    for (const o of this.orbs) o.update(o.owner === 'enemy' ? edt : dt, this);
     for (const s of this.projectiles) s.update(dt, this);
     for (const q of this.particles) q.update(dt, L.heightAt(q.x, q.z));
     this.orbs = this.orbs.filter((o) => o.alive);
@@ -326,7 +348,8 @@ export class Game {
     this.revealT -= dt;
     if (this.revealT <= 0) {
       this.revealT = 0.3;
-      L.reveal(p.x, p.z, L.outdoor ? 14 : 6);
+      L.reveal(p.x, p.z, (L.outdoor ? 14 : 6) * (c.profession === 'strider' ? 1.4 : 1));
+      if (c.birthsign === 'astrolabe') this._astrolabePing();
       for (const lm of L.landmarks) {
         if (!this.discovered.has(lm.id) && Math.hypot(lm.x - p.x, lm.z - p.z) < lm.r) this.discover(lm.id, lm.name);
       }
@@ -340,6 +363,7 @@ export class Game {
     for (const n of this.notes) n.t -= dt;
     this.notes = this.notes.filter((n) => n.t > 0);
 
+    this.audio.setListener(p.x, p.y + p.eye, p.z, p.yaw, p.pitch);
     let near = 0;
     for (const e of this.enemies) if (e.awake && e.state !== 'home' && Math.hypot(e.x - p.x, e.z - p.z) < 14) near++;
     this.audio.setIntensity(near * 0.3);
@@ -666,17 +690,30 @@ export class Game {
 
   /**
    * @param {Enemy} e @param {number} amt @param {number} sx @param {number} sz @param {number} knock
-   * @param {{burn?:boolean, slow?:boolean, quiet?:boolean}} o
+   * @param {{burn?:boolean, slow?:boolean, quiet?:boolean, player?:boolean}} o player: the player's own attack
    */
   damageEnemy(e, amt, sx, sz, knock, o) {
     if (!e.alive || e.state === 'fall') return;
+    if (o.player) {
+      const c = this.char;
+      if (c.effects.supernova) {
+        amt *= 3;
+        delete c.effects.supernova;
+        this.notify('Supernova!');
+        this.burst(e.x, e.y + 1, e.z, 24, [1.8, 0.9, 1.4], 4);
+      } else if (c.birthsign === 'star' && Math.random() < 0.25) {
+        amt *= 2;
+        this.hitmarker = 0.35;
+        this.burst(e.x, e.y + 1.2, e.z, 8, [1.6, 0.7, 1.2], 2);
+      }
+    }
     e.hp -= e.shielded ? amt * 0.25 : amt;
     e.flash = 0.1;
     e.wake();
     if (o.burn) e.burn = 3;
     if (o.slow) e.slow = 3;
     if (!o.quiet) {
-      this.audio.enemyHit();
+      this.audio.enemyHit(e);
       this.hitmarker = 0.15;
     }
     if (knock) {
@@ -695,7 +732,7 @@ export class Game {
     if (!e.alive) return;
     e.alive = false;
     this.world.killed[e.key] = true;
-    this.audio.enemyDie();
+    this.audio.enemyDie(e);
     this.burst(e.x, e.y + 1, e.z, 16, [1.4, 1.0, 0.45], 3);
     if (how) this.notify(`The ${e.name} ${how}.`);
     if (e.state !== 'fall' && Math.random() < 0.4) {
@@ -735,7 +772,8 @@ export class Game {
     const c = this.char;
     if (this.dead || p.iframes > 0) return false;
     if (attacker && p.parryT > 0) {
-      attacker.stagger = c.has('riposte') ? 2 : 1.2;
+      attacker.stagger = (c.has('riposte') ? 2 : 1.2) * (c.birthsign === 'pendulum' ? 1.25 : 1);
+      if (c.birthsign === 'pendulum') c.stamina = Math.min(c.maxStamina, c.stamina + 10);
       attacker.flash = 0.1;
       if (c.has('riposte')) p.riposte = true;
       this.audio.block();
@@ -751,6 +789,7 @@ export class Game {
       this.audio.block();
     }
     if (attacker) dmg *= 25 / (25 + c.armor);
+    else if (c.birthsign === 'crucible') dmg *= 0.75;
     c.hp -= dmg;
     p.iframes = 0.25;
     this.fx.hurt = 1;
@@ -788,7 +827,7 @@ export class Game {
   /** @param {Enemy} e @param {number} angle */
   spawnOrb(e, angle) {
     this.orbs.push(new Orb(e.x + Math.cos(angle) * 0.5, e.y + 1.2, e.z + Math.sin(angle) * 0.5, angle, e.dmg));
-    this.audio.enemyShoot();
+    this.audio.enemyShoot(e);
   }
 
   /** @param {number} x @param {number} z @param {number} maxD @returns {Enemy|null} */
@@ -873,9 +912,29 @@ export class Game {
   footstep(x, z, deep) {
     const t = this.level.floorTex[this.level.idx(Math.floor(x), Math.floor(z))];
     const surface = deep || (this.level.waterLevel > this.level.heightAt(x, z)) ? 'water'
-      : t === TILE.PLANK ? 'wood' : t === TILE.GRASS || t === TILE.FEN ? 'grass' : t === TILE.DUST || t === TILE.BASALT ? 'dirt'
+      : t === TILE.PLANK ? 'wood' : t === TILE.FEN ? 'mud' : t === TILE.GRASS ? 'grass' : t === TILE.DUST || t === TILE.BASALT ? 'dirt'
         : t === TILE.OBS_FLOOR || t === TILE.LEY_FLOOR ? 'metal' : 'stone';
     this.audio.footstep(surface);
+  }
+
+
+  /**
+   * Looping positional sounds near the player: fires crackle, ley vents hiss.
+   * @returns {{key: string, kind: 'fire'|'vent', x: number, y: number, z: number}[]}
+   */
+  _soundEmitters() {
+    const L = this.level;
+    const p = this.player;
+    /** @type {{key: string, kind: 'fire'|'vent', x: number, y: number, z: number}[]} */
+    const out = [];
+    for (const k of this.streamer.active) {
+      for (const pr of L.propChunks.get(k) ?? []) {
+        const kind = pr.kind === 'campfire' || pr.kind === 'brazier' ? 'fire' : pr.sprite === 'vent' ? 'vent' : null;
+        if (!kind || pr.gone || (pr.x - p.x) ** 2 + (pr.z - p.z) ** 2 > 24 * 24) continue;
+        out.push({ key: `${L.id}:${pr.key}`, kind, x: pr.x, y: L.heightAt(pr.x, pr.z), z: pr.z });
+      }
+    }
+    return out;
   }
 
   _die() {
@@ -896,7 +955,7 @@ export class Game {
 
   /** @param {string} skill @param {number} amount */
   exercise(skill, amount) {
-    const r = this.char.exercise(skill, amount);
+    const r = this.char.exercise(skill, amount * (this.char.fated ? 1.05 : 1));
     for (const t of r.text) this.notify(t);
     if (r.levelUp) this.audio.levelUp();
     else if (r.skillUp) this.audio.skillUp();
@@ -918,7 +977,7 @@ export class Game {
   give(id, qty) {
     const c = this.char;
     if (id === 'shards') {
-      this.addShards(qty);
+      this.addShards(c.birthsign === 'star' ? Math.round(qty * 1.3) : qty);
       return;
     }
     c.inventory.add(id, qty);
@@ -1012,7 +1071,7 @@ export class Game {
   /** @param {string} id @param {string} name */
   discover(id, name) {
     this.discovered.add(id);
-    this.exercise('wayfaring', 3);
+    this.exercise('wayfaring', 3 * (this.char.birthsign === 'astrolabe' ? 1.15 : 1));
     this.notify(`Discovered: ${name}`);
     const c = this.contracts.wardens;
     if (c && c.kind === 'scout' && c.landmark === id) this.notify('Survey complete: report to Captain Marr.');
@@ -1177,7 +1236,7 @@ export class Game {
         }
         this.world.loot[p.key] = this.world.loot[p.key] ?? p.data.loot ?? [];
         p.sprite = 'chest_open';
-        this.audio.creak();
+        this.audio.creak('chest');
         return { open: 'loot', data: p };
       case 'book':
         return { open: 'read', data: p.data.book };
@@ -1232,7 +1291,7 @@ export class Game {
     }
     d.shut = !d.shut;
     this.world.doors[d.key] = { locked: d.locked, shut: d.shut };
-    this.audio.creak();
+    this.audio.creak('door');
   }
 
   /**
@@ -1249,7 +1308,7 @@ export class Game {
     for (let k = 0; k < 3; k++) setTimeout(() => this.audio.lockClick(), k * 90);
     const chance = clamp(0.35 + 0.15 * (c.skill('artificing') - level) + c.attrs.finesse * 0.02 + (c.has('steady') ? 0.15 : 0), 0.05, 0.95);
     if (Math.random() < chance) {
-      this.exercise('artificing', 1 + level);
+      this.exercise('artificing', (1 + level) * (c.birthsign === 'astrolabe' ? 1.15 : 1));
       return true;
     }
     this.exercise('artificing', 0.3);
@@ -1273,7 +1332,7 @@ export class Game {
   _pullLever(p) {
     const i = p.data.index;
     this.flags.levers[i] = !this.flags.levers[i];
-    this.audio.creak();
+    this.audio.creak('lever');
     this.audio.chime(this.flags.levers[i] ? 1320 : 990);
     if (this._anchors().every(Boolean)) this._openGate(this.level, 'All three anchors sing. The Great Astrolabe Gate grinds open!');
   }
@@ -1302,6 +1361,7 @@ export class Game {
     c.hp = Math.min(c.maxHp, c.hp + hours * 14);
     c.mana = Math.min(c.maxMana, c.mana + hours * 20);
     c.stamina = c.maxStamina;
+    c.powerCD = 0;
     this.notify(`You rested ${hours} hour${hours > 1 ? 's' : ''}.`);
     for (const n of this.npcs) n.thinkT = 0;
     this.save(true);
@@ -1368,9 +1428,11 @@ export class Game {
     } else if (def.type === 'book') return { open: 'read', data: def.book };
     else if (def.type === 'consumable') {
       if (!c.inventory.remove(id, 1)) return null;
-      if (def.heal) c.hp = Math.min(c.maxHp, c.hp + def.heal);
-      if (def.mana) c.mana = Math.min(c.maxMana, c.mana + def.mana);
-      if (def.oil) c.effects[def.oil === 'ember' ? 'oil_ember' : 'oil_frost'] = 90;
+      // The Crucible's potions (not plain food) are 30% stronger.
+      const k = c.birthsign === 'crucible' && (def.mana || (def.heal ?? 0) >= 20) ? 1.3 : 1;
+      if (def.heal) c.hp = Math.min(c.maxHp, c.hp + def.heal * k);
+      if (def.mana) c.mana = Math.min(c.maxMana, c.mana + def.mana * k);
+      if (def.oil) c.effects[`oil_${def.oil}`] = def.oil === 'whet' ? 120 : 90;
       if (def.heal && def.value < 5) this.audio.eat();
       else this.audio.brew();
     }
@@ -1380,6 +1442,65 @@ export class Game {
   // -------------------------------------------------------------------------
   // Rendering feeds
   // -------------------------------------------------------------------------
+
+  /** Trigger the Birthsign Power if it has recharged (resting recharges it too). */
+  usePower() {
+    const c = this.char;
+    const sign = BIRTHSIGNS[c.birthsign];
+    if (!sign) {
+      this.notify('You were born under no sign the Astrolabe recognises.');
+      return;
+    }
+    if (c.powerCD > 0) {
+      this.notify(`${sign.power} recharges in ${Math.ceil(c.powerCD)}s, or rest.`);
+      return;
+    }
+    const p = this.player;
+    if (c.birthsign === 'pendulum') c.effects.stasis = 4;
+    else if (c.birthsign === 'crucible') {
+      for (const e of this.enemies) {
+        if (!e.alive || Math.hypot(e.x - p.x, e.z - p.z) > 5) continue;
+        this.damageEnemy(e, 28 + c.attrs.intellect * 3, p.x, p.z, 9, { burn: true });
+        e.pushed = 1;
+      }
+      this.burst(p.x, p.y + 1, p.z, 40, [1.8, 0.8, 0.3], 6);
+      this.audio.slam(p);
+    } else if (c.birthsign === 'astrolabe') c.effects.sight = 12;
+    else if (c.birthsign === 'spire') {
+      c.mana = c.maxMana;
+      c.effects.surge = 5;
+    } else if (c.birthsign === 'hound') c.effects.stride = 6;
+    else if (c.birthsign === 'crown') {
+      const near = this.enemies.filter((e) => e.alive && !e.boss).map((e) => ({ e, d: Math.hypot(e.x - p.x, e.z - p.z) })).filter((o) => o.d < 12).sort((a, b) => a.d - b.d)[0];
+      if (!near) {
+        this.notify('No construct is close enough to hear your command.');
+        return;
+      }
+      near.e.charmT = 15;
+    } else if (c.birthsign === 'star') c.effects.supernova = 6;
+    c.powerCD = sign.cd;
+    this.audio.cast(c.birthsign === 'spire' ? 'mending' : c.birthsign === 'crucible' ? 'push' : 'lumina');
+    this.fx.parry = Math.max(this.fx.parry, 0.8);
+    this.notify(`${sign.power}!`);
+  }
+
+  /** The Astrolabe birthsign chimes once for each unlooted chest or scalding vent that comes near. */
+  _astrolabePing() {
+    const L = this.level;
+    const p = this.player;
+    for (const pr of L.props) {
+      const loot = this.world.loot[pr.key];
+      const chest = pr.kind === 'chest' && pr.sprite !== 'chest_open' && !(loot && loot.length === 0);
+      const trap = pr.sprite === 'vent';
+      if ((!chest && !trap) || (pr.x - p.x) ** 2 + (pr.z - p.z) ** 2 > 49) continue;
+      const key = `${L.id}:${pr.key}`;
+      if (this.pinged.has(key)) continue;
+      this.pinged.add(key);
+      this.audio.chime(trap ? 990 : 1760);
+      this.burst(pr.x, L.heightAt(pr.x, pr.z) + 0.8, pr.z, 12, trap ? [1.6, 0.6, 0.3] : [1.6, 1.4, 0.6], 2);
+      this.notify(trap ? 'The Astrolabe stirs: a scalding vent ahead.' : 'The Astrolabe stirs: an unlooted chest nearby.');
+    }
+  }
 
   /** @returns {SpriteDesc[]} */
   collectSprites() {
@@ -1411,6 +1532,17 @@ export class Game {
     for (const o of this.orbs) out.push(o.getSprite());
     for (const s of this.projectiles) out.push(s.getSprite());
     for (const q of this.particles) out.push(q.getSprite());
+    // Astral Sight: glowing markers drawn through walls.
+    if (this.char.effects.sight) {
+      for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 45 * 45) out.push({ x: e.x, y: e.y + 0.6, z: e.z, w: 1.1, h: 1.1, frame: SPR.orb_enemy, emit: 2, tint: [1.2, 0.5, 0.4], sky: 1, xray: true });
+      for (const pr of L.props) {
+        const loot = this.world.loot[pr.key];
+        if (pr.kind !== 'chest' || pr.sprite === 'chest_open' || (loot && loot.length === 0) || (pr.x - p.x) ** 2 + (pr.z - p.z) ** 2 > 45 * 45) continue;
+        out.push({ x: pr.x, y: L.heightAt(pr.x, pr.z) + 0.3, z: pr.z, w: 0.9, h: 0.9, frame: SPR.bead, emit: 2, tint: [1.4, 1.2, 0.5], sky: 1, xray: true });
+      }
+      const qm = this.quests.trackedMarker();
+      if (qm && qm.level === L.id) for (let k = 0; k < 6; k++) out.push({ x: qm.x, y: L.heightAt(qm.x, qm.z) + k * 0.7, z: qm.z, w: 1.4, h: 1.4, frame: SPR.shard, emit: 2, tint: [0.5, 1.2, 1.4], sky: 1, xray: true });
+    }
     return out;
   }
 
@@ -1617,6 +1749,64 @@ const iconCache = new Map();
 /** @type {HTMLCanvasElement|null} */
 let ATLAS = null;
 
+/**
+ * A birthsign's constellation emblem: a seeded scatter of stars joined into a figure, on a
+ * dark disc ringed in brass and tinted with the sign's hue.
+ * @param {string} sign @param {number} [size] CSS pixels
+ */
+function emblem(sign, size = 48) {
+  const def = BIRTHSIGNS[sign];
+  const px = size * 2;
+  const cv = /** @type {HTMLCanvasElement} */ (h('canvas', { width: String(px), height: String(px), class: 'emblem', style: `width:${size}px;height:${size}px`, 'aria-hidden': 'true' }));
+  const c = cv.getContext('2d');
+  if (!c || !def) return cv;
+  const r = px / 2;
+  const bg = c.createRadialGradient(r, r * 0.8, 0, r, r, r);
+  bg.addColorStop(0, '#1b2140');
+  bg.addColorStop(1, '#07060f');
+  c.fillStyle = bg;
+  c.beginPath();
+  c.arc(r, r, r - 2, 0, Math.PI * 2);
+  c.fill();
+  c.strokeStyle = '#c99a48';
+  c.lineWidth = px * 0.035;
+  c.stroke();
+  let seed = 7;
+  for (const ch of sign) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+  const rnd = mulberry32(seed);
+  for (let k = 0; k < 18; k++) {
+    c.fillStyle = `rgba(246,231,193,${0.15 + rnd() * 0.3})`;
+    c.fillRect(r + (rnd() - 0.5) * r * 1.5, r + (rnd() - 0.5) * r * 1.5, 1.5, 1.5);
+  }
+  /** @type {number[][]} */
+  const stars = [];
+  const n = 5 + Math.floor(rnd() * 3);
+  for (let k = 0; k < n; k++) {
+    const a = (k / n) * Math.PI * 2 + rnd() * 0.9;
+    const d = r * (0.18 + rnd() * 0.5);
+    stars.push([r + Math.cos(a) * d, r + Math.sin(a) * d]);
+  }
+  c.strokeStyle = def.hue;
+  c.globalAlpha = 0.7;
+  c.lineWidth = px * 0.018;
+  c.beginPath();
+  stars.forEach(([x, y], k) => (k ? c.lineTo(x, y) : c.moveTo(x, y)));
+  c.lineTo(stars[Math.floor(n / 2)][0], stars[Math.floor(n / 2)][1]);
+  c.stroke();
+  c.globalAlpha = 1;
+  for (const [x, y] of stars) {
+    const g = c.createRadialGradient(x, y, 0, x, y, px * 0.07);
+    g.addColorStop(0, '#ffffff');
+    g.addColorStop(0.3, def.hue);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g;
+    c.beginPath();
+    c.arc(x, y, px * 0.07, 0, Math.PI * 2);
+    c.fill();
+  }
+  return cv;
+}
+
 /** Small <img> of a sprite frame. @param {string} sprite @param {number} [size] */
 function icon(sprite, size = 40) {
   let url = iconCache.get(sprite);
@@ -1675,6 +1865,29 @@ function drawHud(c, g, w, h, touch, target) {
   const ch = g.char;
   // Weapon and lantern viewmodels are 3D, drawn by the renderer (Game.viewState).
   const slot = g.selectedSlot();
+  const sign = BIRTHSIGNS[ch.birthsign];
+  if (sign && !touch) {
+    // Birthsign Power dial: a ring that fills as the power recharges.
+    const px = w - 46;
+    const py = h - 120;
+    const ready = ch.powerCD <= 0;
+    c.fillStyle = 'rgba(12,8,20,0.7)';
+    c.beginPath();
+    c.arc(px, py, 22, 0, Math.PI * 2);
+    c.fill();
+    c.strokeStyle = ready ? sign.hue : 'rgba(201,154,72,0.5)';
+    c.lineWidth = 3;
+    c.beginPath();
+    c.arc(px, py, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (ready ? 1 : 1 - ch.powerCD / sign.cd));
+    c.stroke();
+    c.fillStyle = ready ? IVORY : 'rgba(246,231,193,0.55)';
+    c.font = '700 13px Georgia, serif';
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText(ready ? 'R' : String(Math.ceil(ch.powerCD)), px, py);
+    c.font = '600 9px Georgia, serif';
+    c.fillText(sign.power, px - 30, py + 34);
+  }
   // Crosshair and hit marker.
   c.strokeStyle = p.parryT > 0 ? '#ffd36b' : 'rgba(246,231,193,0.85)';
   c.lineWidth = 1.5;
@@ -1817,6 +2030,12 @@ function drawHud(c, g, w, h, touch, target) {
 
 class App {
   constructor() {
+    /**
+     * Character creation in progress (null otherwise).
+     * @type {{name: string, profession: string, birthsign: string, tab: string, step: number, answers: number[],
+     *   reading: {profession: string, birthsign: string}|null, accepted: boolean, tutorial: boolean}|null}
+     */
+    this.creation = null;
     this.canvas = /** @type {HTMLCanvasElement} */ ($('view'));
     this.hud = /** @type {HTMLCanvasElement} */ ($('hud'));
     const hctx = this.hud.getContext('2d');
@@ -1980,6 +2199,7 @@ class App {
         else if (act === 'dash') this.input.dash = true;
         else if (act === 'jump') this.input.jump = true;
         else if (act === 'interact') this.doInteract();
+        else if (act === 'power') this.game.usePower();
         else this.openPanel(act);
       });
       const release = () => {
@@ -2037,6 +2257,7 @@ class App {
 
   /** @param {KeyboardEvent} e */
   _key(e) {
+    if (e.target instanceof HTMLInputElement) return;
     const code = e.code;
     if (code === 'Tab' || code === 'Space' || code === 'F5' || code === 'F9') e.preventDefault();
     if (this.state === 'TITLE' || this.state === 'DEAD' || this.state === 'ENDING') return;
@@ -2063,7 +2284,8 @@ class App {
     if (code === 'F9') { this.loadGame(); return; }
     if (this.state !== 'EXPLORE') return;
     if (code === 'KeyE') { this.doInteract(); return; }
-    if (code === 'KeyR') { this.cycleAmmo(); return; }
+    if (code === 'KeyR') { this.game.usePower(); return; }
+    if (code === 'KeyT') { this.cycleAmmo(); return; }
     this.input.keyDown(e);
   }
 
@@ -2102,29 +2324,145 @@ class App {
     this.modal.innerHTML = '';
     const start = () => {
       this.audio.init();
-      this.game = new Game(this.audio, this.fixedSeed || 1 + Math.floor(Math.random() * 999999));
-      this.game.newRun(this.tutorialPref);
-      this.setState('EXPLORE');
+      this.showCreation();
     };
-    const toggle = h('button', { class: 'brass-btn', type: 'button', 'aria-pressed': String(this.tutorialPref) }, `Guided Tutorial: ${this.tutorialPref ? 'ON' : 'OFF'}`);
-    toggle.addEventListener('click', () => {
-      this.tutorialPref = !this.tutorialPref;
-      toggle.textContent = `Guided Tutorial: ${this.tutorialPref ? 'ON' : 'OFF'}`;
-      toggle.setAttribute('aria-pressed', String(this.tutorialPref));
-      try { localStorage.setItem('shardlands-tutorial', this.tutorialPref ? '1' : '0'); } catch { /* storage blocked: keep for this session */ }
-    });
     this.modal.append(h('div', { class: 'panel title' },
       h('h1', {}, 'AETHERIUM'), h('h3', {}, 'SHARDLANDS'),
       h('p', {}, 'You wake beneath a brass sky of painted stars. The Sunken Observatory is silent, its Great Astrolabe Gate sealed, and far above, the ley-lines of the Shardlands have begun to drift.'),
       h('div', { class: 'row' }, btn('New Game', start), btn('Continue', () => this.loadGame(), !Game.hasSave())),
-      h('div', { class: 'row' }, toggle),
       h('div', { class: 'controls desktop-only' },
         ...[['WASD', 'Move · double-tap to Phase Dash'], ['Mouse', 'Look (click to lock pointer)'], ['Left click', 'Attack / cast (strafe = sweep, forward = thrust, still = chop)'],
-          ['Right click', 'Parry (tap) / block (hold)'], ['E', 'Interact, talk, loot'], ['Shift / Space', 'Phase Dash / jump'], ['1-6 · wheel · Q · R', 'Hotbar · cycle · switch ammo'],
+          ['Right click', 'Parry (tap) / block (hold)'], ['E', 'Interact, talk, loot'], ['Shift / Space', 'Phase Dash / jump'], ['1-6 · wheel · Q · T', 'Hotbar · cycle · switch ammo'], ['R', 'Birthsign Power'],
           ['Tab/I · K · J · M', 'Inventory · Skills · Journal · Map'], ['F5 / F9', 'Quick save / load']].map(([k, v]) => [h('b', {}, k), h('span', {}, v)])),
-      h('p', { class: 'small touch-only' }, 'Left thumb moves, right thumb aims. Buttons attack, parry, interact, dash and jump; the drawer opens your pack, skills, journal and map.'),
+      h('p', { class: 'small touch-only' }, 'Left thumb moves, right thumb aims. Buttons attack, parry, interact, dash, jump and use your Birthsign POWER; the drawer opens your pack, skills, journal and map.'),
       h('p', { class: 'small' }, 'Progress autosaves when you change regions and when you rest.'),
     ));
+  }
+
+  /** Open the Astrolabe character creation screen (state stays TITLE, so the pointer is free). */
+  showCreation() {
+    /** @type {{name?: string, profession?: string, birthsign?: string}} */
+    let last = {};
+    try { last = JSON.parse(localStorage.getItem(IDENTITY_KEY) || '{}') || {}; } catch { /* storage blocked or corrupt: start fresh */ }
+    this.creation = {
+      name: typeof last.name === 'string' && last.name.trim() ? last.name.slice(0, 32) : randomName(),
+      profession: last.profession && last.profession in PROFESSIONS ? last.profession : 'leywright',
+      birthsign: last.birthsign && last.birthsign in BIRTHSIGNS ? last.birthsign : 'pendulum',
+      tab: 'direct', step: 0, answers: /** @type {number[]} */ ([]), reading: /** @type {{profession:string, birthsign:string}|null} */ (null),
+      accepted: false, tutorial: this.tutorialPref,
+    };
+    this._renderCreation();
+  }
+
+  /** Rebuild the creation screen from this.creation. */
+  _renderCreation() {
+    const st = /** @type {NonNullable<App['creation']>} */ (this.creation);
+    const fated = !!(st.accepted && st.reading && st.reading.profession === st.profession && st.reading.birthsign === st.birthsign);
+    this.state = 'TITLE';
+    this.modal.classList.remove('hidden');
+    this.modal.innerHTML = '';
+    const name = h('input', { type: 'text', value: st.name, maxlength: '32', class: 'name-input', 'aria-label': 'Character name', autocomplete: 'off', spellcheck: 'false',
+      oninput: (/** @type {Event} */ e) => { st.name = /** @type {HTMLInputElement} */ (e.target).value; this._refreshSummaryName(); } });
+    const tab = (/** @type {string} */ id, /** @type {string} */ label) => h('button', { class: `brass-btn tab${st.tab === id ? ' on' : ''}`, type: 'button', role: 'tab', 'aria-selected': String(st.tab === id),
+      onclick: () => { st.tab = id; this._renderCreation(); } }, label);
+    this.modal.append(h('div', { class: 'panel create' },
+      h('h2', {}, 'The Astrolabe Turns'),
+      h('p', { class: 'small' }, 'Before you wake, the Observatory remembers who you were. Choose your past and your sign, or let the Astral Oracle read them from your answers.'),
+      h('div', { class: 'row wrap' },
+        h('label', { class: 'row grow' }, h('span', {}, 'Name'), name),
+        btn('Random name', () => { st.name = randomName(); this._renderCreation(); }),
+        h('button', { class: 'brass-btn', type: 'button', 'aria-pressed': String(st.tutorial), onclick: () => { st.tutorial = !st.tutorial; this._renderCreation(); } }, `Guided Tutorial: ${st.tutorial ? 'ON' : 'OFF'}`)),
+      h('div', { class: 'row tabs', role: 'tablist' }, tab('direct', 'Direct Selection'), tab('quiz', 'Consult the Astrolabe')),
+      h('div', { class: 'create-grid' }, st.tab === 'direct' ? this._creationDirect(st) : this._creationQuiz(st), this._creationSummary(st, fated)),
+      h('div', { class: 'row' }, btn('Back', () => this.showTitle()), btn('Awaken in the Observatory', () => this._awaken(fated)))));
+    const focus = /** @type {HTMLElement|null} */ (this.modal.querySelector('.tab.on'));
+    if (focus && document.activeElement === document.body) focus.focus({ preventScroll: true });
+  }
+
+  /** Keep the summary's name in step with typing, without rebuilding (which would steal focus). */
+  _refreshSummaryName() {
+    const el = this.modal.querySelector('.summary .who');
+    if (el && this.creation) el.textContent = this.creation.name.trim() || 'Wanderer';
+  }
+
+  /** @param {NonNullable<App['creation']>} st */
+  _creationDirect(st) {
+    const card = (/** @type {boolean} */ on, /** @type {() => void} */ pick, /** @type {any[]} */ ...kids) =>
+      h('button', { type: 'button', class: `card${on ? ' sel' : ''}`, 'aria-pressed': String(on), onclick: pick }, ...kids);
+    return h('div', { class: 'create-main' },
+      h('h4', {}, 'Profession'),
+      h('div', { class: 'cards' }, Object.entries(PROFESSIONS).map(([k, p]) => card(st.profession === k, () => { st.profession = k; this._renderCreation(); },
+        h('b', {}, p.name), h('div', { class: 'small' }, p.title),
+        h('div', { class: 'small dim' }, Object.entries(p.skills).map(([id, v]) => `+${v} ${SKILLS[id].name}`).join(' · '))))),
+      h('h4', {}, 'Mythic Birthsign'),
+      h('div', { class: 'cards' }, Object.entries(BIRTHSIGNS).map(([k, b]) => card(st.birthsign === k, () => { st.birthsign = k; this._renderCreation(); },
+        emblem(k, 40), h('b', {}, b.name), h('div', { class: 'small' }, b.epithet)))));
+  }
+
+  /** The Astral Oracle: four dilemmas, then the birth omen, then the reading. @param {NonNullable<App['creation']>} st */
+  _creationQuiz(st) {
+    const restart = btn('Begin again', () => { st.step = 0; st.answers = []; st.reading = null; st.accepted = false; this._renderCreation(); });
+    if (st.step >= 5 && st.reading) {
+      const r = st.reading;
+      const p = PROFESSIONS[r.profession];
+      const b = BIRTHSIGNS[r.birthsign];
+      return h('div', { class: 'create-main oracle' },
+        h('h4', {}, 'The Oracle reads your stars'),
+        h('div', { class: 'row' }, emblem(r.birthsign, 64), h('div', {}, h('p', {}, `You were a ${p.name}, ${p.title.toLowerCase()}, born under ${b.name}.`), h('p', { class: 'small' }, p.desc))),
+        st.accepted && st.profession === r.profession && st.birthsign === r.birthsign
+          ? h('p', { class: 'small' }, 'You have accepted the reading: Fated Alignment (+5% skill gain). You may still change either choice under Direct Selection, but the alignment holds only while both match.')
+          : btn('Accept the reading', () => { st.profession = r.profession; st.birthsign = r.birthsign; st.accepted = true; this._renderCreation(); }),
+        restart);
+    }
+    if (st.step === 4) {
+      return h('div', { class: 'create-main oracle' },
+        h('div', { class: 'small dim' }, 'Question 5 of 5'), h('h4', {}, 'The Astral Omen'),
+        h('p', {}, 'On the night of your birth, a rare alignment crossed the heavens. Which vision lingers in your memory?'),
+        h('div', { class: 'col' }, omenChoices(st.answers).map((k) => h('button', { type: 'button', class: 'brass-btn answer',
+          onclick: () => { st.reading = readDestiny(st.answers, k); st.step = 5; this._renderCreation(); } }, emblem(k, 28), h('span', {}, OMENS[/** @type {keyof typeof OMENS} */ (k)])))),
+        restart);
+    }
+    const q = DESTINY_QUIZ[st.step];
+    return h('div', { class: 'create-main oracle' },
+      h('div', { class: 'small dim' }, `Question ${st.step + 1} of 5`), h('h4', {}, q.title), h('p', {}, q.text),
+      h('div', { class: 'col' }, q.answers.map((a, i) => h('button', { type: 'button', class: 'brass-btn answer',
+        onclick: () => { st.answers.push(i); st.step++; this._renderCreation(); } }, a.text))),
+      st.step ? restart : null);
+  }
+
+  /** Live mechanical summary of the current choices. @param {NonNullable<App['creation']>} st @param {boolean} fated */
+  _creationSummary(st, fated) {
+    const c = new Character();
+    applyOrigin(c, { name: st.name, profession: st.profession, birthsign: st.birthsign, fated });
+    const p = PROFESSIONS[st.profession];
+    const b = BIRTHSIGNS[st.birthsign];
+    const gear = ['Resonance Tuning Fork', 'Aether Lantern', 'Lumina Runestone', 'Healing Draughts', 'Lockpicks', ...p.gear.map(([id, n]) => (id === 'shards' ? `${n} Aether Shards` : `${ITEMS[id].name}${n > 1 ? ` ×${n}` : ''}`))];
+    return h('aside', { class: 'summary', 'aria-live': 'polite' },
+      h('div', { class: 'row' }, emblem(st.birthsign, 56), h('div', {}, h('b', { class: 'who' }, st.name.trim() || 'Wanderer'), h('div', { class: 'small' }, `${p.name} · ${b.name}`))),
+      h('div', { class: 'small' }, Object.entries(ATTRIBUTES).map(([id, a]) => `${a.name} ${/** @type {Record<string, number>} */ (c.attrs)[id]}`).join(' · ')),
+      h('div', { class: 'small' }, Object.entries(SKILLS).map(([id, s]) => `${s.name} ${c.skills[id].level}`).join(' · ')),
+      h('div', { class: 'small' }, `Health ${c.maxHp} · Aether ${c.maxMana} · Stamina ${c.maxStamina} · Carry ${c.carryCap}`),
+      h('p', { class: 'small' }, h('b', {}, 'Starting gear: '), gear.join(', '), '.'),
+      h('p', { class: 'small' }, h('b', {}, `${p.name}: `), p.perk),
+      h('p', { class: 'small' }, h('b', {}, `${b.name} (${b.epithet}): `), b.boon),
+      h('p', { class: 'small' }, h('b', {}, `Power, ${b.power}: `), `${b.powerDesc} Recharges in ${b.cd}s or when you rest.`),
+      h('p', { class: `small ${fated ? 'fated' : 'dim'}` }, fated ? 'Fated Alignment: +5% skill gain.' : st.reading ? 'Your choices differ from the Oracle\'s reading: no Fated Alignment.' : 'Consult the Astrolabe and accept its reading for a Fated Alignment (+5% skill gain).'));
+  }
+
+  /** Start the run with the chosen identity, remembered for next time. @param {boolean} fated */
+  _awaken(fated) {
+    const st = /** @type {NonNullable<App['creation']>} */ (this.creation);
+    this.audio.init();
+    this.tutorialPref = st.tutorial;
+    try {
+      localStorage.setItem('shardlands-tutorial', st.tutorial ? '1' : '0');
+      localStorage.setItem(IDENTITY_KEY, JSON.stringify({ name: st.name.trim(), profession: st.profession, birthsign: st.birthsign }));
+    } catch { /* storage blocked: the identity still lives in this run's save */ }
+    this.game = new Game(this.audio, this.fixedSeed || 1 + Math.floor(Math.random() * 999999));
+    this.game.newRun(st.tutorial, { name: st.name, profession: st.profession, birthsign: st.birthsign, fated });
+    this.creation = null;
+    this.setState('EXPLORE');
+    this.game.notify(`${this.game.char.name} wakes beneath a brass sky.`);
   }
 
   showPause() {
@@ -2134,7 +2472,13 @@ class App {
         this.game.tutorialActive ? btn('End Tutorial', () => this.endTutorial()) : null,
         btn('Save game', () => { this.game.save(); this.setState('EXPLORE'); }),
         btn('Load last save', () => this.loadGame(), !Game.hasSave()),
-        btn('Quit to title', () => this.showTitle())));
+        btn('Quit to title', () => this.showTitle()),
+        h('div', { class: 'col volumes' }, ...[['Master', 'master'], ['Music', 'music'], ['SFX / Ambience', 'sfx']].map(([label, key]) => {
+          const k = /** @type {'master'|'music'|'sfx'} */ (key);
+          return h('label', { class: 'row' }, h('span', { class: 'grow' }, label),
+            h('input', { type: 'range', min: '0', max: '100', step: '1', value: String(Math.round(this.audio.volumes[k] * 100)), 'aria-label': `${label} volume`,
+              oninput: (/** @type {Event} */ e) => this.audio.setVolume(k, Number(/** @type {HTMLInputElement} */ (e.target).value) / 100) }));
+        }))));
   }
 
   /** Terminate the tutorial now and return to unrestricted play. */
@@ -2358,7 +2702,15 @@ class App {
     const c = g.char;
     const owned = Object.keys(ITEMS).filter((id) => ITEMS[id].type === 'rune' && c.inventory.count(id));
     const spell = spellFor(this.runeSel);
-    this.panel('SKILLS', `Level ${c.level}  ·  ${c.skillUps % 10}/10 skill increases to next level`,
+    const prof = PROFESSIONS[c.profession];
+    const sign = BIRTHSIGNS[c.birthsign];
+    const profile = prof && sign
+      ? h('div', { class: 'row profile' }, emblem(c.birthsign, 56), h('div', { class: 'grow' },
+        h('b', {}, c.name), h('div', { class: 'small' }, `${prof.name} (${prof.title}) · born under ${sign.name}${c.fated ? ' · Fated Alignment (+5% skill gain)' : ''}`),
+        h('div', { class: 'small' }, `${sign.boon} ${prof.perk}`),
+        h('div', { class: 'small' }, h('b', {}, `Power [R], ${sign.power}: `), sign.powerDesc, c.powerCD > 0 ? ` Recharging: ${Math.ceil(c.powerCD)}s, or rest.` : ' Ready.')))
+      : h('div', { class: 'small dim' }, `${c.name}: this traveller woke before the Astrolabe read the stars (an older save).`);
+    this.panel('SKILLS', `Level ${c.level}  ·  ${c.skillUps % 10}/10 skill increases to next level`, profile,
       h('div', { class: 'cols' },
         h('div', {},
           h('h4', {}, `Attributes (${c.attrPoints} points)`),
@@ -2407,6 +2759,7 @@ class App {
   // ----- Journal -----
 
   openJournal() {
+    this.game.audio.page();
     const g = this.game;
     const quests = Object.values(g.quests.quests);
     const active = quests.filter((q) => !q.done);
@@ -2434,6 +2787,7 @@ class App {
   // ----- Automap -----
 
   openMap() {
+    this.game.audio.page();
     const g = this.game;
     const L = g.level;
     const size = Math.min(520, window.innerWidth - 60, window.innerHeight - 180);
@@ -2615,6 +2969,12 @@ class App {
     this.hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.hctx.clearRect(0, 0, w, hh);
     if (this.state !== 'TITLE') drawHud(this.hctx, g, w, hh, this.touch, this.state === 'EXPLORE' ? this.target : null);
+    if (this.touch) {
+      // Touch POWER button shows its countdown while recharging.
+      const label = g.char.powerCD > 0 ? String(Math.ceil(g.char.powerCD)) : 'POWER';
+      const pb = $('power-btn');
+      if (pb.textContent !== label) pb.textContent = label;
+    }
   }
 }
 

@@ -14,7 +14,7 @@ import { buildWorldAtlas, buildSpriteAtlas, buildWorldMaterials, buildDetailText
 import { TILE, CHUNK, Level, hash2 } from './world.js';
 import {
   Mesh, VERT, MAX_BONES, ident, mul, trs, buildModel, hasModel, nominalSize, isItemModel, VARIANTS, grassTuft, buildRoof,
-  buildDoorFrame, getRig, poseRig, getViewmodel,
+  buildDoorFrame, getRig, poseRig, getViewmodel, RIG_NAMES,
 } from './models.js';
 
 /** @typedef {import('./world.js').Door} Door */
@@ -33,6 +33,7 @@ import {
  * @property {number[]} tint
  * @property {number} sky 1 under open sky, 0 under a roof
  * @property {ModelDesc} [model] articulated character to draw instead of a prop
+ * @property {boolean} [xray] glow marker drawn through walls (Astral Sight)
  */
 /**
  * @typedef {Object} Env
@@ -74,9 +75,11 @@ const FAR = 140;
 /** Floats per model instance: (x, y, z, yaw) (scale, sky, -, -) (tint rgb, emission). */
 const INST = 12;
 /** Beyond this distance nature props switch to their low-poly LOD. */
-const LOD_DIST = 24;
+const LOD_DIST = 20;
 /** Props within this distance of the eye are drawn into the shadow map. */
 const SHADOW_REACH = 40;
+/** Characters beyond this distance use their low-poly rig. */
+const CHAR_LOD_DIST = 16;
 /** Grass tufts are drawn within this radius. */
 const GRASS_DIST = 28;
 /** Viewmodels are squeezed into the front of the depth range so they never clip into walls. */
@@ -101,11 +104,13 @@ uniform mat4 uBones[${MAX_BONES}];
 uniform float uSky;
 uniform vec3 uTint;
 uniform float uEmit;
+uniform float uBase;
 #endif
 uniform mat4 uViewProj;
 uniform float uTime;
 uniform float uWind;
 out vec3 vPos; out vec3 vNormal; out vec2 vUV; out vec3 vCol; out vec4 vMat; out float vSky; out vec4 vTintEmit;
+out vec3 vObj; out float vH;
 void main() {
 #ifdef INSTANCED
   float c = cos(iA.w), s = sin(iA.w);
@@ -114,13 +119,16 @@ void main() {
   vNormal = vec3(c * aNormal.x + s * aNormal.z, aNormal.y, -s * aNormal.x + c * aNormal.z);
   vSky = iB.y;
   vTintEmit = iC;
+  vH = wp.y - iA.y;
 #else
   mat4 B = uBones[int(aMisc.y + 0.5)];
   vec4 wp = B * vec4(aPos, 1.0);
   vNormal = mat3(B) * aNormal;
   vSky = aMisc.x * uSky;
   vTintEmit = vec4(uTint, uEmit);
+  vH = wp.y - uBase;
 #endif
+  vObj = aPos;
   // Wind sway for foliage, cloth and flames (weight per vertex).
   if (aMisc.z > 0.0) {
     float ph = uTime * 1.9 + wp.x * 0.7 + wp.z * 0.9;
@@ -141,7 +149,7 @@ precision highp sampler2DArray;
 precision highp sampler2DShadow;
 #define MAX_LIGHTS ${MAX_LIGHTS}
 #define PI 3.14159265
-in vec3 vPos; in vec3 vNormal; in vec2 vUV; in vec3 vCol; in vec4 vMat; in float vSky; in vec4 vTintEmit;
+in vec3 vPos; in vec3 vNormal; in vec2 vUV; in vec3 vCol; in vec4 vMat; in float vSky; in vec4 vTintEmit; in vec3 vObj; in float vH;
 uniform sampler2DArray uAlbedo;
 uniform sampler2DArray uNormal;
 uniform sampler2DArray uMat;
@@ -234,9 +242,12 @@ vec3 envBRDF(vec3 F0, float r, float NoV) {
 }
 
 // Cook-Torrance: GGX distribution, Smith-Schlick visibility, Schlick Fresnel; Lambert diffuse.
-vec3 shade(vec3 N, vec3 V, vec3 L, vec3 diff, vec3 F0, float rough) {
+// wrap > 0 marks organic matter (skin, cloth, leaves): light bleeds past the terminator, warmed
+// as if scattered beneath the surface, and thin parts glow faintly when backlit.
+vec3 shade(vec3 N, vec3 V, vec3 L, vec3 diff, vec3 F0, float rough, float wrap) {
   vec3 H = normalize(L + V);
-  float NoL = max(dot(N, L), 0.0);
+  float NoLr = dot(N, L);
+  float NoL = max(NoLr, 0.0);
   float NoV = max(dot(N, V), 1e-3);
   float NoH = max(dot(N, H), 0.0);
   float VoH = max(dot(V, H), 0.0);
@@ -247,7 +258,10 @@ vec3 shade(vec3 N, vec3 V, vec3 L, vec3 diff, vec3 F0, float rough) {
   float k = a * 0.5;
   float Vis = 0.25 / ((NoV * (1.0 - k) + k) * (NoL * (1.0 - k) + k));
   vec3 F = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
-  return (diff * (1.0 - F) + PI * D * Vis * F) * NoL;
+  float wrapped = max((NoLr + wrap) / (1.0 + wrap), 0.0);
+  vec3 bleed = diff * max(wrapped - NoL, 0.0) * vec3(1.0, 0.62, 0.48);
+  vec3 trans = diff * pow(max(dot(-V, L), 0.0), 6.0) * wrap * 0.5;
+  return (diff * (1.0 - F) + PI * D * Vis * F) * NoL + bleed + trans;
 }
 
 void main() {
@@ -261,6 +275,7 @@ void main() {
   float metal;
   float specK = 1.0;
   float cav = 1.0;
+  float wrap = 0.0;
   vec3 emission = vec3(0.0);
   float water = 0.0;
   if (layer >= 0.0) {
@@ -289,13 +304,23 @@ void main() {
       emission = lin(texel) * mask * pulse * 2.4;
     }
   } else {
-    // Plain-colour mesh material: fine bump and tone variation from the detail texture.
+    // Plain-colour mesh material. Object-space triplanar micro-relief (so it sticks to moving
+    // parts): a coarse grain plus a fine weave/pore layer, bump-mapped, never smooth plastic.
     if (dot(N, V) < 0.0) N = -N;
-    vec3 d = texture(uDetail, vUV * 1.3).rgb;
-    N = bump(N, vPos, d.r, 0.004 + vMat.y * 0.012);
-    albedo = lin(vCol) * (0.88 + d.g * 0.24);
-    rough = clamp(vMat.y + (d.b - 0.5) * 0.12, 0.05, 1.0);
+    vec3 w3 = pow(abs(N), vec3(4.0));
+    w3 /= dot(w3, vec3(1.0));
+    vec3 p1 = vObj * 6.0;
+    vec4 d = texture(uDetail, p1.yz) * w3.x + texture(uDetail, p1.xz) * w3.y + texture(uDetail, p1.xy) * w3.z;
+    vec3 p2 = vObj * 21.0;
+    float fine = texture(uDetail, p2.yz).r * w3.x + texture(uDetail, p2.xz).r * w3.y + texture(uDetail, p2.xy).r * w3.z;
     metal = vMat.z;
+    N = bump(N, vPos, d.r * 0.55 + fine * 0.45, (0.005 + vMat.y * 0.012) * (1.0 - metal * 0.55));
+    albedo = lin(vCol) * (0.84 + d.g * 0.32);
+    // Grime gathers near the ground (boots, hems, trunk bases) and in broad blotches.
+    float grime = clamp(smoothstep(0.55, 0.0, vH) * 0.7 + (d.g - 0.55) * 0.7, 0.0, 1.0) * step(vMat.w, 0.0);
+    albedo = mix(albedo, albedo * vec3(0.52, 0.45, 0.37), grime * 0.6);
+    rough = clamp(vMat.y + (d.b - 0.5) * 0.16 + grime * 0.15, 0.05, 1.0);
+    wrap = metal < 0.2 && vMat.y > 0.45 ? 0.45 : 0.0;
     emission = lin(vCol) * vMat.w * vTintEmit.w * (0.9 + 0.1 * sin(uTime * 6.0 + vPos.y * 9.0));
   }
   albedo *= vTintEmit.rgb;
@@ -317,10 +342,12 @@ void main() {
   vec3 env = mix(groundA * 0.7, mix(uFog, uZenith, smoothstep(0.0, 0.6, R.y)), smoothstep(-0.25, 0.15, R.y));
   env = mix(uAmbient * 1.4, env, vSky);
   vec3 col = (diff * hemi + env * envBRDF(F0, rough, NoV)) * cav;
+  // Grazing Fresnel rim on worn metal, glass and wet or polished surfaces.
+  col += env * pow(1.0 - NoV, 5.0) * (metal * 0.5 + (1.0 - rough) * 0.35) * cav;
 
   if (vSky > 0.0) {
     float ndl = dot(N, uSunDir);
-    if (ndl > 0.0) col += shade(N, V, uSunDir, diff, F0, rough) * uSunCol * shadowAt(vPos, N, ndl) * vSky;
+    if (ndl > -wrap) col += shade(N, V, uSunDir, diff, F0, rough, wrap) * uSunCol * shadowAt(vPos, N, max(ndl, 0.0)) * vSky;
   }
   for (int i = 0; i < MAX_LIGHTS; i++) {
     if (i >= uLightCount) break;
@@ -331,7 +358,7 @@ void main() {
     vec3 Ld = L / max(d, 1e-4);
     float win = clamp(1.0 - d2 * d2 / 65536.0, 0.0, 1.0);
     float att = win * win / (1.0 + 0.3 * d2);
-    col += (shade(N, V, Ld, diff, F0, max(rough, 0.12)) + diff * 0.06) * uLightCol[i] * att;
+    col += (shade(N, V, Ld, diff, F0, max(rough, 0.12), wrap) + diff * 0.06) * uLightCol[i] * att;
   }
   if (water > 0.0) {
     float fres = pow(1.0 - NoV, 4.0);
@@ -614,7 +641,7 @@ void main() {
 const SHARED_FS_UNIFORMS = ['uAlbedo', 'uNormal', 'uMat', 'uDetail', 'uShadowMap', 'uShadowMat', 'uShadowOn', 'uLightPos', 'uLightCol', 'uLightCount', 'uEye', 'uFog', 'uZenith', 'uFogDensity', 'uAmbient', 'uSunDir', 'uSunCol', 'uStore', 'uWet'];
 /** Every uniform each program declares; checked against the shader sources at startup. */
 const UNIFORMS = {
-  mesh: ['uViewProj', 'uBones', 'uSky', 'uTint', 'uEmit', 'uTime', 'uWind', ...SHARED_FS_UNIFORMS],
+  mesh: ['uViewProj', 'uBones', 'uSky', 'uTint', 'uEmit', 'uBase', 'uTime', 'uWind', ...SHARED_FS_UNIFORMS],
   meshInst: ['uViewProj', 'uTime', 'uWind', ...SHARED_FS_UNIFORMS],
   depth: ['uViewProj', 'uBones', 'uTime', 'uWind'],
   depthInst: ['uViewProj', 'uTime', 'uWind'],
@@ -1054,6 +1081,8 @@ export class Renderer {
     gl.bindVertexArray(null);
     this.fxList = new FloatList(256 * 8);
     this.shadowList = new FloatList(64 * 8);
+    /** Glow markers drawn with the depth test off. */
+    this.xrayList = new FloatList(64 * 8);
     // Directional shadow map: hardware depth comparison gives bilinear PCF per tap.
     this.shadowTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
@@ -1106,6 +1135,23 @@ export class Renderer {
     this.aoB = null;
     this.lightPos = new Float32Array(MAX_LIGHTS * 3);
     this.lightCol = new Float32Array(MAX_LIGHTS * 3);
+    /** Viewmodel inertia: last camera angles and the current lag offset. @type {{yaw:number, pitch:number}|null} */
+    this.vmLast = null;
+    this.vmSway = [0, 0];
+    // Sculpting and AO-baking a rig or tree takes 0.1-0.3 s, so build them all in small steps
+    // while the title screen is up instead of hitching the first time one comes into view.
+    /** @type {(() => void)[]} */
+    const warm = [];
+    for (const n of RIG_NAMES) warm.push(() => getRig(n), () => getRig(n, true));
+    for (const n of ['tree_ley', 'tree_pine', 'tree_dead', 'rock', 'ruin']) for (let k = 0; k < 4; k++) warm.push(() => this._cpuModel(`${n}#${k}`), () => this._cpuModel(`${n}#${k}~`));
+    for (const id of ['fork', 'scatter', 'crossbow', 'cast', 'lantern']) warm.push(() => getViewmodel(id));
+    const step = () => {
+      const job = warm.shift();
+      if (!job) return;
+      job();
+      setTimeout(step, 16);
+    };
+    setTimeout(step, 300);
   }
 
   /**
@@ -1489,6 +1535,7 @@ export class Renderer {
     const chars = [];
     const fxl = this.fxList;
     fxl.n = 0;
+    this.xrayList.n = 0;
     const shl = this.shadowList;
     shl.n = 0;
     for (const s of v.sprites) {
@@ -1521,9 +1568,10 @@ export class Renderer {
         continue;
       }
       const col = /** @type {Record<string, number[]>} */ (FX_COLOR)[name] ?? FX_COLOR.spark;
-      fxl.grow(8);
-      fxl.data.set([s.x, s.y + s.h / 2, s.z, s.w, col[0] * s.tint[0], col[1] * s.tint[1], col[2] * s.tint[2], 0], fxl.n);
-      fxl.n += 8;
+      const list = s.xray ? this.xrayList : fxl;
+      list.grow(8);
+      list.data.set([s.x, s.y + s.h / 2, s.z, s.w, col[0] * s.tint[0], col[1] * s.tint[1], col[2] * s.tint[2], 0], list.n);
+      list.n += 8;
     }
     for (const g of this.models.values()) g.ns = g.n;
     for (const { p, d } of far) this._queue(d > LOD_DIST ? p.far : p.key, p.x, p.y, p.z, p.yaw, p.s, p.sky, WHITE, 1);
@@ -1552,19 +1600,23 @@ export class Renderer {
 
   /**
    * Draw the posed characters with the skinned program bound.
+   * Close characters use the full sculpted rig; distant ones and the shadow pass use its LOD.
    * @param {{s: SpriteDesc, m: ModelDesc}[]} chars @param {Record<string, WebGLUniformLocation>} u @param {boolean} lit
+   * @param {{x:number, z:number}} eye
    */
-  _drawChars(chars, u, lit) {
+  _drawChars(chars, u, lit, eye) {
     const gl = this.gl;
     for (const { s, m } of chars) {
-      const rig = getRig(m.rig);
-      const gpu = this._skinned(`rig:${m.rig}`, () => rig.mesh);
+      const far = !lit || Math.hypot(s.x - eye.x, s.z - eye.z) > CHAR_LOD_DIST;
+      const rig = getRig(m.rig, far);
+      const gpu = this._skinned(`rig:${m.rig}${far ? '~' : ''}`, () => rig.mesh);
       const n = poseRig(rig, m, s.x, s.y, s.z, this.bones);
       gl.uniformMatrix4fv(u.uBones, false, this.bones.subarray(0, Math.max(n, 1) * 16));
       if (lit) {
         gl.uniform1f(u.uSky, s.sky);
         gl.uniform3fv(u.uTint, s.tint);
         gl.uniform1f(u.uEmit, 1);
+        gl.uniform1f(u.uBase, s.y);
       }
       this._drawIndexed(gpu);
     }
@@ -1685,7 +1737,7 @@ export class Renderer {
       }
       gl.bindVertexArray(this.doorBuf.vao);
       gl.drawArrays(gl.TRIANGLES, 0, this.doorMesh.count);
-      this._drawChars(chars, du, false);
+      this._drawChars(chars, du, false, v.eye);
       const diu = this.depthInst.u;
       gl.useProgram(this.depthInst.prog);
       gl.uniformMatrix4fv(diu.uViewProj, false, svp);
@@ -1737,6 +1789,7 @@ export class Renderer {
     gl.uniform1f(u.uSky, 1);
     gl.uniform3fv(u.uTint, WHITE);
     gl.uniform1f(u.uEmit, 1);
+    gl.uniform1f(u.uBase, -1e4);
     const fx = Math.cos(v.yaw);
     const fz = Math.sin(v.yaw);
     for (const c of this.chunks.values()) {
@@ -1748,7 +1801,7 @@ export class Renderer {
     }
     gl.bindVertexArray(this.doorBuf.vao);
     gl.drawArrays(gl.TRIANGLES, 0, this.doorMesh.count);
-    this._drawChars(chars, u, true);
+    this._drawChars(chars, u, true, v.eye);
     if (v.view) this._drawViewmodel(v, view, u, eyeSky);
 
     // Instanced props, foliage, grass and items.
@@ -1780,6 +1833,14 @@ export class Renderer {
       gl.bindBuffer(gl.ARRAY_BUFFER, this.fxVBO);
       gl.bufferData(gl.ARRAY_BUFFER, this.fxList.data.subarray(0, this.fxList.n), gl.STREAM_DRAW);
       gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, this.fxList.n / 8);
+    }
+    if (this.xrayList.n) {
+      gl.blendFunc(gl.ONE, gl.ONE);
+      gl.disable(gl.DEPTH_TEST);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.fxVBO);
+      gl.bufferData(gl.ARRAY_BUFFER, this.xrayList.data.subarray(0, this.xrayList.n), gl.STREAM_DRAW);
+      gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, this.xrayList.n / 8);
+      gl.enable(gl.DEPTH_TEST);
     }
 
     // GPU rain: every drop positioned in the vertex shader from its instance id.
@@ -1873,8 +1934,17 @@ export class Renderer {
     const vm = /** @type {ViewDesc} */ (v.view);
     const gl = this.gl;
     const cam = invert(view);
-    const bx = Math.sin(vm.bob) * 0.012;
-    const by = -Math.abs(Math.cos(vm.bob)) * 0.012;
+    // Inertia: the held items lag behind fast turns and settle back.
+    const last = this.vmLast ?? { yaw: v.yaw, pitch: v.pitch };
+    let dyaw = v.yaw - last.yaw;
+    dyaw -= Math.round(dyaw / (Math.PI * 2)) * Math.PI * 2;
+    const dpitch = v.pitch - last.pitch;
+    this.vmLast = { yaw: v.yaw, pitch: v.pitch };
+    const sway = this.vmSway;
+    sway[0] += (Math.max(-0.05, Math.min(0.05, -dyaw * 1.6)) - sway[0]) * 0.18;
+    sway[1] += (Math.max(-0.04, Math.min(0.04, -dpitch * 1.6)) - sway[1]) * 0.18;
+    const bx = Math.sin(vm.bob) * 0.012 + sway[0];
+    const by = -Math.abs(Math.cos(vm.bob)) * 0.012 + sway[1];
     /** @type {[string, Float32Array][]} */
     const parts = [];
     if (vm.item) {
@@ -1891,6 +1961,7 @@ export class Renderer {
     if (vm.lantern) parts.push(['lantern', mul(cam, trs(-0.34 - bx * 0.5, -0.24 + by, -0.62, -0.2, 0, 0, 0.75))]);
     if (!parts.length) return;
     gl.depthRange(0, VIEW_DEPTH);
+    gl.uniform1f(u.uBase, -1e4);
     gl.uniform1f(u.uSky, sky);
     gl.uniform3fv(u.uTint, WHITE);
     gl.uniform1f(u.uEmit, vm.item === 'cast' ? 1 + vm.cast * 2 : 1);

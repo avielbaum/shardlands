@@ -194,34 +194,40 @@ export class Mesh {
    * @param {number[][][]} T matching [u, v] texture coordinates
    * @param {Mat|((row: number) => Mat)} mt material, or one per row
    * @param {boolean} wrapU first and last columns coincide
-   * @param {{flat?: boolean, flip?: boolean}} [o]
+   * @param {{flat?: boolean, flip?: boolean, smooth?: number, disp?: (x:number, y:number, z:number) => number}} [o]
+   *   smooth: Laplacian iterations; disp: offset along the normal (metres) at a point
+   * @returns {number[][][]} the final (smoothed, displaced) points
    */
   grid(P, T, mt, wrapU, o = {}) {
     const matOf = typeof mt === 'function' ? mt : () => mt;
     const rows = P.length;
     const cols = P[0].length;
-    /** @type {number[][][]} */
-    const N = [];
     const sign = o.flip ? -1 : 1;
-    for (let j = 0; j < rows; j++) {
-      N.push([]);
-      for (let i = 0; i < cols; i++) {
-        const il = i > 0 ? i - 1 : wrapU ? cols - 2 : 0;
-        const ir = i < cols - 1 ? i + 1 : wrapU ? 1 : cols - 1;
-        const jd = Math.max(0, j - 1);
-        const ju = Math.min(rows - 1, j + 1);
-        const du = sub(P[j][ir], P[j][il]);
-        const dv = sub(P[ju][i], P[jd][i]);
-        let n = cross(dv, du);
-        let l = Math.hypot(n[0], n[1], n[2]);
-        if (l < 1e-9) {
-          // Degenerate row (a pole): borrow the tangent from the neighbouring row.
-          const jj = j === 0 ? Math.min(1, rows - 1) : Math.max(0, rows - 2);
-          n = cross(sub(P[Math.min(rows - 1, jj + 1)][i], P[Math.max(0, jj - 1)][i]), sub(P[jj][ir], P[jj][il]));
-          l = Math.hypot(n[0], n[1], n[2]) || 1;
+    // Laplacian smoothing: relax interior points toward their four neighbours (end rows stay put
+    // so parts still meet their joints).
+    for (let it = 0; it < (o.smooth ?? 0); it++) {
+      const Q = P.map((r) => r.map((p) => p.slice()));
+      for (let j = 1; j < rows - 1; j++) {
+        for (let i = 0; i < cols; i++) {
+          if (!wrapU && (i === 0 || i === cols - 1)) continue;
+          const il = i > 0 ? i - 1 : cols - 2;
+          const ir = i < cols - 1 ? i + 1 : 1;
+          for (let k = 0; k < 3; k++) Q[j][i][k] = P[j][i][k] * 0.5 + (P[j][il][k] + P[j][ir][k] + P[j - 1][i][k] + P[j + 1][i][k]) * 0.125;
         }
-        N[j].push([(n[0] / l) * sign, (n[1] / l) * sign, (n[2] / l) * sign]);
+        if (wrapU) Q[j][cols - 1] = Q[j][0].slice();
       }
+      P = Q;
+    }
+    let N = gridNormals(P, wrapU, sign);
+    // Organic imperfection: push every point along its normal by a noise field, then re-derive normals.
+    if (o.disp) {
+      const disp = o.disp;
+      P = P.map((r, j) => r.map((p, i) => {
+        const d = disp(p[0], p[1], p[2]);
+        return [p[0] + N[j][i][0] * d, p[1] + N[j][i][1] * d, p[2] + N[j][i][2] * d];
+      }));
+      if (wrapU) for (const r of P) r[cols - 1] = r[0].slice();
+      N = gridNormals(P, wrapU, sign);
     }
     for (let j = 0; j < rows - 1; j++) {
       for (let i = 0; i < cols - 1; i++) {
@@ -239,7 +245,7 @@ export class Mesh {
         }
       }
     }
-    return this;
+    return P;
   }
 
   /**
@@ -247,7 +253,7 @@ export class Mesh {
    * grad shades the colour from the first profile row to the last (self-occlusion for foliage).
    * @param {number[][]} prof @param {number} seg @param {Mat} mt
    * @param {{sx?: number, sz?: number, a0?: number, a1?: number, cap0?: boolean, cap1?: boolean, flat?: boolean,
-   *   wob?: (x:number, y:number, z:number) => number, grad?: number[]}} [o]
+   *   wob?: (x:number, y:number, z:number) => number, grad?: number[], smooth?: number, disp?: (x:number, y:number, z:number) => number}} [o]
    */
   lathe(prof, seg, mt, o = {}) {
     seg = Math.max(o.flat ? seg : 4, Math.round(seg * DETAIL));
@@ -290,28 +296,135 @@ export class Mesh {
       T.push(trow);
     }
     const g = o.grad;
-    this.grid(P, T, g ? (j) => shade(mt, g[0] + ((g[1] - g[0]) * j) / Math.max(1, prof.length - 1)) : mt, full, { flat: o.flat });
-    /** @type {[number, boolean|undefined, number][]} */
-    const caps = [[0, o.cap0, -1], [prof.length - 1, o.cap1, 1]];
-    for (const [end, on, ny] of caps) {
-      if (!on || prof[end][0] < 1e-4) continue;
+    const F = this.grid(P, T, g ? (j) => shade(mt, g[0] + ((g[1] - g[0]) * j) / Math.max(1, prof.length - 1)) : mt, full, { flat: o.flat, smooth: o.smooth, disp: o.disp });
+    this._caps(F, seg, mt, o.cap0 && prof[0][0] > 1e-4, o.cap1 && prof[prof.length - 1][0] > 1e-4);
+    return this;
+  }
+
+  /**
+   * Close the first and/or last ring of a grid with a fan.
+   * @param {number[][][]} P @param {number} seg @param {Mat} mt @param {boolean|undefined} c0 @param {boolean|undefined} c1
+   */
+  _caps(P, seg, mt, c0, c1) {
+    /** @type {[number, boolean|undefined][]} */
+    const caps = [[0, c0], [P.length - 1, c1]];
+    for (const [end, on] of caps) {
+      if (!on) continue;
       const ring = P[end];
-      const cy = ring.reduce((s, p) => s + p[1], 0) / ring.length;
+      const c = [0, 1, 2].map((k) => ring.slice(0, seg).reduce((s, p) => s + p[k], 0) / seg);
+      const inner = P[end === 0 ? 1 : P.length - 2];
+      // Cap faces away from the neighbouring ring.
+      const n = norm(sub(c, inner.slice(0, seg).reduce((s, p) => [s[0] + p[0] / seg, s[1] + p[1] / seg, s[2] + p[2] / seg], [0, 0, 0])));
       for (let i = 0; i < seg; i++) {
-        const p0 = ring[i];
-        const p1 = ring[i + 1];
-        this.v([0, cy, 0], [0, ny, 0], 0, 0, mt);
-        this.v(p0, [0, ny, 0], p0[0], p0[2], mt);
-        this.v(p1, [0, ny, 0], p1[0], p1[2], mt);
+        this.v(c, n, 0, 0, mt);
+        this.v(ring[i], n, ring[i][0], ring[i][2], mt);
+        this.v(ring[i + 1], n, ring[i + 1][0], ring[i + 1][2], mt);
       }
     }
+  }
+
+  /**
+   * Lofted surface through elliptical cross-sections, Catmull-Rom interpolated between rows.
+   * rows: [y, rx, rz, cx?, cz?] bottom to top. folds adds gravity drapery that deepens toward
+   * the lowest row: [count, depth in metres].
+   * @param {number[][]} rows @param {number} seg @param {Mat} mt
+   * @param {{sub?: number, a0?: number, a1?: number, cap0?: boolean, cap1?: boolean, smooth?: number, flat?: boolean,
+   *   disp?: (x:number, y:number, z:number) => number, folds?: number[], grad?: number[]}} [o]
+   */
+  loft(rows, seg, mt, o = {}) {
+    seg = Math.max(6, Math.round(seg * DETAIL));
+    const R = crPath(rows.map((r) => [r[0], r[1], r[2], r[3] ?? 0, r[4] ?? 0]), Math.max(1, Math.round((o.sub ?? 3) * DETAIL)));
+    const a0 = o.a0 ?? 0;
+    const a1 = o.a1 ?? Math.PI * 2;
+    const full = Math.abs(a1 - a0 - Math.PI * 2) < 1e-6;
+    const yTop = R[R.length - 1][0];
+    const yBot = R[0][0];
+    /** @type {number[][][]} */
+    const P = [];
+    /** @type {number[][][]} */
+    const T = [];
+    let arc = 0;
+    for (let j = 0; j < R.length; j++) {
+      const [y, rx, rz, cx, cz] = R[j];
+      if (j) arc += Math.hypot(rx - R[j - 1][1], y - R[j - 1][0]);
+      const drop = o.folds ? ((yTop - y) / Math.max(1e-6, yTop - yBot)) ** 1.5 : 0;
+      const row = [];
+      const trow = [];
+      for (let i = 0; i <= seg; i++) {
+        const a = a0 + ((a1 - a0) * i) / seg;
+        const f = o.folds ? 1 + (o.folds[1] / Math.max(rx, rz)) * drop * Math.sin(a * o.folds[0] + j * 0.15) : 1;
+        row.push([cx + Math.cos(a) * rx * f, y, cz + Math.sin(a) * rz * f]);
+        trow.push([((a - a0) * (rx + rz)) / 2, arc]);
+      }
+      if (full) row[seg] = row[0].slice();
+      P.push(row);
+      T.push(trow);
+    }
+    const g = o.grad;
+    const F = this.grid(P, T, g ? (j) => shade(mt, g[0] + ((g[1] - g[0]) * j) / Math.max(1, R.length - 1)) : mt, full, { smooth: o.smooth, disp: o.disp, flat: o.flat });
+    if (full) this._caps(F, seg, mt, o.cap0, o.cap1);
+    return this;
+  }
+
+  /**
+   * Sweep a variable elliptical cross-section along a Catmull-Rom spline (limbs, trunks,
+   * branches, grips). Frames are parallel-transported so the tube never twists; radii are
+   * [across, depth] (or one number), where "across" starts perpendicular to the path and +Z.
+   * @param {number[][]} pts control points @param {(number|number[])[]} radii per control point
+   * @param {number} seg @param {Mat} mt
+   * @param {{sub?: number, cap0?: boolean, cap1?: boolean, smooth?: number, disp?: (x:number, y:number, z:number) => number}} [o]
+   */
+  sweep(pts, radii, seg, mt, o = {}) {
+    seg = Math.max(5, Math.round(seg * DETAIL));
+    const ctrl = pts.map((p, k) => {
+      const r = radii[k];
+      return [p[0], p[1], p[2], typeof r === 'number' ? r : r[0], typeof r === 'number' ? r : r[1]];
+    });
+    const S = crPath(ctrl, Math.max(1, Math.round((o.sub ?? 4) * DETAIL)));
+    /** @type {number[][][]} */
+    const P = [];
+    /** @type {number[][][]} */
+    const T = [];
+    let nPrev = null;
+    let arc = 0;
+    for (let j = 0; j < S.length; j++) {
+      const p = S[j];
+      const t = norm(sub(S[Math.min(S.length - 1, j + 1)], S[Math.max(0, j - 1)]));
+      let n;
+      if (!nPrev) {
+        const ref = Math.abs(t[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+        n = norm(cross(t, ref));
+      } else {
+        // Parallel transport: remove the tangent component from the previous normal.
+        const d = nPrev[0] * t[0] + nPrev[1] * t[1] + nPrev[2] * t[2];
+        n = norm([nPrev[0] - t[0] * d, nPrev[1] - t[1] * d, nPrev[2] - t[2] * d]);
+      }
+      nPrev = n;
+      const b = cross(t, n);
+      if (j) arc += Math.hypot(p[0] - S[j - 1][0], p[1] - S[j - 1][1], p[2] - S[j - 1][2]);
+      const row = [];
+      const trow = [];
+      for (let i = 0; i <= seg; i++) {
+        const a = (i / seg) * Math.PI * 2;
+        const c = Math.cos(a) * p[3];
+        const s2 = Math.sin(a) * p[4];
+        row.push([p[0] + n[0] * c + b[0] * s2, p[1] + n[1] * c + b[1] * s2, p[2] + n[2] * c + b[2] * s2]);
+        trow.push([(a * (p[3] + p[4])) / 2, arc]);
+      }
+      row[seg] = row[0].slice();
+      P.push(row);
+      T.push(trow);
+    }
+    const F = this.grid(P, T, mt, true, { smooth: o.smooth, disp: o.disp });
+    this._caps(F, seg, mt, o.cap0, o.cap1);
     return this;
   }
 
   /**
    * Ellipsoid centred on the current origin.
    * @param {number} rx @param {number} ry @param {number} rz @param {number} seg @param {number} rings @param {Mat} mt
-   * @param {{wob?: (x:number, y:number, z:number) => number, v0?: number, v1?: number, a0?: number, a1?: number, grad?: number[]}} [o]
+   * @param {{wob?: (x:number, y:number, z:number) => number, v0?: number, v1?: number, a0?: number, a1?: number, grad?: number[],
+   *   smooth?: number, disp?: (x:number, y:number, z:number) => number}} [o]
    */
   ellipsoid(rx, ry, rz, seg, rings, mt, o = {}) {
     const v0 = o.v0 ?? -Math.PI / 2;
@@ -323,7 +436,7 @@ export class Mesh {
       const t = v0 + ((v1 - v0) * j) / rings;
       prof.push([Math.cos(t), Math.sin(t) * ry]);
     }
-    return this.lathe(prof, seg, mt, { sx: rx, sz: rz, wob: o.wob, a0: o.a0, a1: o.a1, grad: o.grad });
+    return this.lathe(prof, seg, mt, { sx: rx, sz: rz, wob: o.wob, a0: o.a0, a1: o.a1, grad: o.grad, smooth: o.smooth, disp: o.disp });
   }
 
   /** Sphere. @param {number} r @param {number} seg @param {Mat} mt */
@@ -473,6 +586,60 @@ const norm = (a) => {
   const l = Math.hypot(a[0], a[1], a[2]) || 1;
   return [a[0] / l, a[1] / l, a[2] / l];
 };
+/**
+ * Normals of a parametric grid by central differences (poles borrow the neighbouring row).
+ * @param {number[][][]} P @param {boolean} wrapU @param {number} sign
+ */
+function gridNormals(P, wrapU, sign) {
+  const rows = P.length;
+  const cols = P[0].length;
+  /** @type {number[][][]} */
+  const N = [];
+  for (let j = 0; j < rows; j++) {
+    N.push([]);
+    for (let i = 0; i < cols; i++) {
+      const il = i > 0 ? i - 1 : wrapU ? cols - 2 : 0;
+      const ir = i < cols - 1 ? i + 1 : wrapU ? 1 : cols - 1;
+      const jd = Math.max(0, j - 1);
+      const ju = Math.min(rows - 1, j + 1);
+      let n = cross(sub(P[ju][i], P[jd][i]), sub(P[j][ir], P[j][il]));
+      let l = Math.hypot(n[0], n[1], n[2]);
+      if (l < 1e-9) {
+        const jj = j === 0 ? Math.min(1, rows - 1) : Math.max(0, rows - 2);
+        n = cross(sub(P[Math.min(rows - 1, jj + 1)][i], P[Math.max(0, jj - 1)][i]), sub(P[jj][ir], P[jj][il]));
+        l = Math.hypot(n[0], n[1], n[2]) || 1;
+      }
+      N[j].push([(n[0] / l) * sign, (n[1] / l) * sign, (n[2] / l) * sign]);
+    }
+  }
+  return N;
+}
+
+/**
+ * Catmull-Rom resampling of a list of control rows (each an array of numbers), with `sub`
+ * samples per span; the curve passes through every control row.
+ * @param {number[][]} C @param {number} sub @returns {number[][]}
+ */
+function crPath(C, sub) {
+  if (C.length < 2) return C.map((c) => c.slice());
+  /** @type {number[][]} */
+  const out = [];
+  for (let k = 0; k < C.length - 1; k++) {
+    const p0 = C[Math.max(0, k - 1)];
+    const p1 = C[k];
+    const p2 = C[k + 1];
+    const p3 = C[Math.min(C.length - 1, k + 2)];
+    for (let s = 0; s < sub; s++) {
+      const t = s / sub;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      out.push(p1.map((_, i) => 0.5 * (2 * p1[i] + (-p0[i] + p2[i]) * t + (2 * p0[i] - 5 * p1[i] + 4 * p2[i] - p3[i]) * t2 + (-p0[i] + 3 * p1[i] - 3 * p2[i] + p3[i]) * t3)));
+    }
+  }
+  out.push(C[C.length - 1].slice());
+  return out;
+}
+
 /** Smooth 3D value noise for displacing rocks and foliage. @param {number} x @param {number} y @param {number} z @param {number} seed */
 function noise3(x, y, z, seed) {
   const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
@@ -488,6 +655,32 @@ function noise3(x, y, z, seed) {
   ) * 2 - 1;
 }
 
+/**
+ * Fractal (fBm) value noise, about [-1, 1]. @param {number} x @param {number} y @param {number} z
+ * @param {number} seed @param {number} [oct]
+ */
+export function fbm3(x, y, z, seed, oct = 4) {
+  let sum = 0;
+  let amp = 0.5;
+  let f = 1;
+  for (let o = 0; o < oct; o++) {
+    sum += noise3(x * f, y * f, z * f, seed + o * 31) * amp;
+    f *= 2.03;
+    amp *= 0.5;
+  }
+  return sum;
+}
+
+/**
+ * Normal displacement by fBm: freq in cycles per metre, amp in metres; ridge > 0 sharpens
+ * the noise into chips and cracks; stretch elongates it along Y (bark, hair strands).
+ * @param {number} freq @param {number} amp @param {number} seed @param {{ridge?: number, stretch?: number}} [o]
+ */
+const rough = (freq, amp, seed, o = {}) => (/** @type {number} */ x, /** @type {number} */ y, /** @type {number} */ z) => {
+  const n = fbm3(x * freq, (y * freq) / (o.stretch ?? 1), z * freq, seed);
+  return amp * (o.ridge ? n - o.ridge * Math.abs(n) * 2 : n);
+};
+
 /** Lumpy displacement for organic shapes. @param {number} freq @param {number} amp @param {number} seed */
 const lumpy = (freq, amp, seed) => (/** @type {number} */ x, /** @type {number} */ y, /** @type {number} */ z) =>
   1 + amp * (noise3(x * freq, y * freq, z * freq, seed) * 0.7 + noise3(x * freq * 2.3, y * freq * 2.3, z * freq * 2.3, seed + 9) * 0.3);
@@ -502,17 +695,18 @@ const lumpy = (freq, amp, seed) => (/** @type {number} */ x, /** @type {number} 
  * @param {number} depth @param {(m: Mesh, tip: number[], size: number) => void} leaf @param {Mat} barkM
  */
 function branch(m, rnd, p, dir, len, r, depth, leaf, barkM) {
-  let cur = p;
+  // One continuous curved, tapering limb (a spline sweep), then its children.
+  /** @type {number[][]} */
+  const pts = [p];
   let d = dir;
-  const segs = depth > 1 ? 3 : 2;
-  for (let s = 0; s < segs; s++) {
-    d = norm([d[0] + (rnd() - 0.5) * 0.35, d[1] + 0.06, d[2] + (rnd() - 0.5) * 0.35]);
-    const nx = [cur[0] + d[0] * (len / segs), cur[1] + d[1] * (len / segs), cur[2] + d[2] * (len / segs)];
-    const r1 = r * (1 - (0.45 * (s + 1)) / segs);
-    m.sw = Math.max(0, (cur[1] - 1.2) * 0.04);
-    m.tube(cur, nx, r * (1 - (0.45 * s) / segs), r1, depth > 1 ? 7 : 5, barkM);
-    cur = nx;
+  let cur = p;
+  for (let s = 0; s < 3; s++) {
+    d = norm([d[0] + (rnd() - 0.5) * 0.4, d[1] + 0.08, d[2] + (rnd() - 0.5) * 0.4]);
+    cur = [cur[0] + (d[0] * len) / 3, cur[1] + (d[1] * len) / 3, cur[2] + (d[2] * len) / 3];
+    pts.push(cur);
   }
+  m.sw = Math.max(0, (p[1] - 1.2) * 0.04);
+  m.sweep(pts, [r, r * 0.8, r * 0.62, r * 0.45], depth > 1 ? 10 : 6, barkM, { disp: rough(14, r * 0.12, Math.floor(rnd() * 999), { stretch: 3 }), sub: depth > 1 ? 3 : 2 });
   m.sw = 0;
   if (depth <= 0) {
     leaf(m, cur, len);
@@ -542,7 +736,8 @@ function leafCluster(m, rnd, tip, size, mats) {
     const d = k ? s * (0.6 + rnd() * 0.5) : 0;
     const tone = 0.75 + rnd() * 0.35;
     m.push().at(tip[0] + Math.cos(a) * d, tip[1] + 0.1 + (rnd() - 0.3) * s * 0.7, tip[2] + Math.sin(a) * d, rnd() * 6);
-    m.ellipsoid(s, s * 0.68, s * 0.9, 8, 5, shade(mats[k % mats.length], tone), { wob: lumpy(4.2, 0.42, Math.floor(rnd() * 999)), grad: [0.45, 1.05] });
+    // Leaf masses: broken, clumped silhouettes from ridged fBm, darker underneath.
+    m.ellipsoid(s, s * 0.68, s * 0.9, 10, 7, shade(mats[k % mats.length], tone), { disp: rough(3.2, s * 0.32, Math.floor(rnd() * 999), { ridge: 0.25 }), grad: [0.45, 1.05] });
     m.pop();
   }
   m.sw = 0;
@@ -557,22 +752,25 @@ function buildLeyTree(m, rnd) {
     // Faint ley blossoms caught in the canopy.
     if (rnd() < 0.5) mm.push().at(tip[0], tip[1] - 0.2, tip[2]).sphere(0.05, 6, M.leySoft).pop();
   };
-  // Flared, root-buttressed trunk.
-  m.lathe([[0.42, -0.2], [0.34, 0.05], [0.24, 0.4], [0.21, 1.2], [0.19, 1.9]], 9, M.bark, { wob: lumpy(3, 0.12, 5) });
-  for (let k = 0; k < 4; k++) {
-    const a = (k / 4) * Math.PI * 2 + rnd();
-    m.tube([Math.cos(a) * 0.15, 0.25, Math.sin(a) * 0.15], [Math.cos(a) * 0.6, -0.1, Math.sin(a) * 0.6], 0.11, 0.04, 5, M.barkDark);
+  // A leaning, flared trunk with vertical bark ridges, and buttress roots into the ground.
+  const lean = [(rnd() - 0.5) * 0.2, (rnd() - 0.5) * 0.2];
+  m.sweep([[0, -0.25, 0], [lean[0] * 0.3, 0.6, lean[1] * 0.3], [lean[0], 1.4, lean[1]], [lean[0] * 0.6, 2.0, lean[1] * 0.6]], [[0.4, 0.38], [0.25, 0.24], [0.2, 0.19], [0.17, 0.16]], 24, M.bark,
+    { disp: rough(9, 0.03, 5, { stretch: 4, ridge: 0.3 }), cap1: true });
+  for (let k = 0; k < 5; k++) {
+    const a = (k / 5) * Math.PI * 2 + rnd();
+    m.sweep([[Math.cos(a) * 0.12, 0.45, Math.sin(a) * 0.12], [Math.cos(a) * 0.38, 0.05, Math.sin(a) * 0.38], [Math.cos(a) * 0.7, -0.12, Math.sin(a) * 0.7]], [0.12, 0.08, 0.03], 8, M.barkDark,
+      { disp: rough(12, 0.012, k + 9, { stretch: 3 }), cap1: true, sub: 2 });
   }
   for (let k = 0; k < 3; k++) {
     const a = (k / 3) * Math.PI * 2 + rnd() * 0.8;
-    branch(m, rnd, [0, 1.8, 0], norm([Math.cos(a) * 0.6, 1, Math.sin(a) * 0.6]), 1.5 + rnd() * 0.4, 0.15, 1, leaf, M.bark);
+    branch(m, rnd, [lean[0] * 0.8, 1.8, lean[1] * 0.8], norm([Math.cos(a) * 0.6, 1, Math.sin(a) * 0.6]), 1.5 + rnd() * 0.4, 0.15, 1, leaf, M.bark);
   }
-  leaf(m, [0, 3.6, 0], 1.4);
+  leaf(m, [lean[0] * 0.6, 3.6, lean[1] * 0.6], 1.4);
 }
 
 /** Conifer, ~5.6 m. @param {Mesh} m @param {() => number} rnd */
 function buildPine(m, rnd) {
-  m.lathe([[0.26, -0.1], [0.2, 0.3], [0.08, 5.4]], 8, M.barkDark, { wob: lumpy(4, 0.1, 3) });
+  m.sweep([[0, -0.15, 0], [0, 1.5, 0.02], [0.02, 3.5, 0], [0, 5.4, 0]], [0.27, 0.19, 0.13, 0.04], 16, M.barkDark, { disp: rough(10, 0.015, 3, { stretch: 4, ridge: 0.3 }), cap1: true });
   m.sw = 0;
   // Ragged, drooping skirts of needles, darker toward their undersides and slightly askew.
   for (let k = 0; k < 7; k++) {
@@ -580,8 +778,8 @@ function buildPine(m, rnd) {
     const r = (1.6 - k * 0.2) * (0.85 + rnd() * 0.3);
     m.swY = 0.06;
     m.push().at(0, y, 0, rnd() * 6, (rnd() - 0.5) * 0.12, (rnd() - 0.5) * 0.12);
-    m.lathe([[0.15, 0.1], [r * 0.85, -0.25], [r, -0.12], [r * 0.5, 0.45], [0.05, 0.95]], 11,
-      shade(M.pine, 0.8 + rnd() * 0.3), { wob: lumpy(3.4, 0.38, k * 7 + Math.floor(rnd() * 99)), grad: [0.4, 1.05] });
+    m.lathe([[0.15, 0.1], [r * 0.85, -0.25], [r, -0.12], [r * 0.5, 0.45], [0.05, 0.95]], 20,
+      shade(M.pine, 0.8 + rnd() * 0.3), { disp: rough(4.5, r * 0.11, k * 7 + Math.floor(rnd() * 99), { ridge: 0.4 }), grad: [0.4, 1.05] });
     m.pop();
   }
   m.swY = 0;
@@ -589,11 +787,11 @@ function buildPine(m, rnd) {
 
 /** Bare, twisted dead tree, ~3.8 m. @param {Mesh} m @param {() => number} rnd */
 function buildDeadTree(m, rnd) {
-  m.lathe([[0.3, -0.15], [0.22, 0.25], [0.15, 1.6]], 8, M.barkPale, { wob: lumpy(3.5, 0.18, 11) });
+  m.sweep([[0, -0.2, 0], [0.06, 0.6, 0.02], [-0.03, 1.2, 0.05], [0.02, 1.6, 0]], [0.3, 0.22, 0.17, 0.14], 18, M.barkPale, { disp: rough(8, 0.025, 11, { stretch: 3, ridge: 0.45 }), cap1: true });
   const none = () => {};
   for (let k = 0; k < 3; k++) {
     const a = (k / 3) * Math.PI * 2 + rnd();
-    branch(m, rnd, [0, 1.5, 0], norm([Math.cos(a) * 0.8, 1, Math.sin(a) * 0.8]), 1.2 + rnd() * 0.5, 0.11, 2, none, M.barkPale);
+    branch(m, rnd, [0.02, 1.5, 0], norm([Math.cos(a) * 0.8, 1, Math.sin(a) * 0.8]), 1.2 + rnd() * 0.5, 0.11, 2, none, M.barkPale);
   }
 }
 
@@ -628,29 +826,31 @@ function buildReeds(m, rnd) {
 /** Weathered boulder, ~0.8 m tall. @param {Mesh} m @param {() => number} rnd */
 function buildRock(m, rnd) {
   const s = Math.floor(rnd() * 999);
-  m.push().at(0, 0.15, 0, rnd() * 6);
-  m.ellipsoid(0.75, 0.55, 0.62, 12, 8, M.stoneCliff, { wob: lumpy(1.8, 0.32, s) });
+  m.push().at(0, 0.12, 0, rnd() * 6);
+  // Weathered, fractured boulder: ridged fBm gives chipped faces and cracks.
+  m.ellipsoid(0.75, 0.55, 0.62, 22, 14, M.stoneCliff, { disp: rough(1.7, 0.2, s, { ridge: 0.35 }) });
   m.pop();
-  if (rnd() < 0.7) m.push().at(0.6, 0.02, 0.35, rnd() * 6).ellipsoid(0.26, 0.17, 0.22, 8, 5, M.stoneCliff, { wob: lumpy(3, 0.3, s + 1) }).pop();
+  if (rnd() < 0.7) m.push().at(0.62, 0.0, 0.35, rnd() * 6).ellipsoid(0.26, 0.17, 0.22, 12, 8, M.stoneCliff, { disp: rough(4, 0.07, s + 1, { ridge: 0.35 }) }).pop();
 }
 
 /** Broken colonnade fragment, ~2.6 m. @param {Mesh} m @param {() => number} rnd */
 function buildRuin(m, rnd) {
+  const seed = Math.floor(rnd() * 99);
+  const chips = rough(7, 0.022, seed, { ridge: 0.6 });
   m.push().at(0, 0.12, 0).box(0.55, 0.12, 0.55, 0.05, M.stone).pop();
   const h = 1.5 + rnd() * 0.9;
-  const seed = Math.floor(rnd() * 99);
-  // Fluted shaft: a wobbly-topped lathe whose fluting comes from a cosine wobble.
+  // Fluted shaft with a broken, jagged top and chipped, weathered faces.
   m.push().at(0, 0.24, 0);
-  m.lathe([[0.38, 0], [0.33, 0.1], [0.29, 0.25], [0.27, h * 0.5], [0.25, h]], 16, M.stone,
-    { wob: (x, y, z) => 1 + Math.cos(Math.atan2(z, x) * 12) * 0.035 + (y > h * 0.85 ? (noise3(x * 6, 0, z * 6, seed) - 0.5) * 0.3 : 0), cap1: true });
+  m.lathe([[0.38, 0], [0.33, 0.1], [0.29, 0.25], [0.27, h * 0.5], [0.25, h * 0.92], [0.18, h]], 28, M.stone,
+    { wob: (x, y, z) => 1 + Math.cos(Math.atan2(z, x) * 12) * 0.035 + (y > h * 0.85 ? (noise3(x * 6, 0, z * 6, seed) - 0.5) * 0.3 : 0), cap1: true, disp: chips });
   m.pop();
   // Fallen capital and a drum.
   m.push().at(0.9, 0.17, 0.4, rnd() * 3, 0.2);
   m.box(0.36, 0.08, 0.36, 0.03, M.stone);
-  m.at(0, -0.17, 0).lathe([[0.22, 0], [0.34, 0.09], [0.3, 0.1]], 14, M.stone);
+  m.at(0, -0.17, 0).lathe([[0.22, 0], [0.34, 0.09], [0.3, 0.1]], 24, M.stone, { disp: chips });
   m.pop();
-  m.push().at(-0.8, 0.25, -0.3, rnd() * 3, 0, 1.45).lathe([[0.27, -0.3], [0.27, 0.3]], 14, M.stone, { cap0: true, cap1: true }).pop();
-  for (let k = 0; k < 4; k++) m.push().at((rnd() - 0.5) * 2, 0.05, (rnd() - 0.5) * 2, rnd() * 6).box(0.1 + rnd() * 0.1, 0.07, 0.09, 0.03, M.stone).pop();
+  m.push().at(-0.8, 0.25, -0.3, rnd() * 3, 0, 1.45).lathe([[0.27, -0.3], [0.28, -0.1], [0.27, 0.3]], 24, M.stone, { cap0: true, cap1: true, disp: chips }).pop();
+  for (let k = 0; k < 4; k++) m.push().at((rnd() - 0.5) * 2, 0.05, (rnd() - 0.5) * 2, rnd() * 6).ellipsoid(0.13, 0.08, 0.1, 10, 6, M.stone, { disp: rough(9, 0.025, seed + k, { ridge: 0.5 }) }).pop();
 }
 
 /** Market stall with a striped awning, ~2.4 m. @param {Mesh} m @param {() => number} rnd */
@@ -1091,10 +1291,149 @@ export function nominalSize(name) {
  * far builds the same shape at half tessellation for distant LOD).
  * @param {string} name @param {number} [variant] @param {boolean} [far] @returns {Mesh}
  */
+/** Cosine-weighted hemisphere directions (around +Z) for the AO bake, elevation >= ~15 degrees. */
+const AO_DIRS = (() => {
+  /** @type {number[][]} */
+  const d = [];
+  const n = 16;
+  for (let k = 0; k < n; k++) {
+    const r = Math.sqrt(0.06 + (0.84 * (k + 0.5)) / n);
+    const a = k * 2.39996;
+    d.push([Math.cos(a) * r, Math.sin(a) * r, Math.sqrt(1 - r * r)]);
+  }
+  return d;
+})();
+
+/**
+ * Finish a model: area-weighted smooth normals across coincident vertices (faces more than
+ * `crease` degrees apart keep a hard edge), then per-vertex ambient occlusion baked into the
+ * vertex colour by marching rays through a voxelized copy of the mesh. `offsets` gives each
+ * bone's rest-pose origin so skinned parts are lit as one assembled body.
+ * @param {Mesh} m @param {{crease?: number, ao?: number, offsets?: number[][]}} [o] @returns {Mesh}
+ */
+export function finalize(m, o = {}) {
+  const d = m.data;
+  const n = m.count;
+  if (n < 3) return m;
+  const off = o.offsets;
+  const P = new Float32Array(n * 3);
+  for (let v = 0; v < n; v++) {
+    const b = off ? off[d[v * VERT + 16] | 0] ?? [0, 0, 0] : [0, 0, 0];
+    for (let k = 0; k < 3; k++) P[v * 3 + k] = d[v * VERT + k] + b[k];
+  }
+  // Face normals (unnormalized = area weighted), oriented to agree with the authored normals.
+  const F = Math.floor(n / 3);
+  const fn = new Float32Array(F * 3);
+  for (let f = 0; f < F; f++) {
+    const a = f * 3;
+    const e1 = [P[(a + 1) * 3] - P[a * 3], P[(a + 1) * 3 + 1] - P[a * 3 + 1], P[(a + 1) * 3 + 2] - P[a * 3 + 2]];
+    const e2 = [P[(a + 2) * 3] - P[a * 3], P[(a + 2) * 3 + 1] - P[a * 3 + 1], P[(a + 2) * 3 + 2] - P[a * 3 + 2]];
+    const c = cross(e1, e2);
+    let s = 0;
+    for (let k = 0; k < 3; k++) for (let i = 0; i < 3; i++) s += c[i] * d[(a + k) * VERT + 3 + i];
+    const sg = s < 0 ? -1 : 1;
+    for (let i = 0; i < 3; i++) fn[f * 3 + i] = c[i] * sg;
+  }
+  /** @type {Map<string, number[]>} position (and bone) -> faces touching it */
+  const groups = new Map();
+  const keyOf = (/** @type {number} */ v) => `${Math.round(P[v * 3] * 4000)},${Math.round(P[v * 3 + 1] * 4000)},${Math.round(P[v * 3 + 2] * 4000)},${d[v * VERT + 16]}`;
+  for (let v = 0; v < F * 3; v++) {
+    const k = keyOf(v);
+    const g = groups.get(k);
+    if (g) g.push(Math.floor(v / 3));
+    else groups.set(k, [Math.floor(v / 3)]);
+  }
+  const cosC = Math.cos(((o.crease ?? 80) * Math.PI) / 180);
+  const unit = (/** @type {number} */ f) => {
+    const l = Math.hypot(fn[f * 3], fn[f * 3 + 1], fn[f * 3 + 2]) || 1;
+    return [fn[f * 3] / l, fn[f * 3 + 1] / l, fn[f * 3 + 2] / l];
+  };
+  const N = new Float32Array(n * 3);
+  for (let v = 0; v < F * 3; v++) {
+    const own = unit(Math.floor(v / 3));
+    // Authored flat shading (crystals, blades) keeps its facet normal.
+    if (Math.abs(own[0] * d[v * VERT + 3] + own[1] * d[v * VERT + 4] + own[2] * d[v * VERT + 5]) > 0.9999) {
+      for (let i = 0; i < 3; i++) N[v * 3 + i] = d[v * VERT + 3 + i];
+      continue;
+    }
+    const acc = [0, 0, 0];
+    for (const f of /** @type {number[]} */ (groups.get(keyOf(v)))) {
+      const u = unit(f);
+      if (u[0] * own[0] + u[1] * own[1] + u[2] * own[2] < cosC) continue;
+      for (let i = 0; i < 3; i++) acc[i] += fn[f * 3 + i];
+    }
+    const l = Math.hypot(acc[0], acc[1], acc[2]);
+    for (let i = 0; i < 3; i++) N[v * 3 + i] = l > 1e-12 ? acc[i] / l : d[v * VERT + 3 + i];
+    for (let i = 0; i < 3; i++) d[v * VERT + 3 + i] = N[v * 3 + i];
+  }
+  const strength = o.ao ?? 0.85;
+  if (strength <= 0) return m;
+  // Voxelize: sample every triangle densely enough to leave no gaps.
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (let v = 0; v < n; v++) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], P[v * 3 + k]); hi[k] = Math.max(hi[k], P[v * 3 + k]); }
+  const size = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 1e-3);
+  const vox = Math.max(size / 56, 0.004);
+  const dim = [0, 1, 2].map((k) => Math.ceil((hi[k] - lo[k]) / vox) + 3);
+  const grid = new Uint8Array(dim[0] * dim[1] * dim[2]);
+  const cell = (/** @type {number} */ x, /** @type {number} */ y, /** @type {number} */ z) => {
+    const i = Math.floor((x - lo[0]) / vox) + 1;
+    const j = Math.floor((y - lo[1]) / vox) + 1;
+    const k = Math.floor((z - lo[2]) / vox) + 1;
+    if (i < 0 || j < 0 || k < 0 || i >= dim[0] || j >= dim[1] || k >= dim[2]) return -1;
+    return (k * dim[1] + j) * dim[0] + i;
+  };
+  for (let f = 0; f < F; f++) {
+    const a = f * 9;
+    const A = [P[a], P[a + 1], P[a + 2]];
+    const Bp = [P[a + 3], P[a + 4], P[a + 5]];
+    const C = [P[a + 6], P[a + 7], P[a + 8]];
+    const edge = Math.max(Math.hypot(Bp[0] - A[0], Bp[1] - A[1], Bp[2] - A[2]), Math.hypot(C[0] - A[0], C[1] - A[1], C[2] - A[2]), Math.hypot(C[0] - Bp[0], C[1] - Bp[1], C[2] - Bp[2]));
+    const steps = Math.min(64, Math.ceil(edge / (vox * 0.6)));
+    for (let i = 0; i <= steps; i++) {
+      for (let j = 0; j <= steps - i; j++) {
+        const u = i / steps;
+        const w = j / steps;
+        const c = cell(A[0] + (Bp[0] - A[0]) * u + (C[0] - A[0]) * w, A[1] + (Bp[1] - A[1]) * u + (C[1] - A[1]) * w, A[2] + (Bp[2] - A[2]) * u + (C[2] - A[2]) * w);
+        if (c >= 0) grid[c] = 1;
+      }
+    }
+  }
+  const reach = Math.min(size * 0.4, 0.9);
+  const steps = Math.max(4, Math.ceil(reach / vox));
+  /** @type {Map<string, number>} AO per welded position, so shared vertices agree */
+  const done = new Map();
+  for (let v = 0; v < n; v++) {
+    if (d[v * VERT + 14] > 0 && d[v * VERT + 11] < 0) continue; // emissive plain-colour parts stay bright
+    const k = keyOf(v) + `|${Math.round(N[v * 3] * 8)},${Math.round(N[v * 3 + 1] * 8)},${Math.round(N[v * 3 + 2] * 8)}`;
+    let ao = done.get(k);
+    if (ao === undefined) {
+      const nz = [N[v * 3], N[v * 3 + 1], N[v * 3 + 2]];
+      const tx = norm(cross(Math.abs(nz[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0], nz));
+      const ty = cross(nz, tx);
+      let occ = 0;
+      for (const r of AO_DIRS) {
+        const dir = [tx[0] * r[0] + ty[0] * r[1] + nz[0] * r[2], tx[1] * r[0] + ty[1] * r[1] + nz[1] * r[2], tx[2] * r[0] + ty[2] * r[1] + nz[2] * r[2]];
+        for (let s = 2; s <= steps; s++) {
+          const t = s * vox;
+          const c = cell(P[v * 3] + dir[0] * t, P[v * 3 + 1] + dir[1] * t, P[v * 3 + 2] + dir[2] * t);
+          if (c >= 0 && grid[c]) { occ += 1 - t / (reach + vox); break; }
+        }
+      }
+      ao = Math.max(0.3, 1 - (strength * occ) / AO_DIRS.length);
+      done.set(k, ao);
+    }
+    const layered = d[v * VERT + 11] >= 0;
+    const kk = layered ? ao : Math.pow(ao, 1 / 2.2);
+    for (let i = 8; i < 11; i++) d[v * VERT + i] *= kk;
+  }
+  return m;
+}
+
 export function buildModel(name, variant = 0, far = false) {
   const m = new Mesh(2048);
   const rnd = mulberry32(1000 + variant * 7919 + name.length * 31);
-  DETAIL = far ? 0.5 : 1;
+  DETAIL = far ? 0.35 : 1;
   try {
     if (PROPS[name]) PROPS[name].b(m, rnd);
     else if (name.startsWith('rune_')) buildRune(m, name.slice(5));
@@ -1102,7 +1441,8 @@ export function buildModel(name, variant = 0, far = false) {
   } finally {
     DETAIL = 1;
   }
-  return m;
+  // Distant LODs keep normals but skip the AO bake; they are small on screen.
+  return finalize(m, { ao: far ? 0 : 0.85 });
 }
 
 /** Props whose shape varies per instance (seeded); everything else has one shape. */
@@ -1263,128 +1603,235 @@ const B = { HIPS: 0, TORSO: 1, HEAD: 2, UARM_L: 3, FARM_L: 4, UARM_R: 5, FARM_R:
 /** @param {Mesh} m @param {Outfit} o */
 function buildHuman(m, o) {
   const glove = o.glove ?? o.skin;
-  // Hips and belt.
+  const cloth = o.top;
+  // --- Hips: pelvis, tunic skirt or robe, belt and pouch, apron.
   m.bone = B.HIPS;
-  m.push().at(0, 0.02, 0).box(0.16, 0.1, 0.1, 0.06, o.legs).pop();
-  m.push().at(0, 0.09, 0).lathe([[0.175, -0.025], [0.178, 0.025]], 14, M.leatherDark, { sz: 0.66 }).pop();
-  m.push().at(0.1, 0.09, 0.11).box(0.03, 0.025, 0.008, 0.005, M.brass).pop();
-  if (o.robe) m.lathe([[0.31, -0.86], [0.26, -0.45], [0.2, -0.1], [0.18, 0.1]], 16, o.robe, { sz: 0.78 });
-  if (o.apron) m.push().at(0, -0.22, 0.13, 0, 0.05).box(0.15, 0.3, 0.01, 0.008, o.apron).pop();
-  // Torso: tapered lathe with an oval section, neck.
+  m.loft([[-0.14, 0.09, 0.075], [-0.08, 0.145, 0.1], [0, 0.163, 0.108], [0.07, 0.155, 0.103]], 24, o.legs, { cap0: true, smooth: 1 });
+  if (o.robe) m.loft([[-0.88, 0.3, 0.23], [-0.55, 0.25, 0.19], [-0.2, 0.2, 0.148], [0.08, 0.17, 0.115]], 28, o.robe, { folds: [11, 0.024], smooth: 1 });
+  else m.loft([[-0.24, 0.198, 0.15], [-0.08, 0.18, 0.128], [0.07, 0.167, 0.113]], 26, cloth, { folds: [9, 0.014], smooth: 1 });
+  m.loft([[0.045, 0.172, 0.118], [0.095, 0.17, 0.116]], 26, M.leatherDark);
+  m.push().at(0, 0.07, 0.118).box(0.026, 0.02, 0.006, 0.004, M.brass).pop();
+  m.push().at(-0.135, 0.0, 0.085, -0.55).box(0.032, 0.042, 0.02, 0.012, M.leather).at(0, 0.035, 0.004).box(0.034, 0.012, 0.022, 0.006, M.leatherDark).pop();
+  if (o.apron) m.loft([[-0.46, 0.205, 0.165], [-0.12, 0.188, 0.14], [0.05, 0.176, 0.122]], 14, o.apron, { a0: Math.PI / 2 - 0.95, a1: Math.PI / 2 + 0.95, folds: [5, 0.004] });
+
+  // --- Torso: one smooth lofted body from waist to neck, tapered waist and sloped shoulders.
   m.bone = B.TORSO;
-  m.lathe([[0.15, -0.02], [0.16, 0.12], [0.18, 0.3], [0.19, 0.4], [0.15, 0.49], [0.06, 0.54]], 16, o.top, { sz: 0.64, cap0: true });
-  m.tube([0, 0.48, 0.005], [0, 0.6, 0.01], 0.05, 0.048, 8, o.skin);
-  if (o.apron) m.push().at(0, 0.18, 0.11, 0, -0.1).box(0.13, 0.14, 0.008, 0.006, o.apron).pop();
+  m.loft([[-0.07, 0.158, 0.106], [0.04, 0.148, 0.098], [0.15, 0.16, 0.106], [0.27, 0.182, 0.12], [0.37, 0.19, 0.123], [0.44, 0.188, 0.115], [0.49, 0.14, 0.092], [0.535, 0.07, 0.06]], 26, cloth, { smooth: 1 });
+  m.sweep([[0, 0.49, 0], [0, 0.56, 0.008], [0, 0.63, 0.014]], [0.056, 0.05, 0.047], 16, o.skin);
+  m.loft([[0.495, 0.088, 0.076], [0.53, 0.074, 0.066]], 20, cloth);
+  if (o.apron) m.loft([[0.04, 0.156, 0.112], [0.32, 0.19, 0.13]], 12, o.apron, { a0: Math.PI / 2 - 0.7, a1: Math.PI / 2 + 0.7 });
   if (o.armor) {
-    m.lathe([[0.17, 0.12], [0.2, 0.28], [0.205, 0.4], [0.16, 0.48]], 16, o.armor, { sz: 0.7 });
-    for (const x of [-0.2, 0.2]) m.push().at(x, 0.48, 0, 0, 0, x > 0 ? -0.35 : 0.35).ellipsoid(0.1, 0.07, 0.1, 10, 5, o.armor, { v0: 0 }).pop();
+    m.loft([[0.1, 0.17, 0.12], [0.25, 0.194, 0.135], [0.37, 0.202, 0.136], [0.45, 0.186, 0.123]], 26, o.armor, { disp: rough(9, 0.0025, 7) });
+    for (let k = 0; k < 14; k++) {
+      const a = (k / 14) * Math.PI * 2;
+      m.push().at(Math.cos(a) * 0.171, 0.11, Math.sin(a) * 0.121).sphere(0.005, 5, M.brass).pop();
+    }
   }
-  // Head.
+  if (o.hat === 'hood') m.loft([[0.34, 0.235, 0.155], [0.45, 0.185, 0.123], [0.52, 0.1, 0.086]], 24, o.hatM ?? cloth, { folds: [8, 0.012], smooth: 1 });
+
+  // --- Head: lofted skull with jaw and chin, then features.
   m.bone = B.HEAD;
-  m.push().at(0, 0.14, 0.01);
-  m.ellipsoid(0.092, 0.115, 0.102, 14, 9, o.skin);
-  m.push().at(0, -0.005, 0.1).ellipsoid(0.018, 0.028, 0.02, 6, 4, o.skin).pop();
-  for (const x of [-0.035, 0.035]) m.push().at(x, 0.02, 0.088).ellipsoid(0.014, 0.01, 0.008, 6, 4, mat('#1c1a18', 0.3)).pop();
-  if (o.beard) m.push().at(0, -0.07, 0.06).ellipsoid(0.075, 0.07, 0.06, 10, 6, o.hair ?? M.barkDark, { wob: lumpy(30, 0.1, 4) }).pop();
-  if (o.hair && o.hat !== 'hood' && o.hat !== 'helm') m.push().at(0, 0.03, -0.018).ellipsoid(0.1, 0.1, 0.105, 12, 7, o.hair, { v0: -0.2 }).pop();
-  const hatM = o.hatM ?? o.top;
-  if (o.hat === 'cap') m.push().at(0, 0.075, -0.005).ellipsoid(0.105, 0.06, 0.112, 12, 5, hatM, { v0: 0 }).at(0, 0, 0.09).box(0.07, 0.008, 0.04, 0.006, hatM).pop();
-  else if (o.hat === 'scarf') m.push().at(0, 0.04, -0.01).ellipsoid(0.103, 0.1, 0.11, 12, 6, hatM, { v0: -0.1, a0: Math.PI / 2 + 0.9, a1: Math.PI * 2.5 - 0.9 }).pop();
-  else if (o.hat === 'hood') {
-    m.push().at(0, -0.02, -0.02).ellipsoid(0.135, 0.165, 0.14, 14, 8, hatM, { v0: -0.6, a0: Math.PI / 2 + 0.75, a1: Math.PI * 2.5 - 0.75 }).pop();
+  m.loft([[0.03, 0.03, 0.04, 0, 0.03], [0.055, 0.062, 0.07, 0, 0.012], [0.1, 0.079, 0.088, 0, 0.002], [0.15, 0.086, 0.097, 0, -0.004], [0.2, 0.083, 0.093, 0, -0.01], [0.24, 0.063, 0.074, 0, -0.012], [0.265, 0.012, 0.014, 0, -0.012]], 24, o.skin, { cap0: true, cap1: true, smooth: 2 });
+  m.sweep([[0, 0.152, 0.088], [0, 0.128, 0.104], [0, 0.118, 0.106]], [0.009, 0.013, 0.012], 10, o.skin, { cap1: true });
+  m.push().at(0, 0.166, 0.078).ellipsoid(0.07, 0.012, 0.022, 14, 5, o.skin).pop();
+  for (const x of [-0.033, 0.033]) {
+    m.push().at(x, 0.147, 0.079).ellipsoid(0.013, 0.008, 0.007, 8, 5, mat('#1d1916', 0.25)).pop();
+    m.push().at(x, 0.153, 0.08).ellipsoid(0.016, 0.005, 0.008, 8, 4, o.skin, { v0: 0 }).pop();
+    m.push().at(x * 2.65, 0.135, -0.006, 0, 0, x > 0 ? 0.2 : -0.2).ellipsoid(0.012, 0.026, 0.018, 8, 5, o.skin).pop();
+  }
+  m.push().at(0, 0.082, 0.086).ellipsoid(0.026, 0.007, 0.01, 10, 4, shade(o.skin, 0.8)).pop();
+  if (o.beard) m.loft([[0.02, 0.03, 0.035, 0, 0.055], [0.06, 0.07, 0.07, 0, 0.03], [0.11, 0.084, 0.09, 0, 0.012]], 18, o.hair ?? M.barkDark, { a0: -0.35, a1: Math.PI + 0.35, disp: rough(55, 0.004, 4, { stretch: 3 }) });
+  const hairOk = o.hair && o.hat !== 'hood' && o.hat !== 'helm';
+  if (hairOk && o.hair) {
+    // Crown and back of the head, with strands from stretched noise.
+    m.loft([[0.17, 0.09, 0.1, 0, -0.008], [0.22, 0.087, 0.097, 0, -0.012], [0.255, 0.066, 0.077, 0, -0.014], [0.28, 0.02, 0.02, 0, -0.014]], 22, o.hair, { cap1: true, disp: rough(45, 0.003, 8, { stretch: 4 }) });
+    m.loft([[0.07, 0.083, 0.094, 0, -0.012], [0.13, 0.09, 0.101, 0, -0.012], [0.18, 0.09, 0.1, 0, -0.01]], 18, o.hair, { a0: Math.PI + 0.25, a1: Math.PI * 2 - 0.25, disp: rough(45, 0.003, 9, { stretch: 4 }) });
+  }
+  const hatM = o.hatM ?? cloth;
+  if (o.hat === 'cap') {
+    m.loft([[0.19, 0.094, 0.104, 0, -0.006], [0.24, 0.088, 0.098, 0, -0.01], [0.28, 0.05, 0.058, 0, -0.012], [0.29, 0.01, 0.01, 0, -0.012]], 22, hatM, { cap1: true, smooth: 1 });
+    m.push().at(0, 0.195, 0.1, 0, -0.15).box(0.072, 0.006, 0.04, 0.005, hatM).pop();
+  } else if (o.hat === 'scarf') {
+    m.loft([[0.1, 0.092, 0.104, 0, -0.008], [0.2, 0.095, 0.104, 0, -0.012], [0.26, 0.07, 0.08, 0, -0.014], [0.285, 0.02, 0.02, 0, -0.014]], 22, hatM, { a0: Math.PI / 2 + 0.85, a1: Math.PI * 2.5 - 0.85, folds: [6, 0.004] });
+    m.sweep([[0, 0.12, -0.1], [0, 0.07, -0.13], [0.02, 0.0, -0.12]], [0.018, 0.022, 0.012], 10, hatM, { cap1: true });
+  } else if (o.hat === 'hood') {
+    m.loft([[0.0, 0.14, 0.15, 0, -0.02], [0.1, 0.13, 0.14, 0, -0.02], [0.2, 0.118, 0.13, 0, -0.025], [0.28, 0.08, 0.1, 0, -0.035], [0.31, 0.02, 0.03, 0, -0.045]], 24, hatM,
+      { a0: Math.PI / 2 + 0.72, a1: Math.PI * 2.5 - 0.72, folds: [5, 0.008], smooth: 1 });
   } else if (o.hat === 'helm') {
-    m.push().at(0, 0.03, 0).lathe([[0.115, -0.04], [0.12, 0.02], [0.1, 0.08], [0.06, 0.12], [0, 0.135]], 14, o.armor ?? M.steel).pop();
-    m.push().at(0, -0.01, 0).lathe([[0.17, 0], [0.12, 0.02]], 14, o.armor ?? M.steel).pop();
+    m.loft([[0.12, 0.103, 0.112], [0.18, 0.1, 0.11], [0.24, 0.08, 0.09], [0.285, 0.035, 0.04], [0.3, 0.005, 0.005]], 24, o.armor ?? M.steel, { cap1: true, disp: rough(14, 0.0015, 3) });
+    m.loft([[0.115, 0.15, 0.158], [0.13, 0.112, 0.12]], 24, o.armor ?? M.steel);
+    m.push().at(0, 0.13, 0.112).box(0.008, 0.04, 0.006, 0.004, o.armor ?? M.steel).pop();
   } else if (o.hat === 'goggles') {
-    m.push().at(0, 0.06, 0).lathe([[0.104, -0.012], [0.104, 0.012]], 14, M.leatherDark, { sz: 1.08 }).pop();
-    for (const x of [-0.04, 0.04]) m.push().at(x, 0.065, 0.1, 0, Math.PI / 2).lathe([[0.03, -0.012], [0.03, 0.012]], 10, M.brass, { cap1: true }).at(0, 0.014, 0).lathe([[0.022, 0], [0, 0.001]], 10, o.glow ?? M.ley).pop();
+    m.loft([[0.185, 0.093, 0.104, 0, -0.004], [0.205, 0.093, 0.104, 0, -0.006]], 24, M.leatherDark);
+    for (const x of [-0.035, 0.035]) {
+      m.push().at(x, 0.197, 0.096, 0, Math.PI / 2).lathe([[0.024, -0.012], [0.027, 0], [0.024, 0.012]], 14, M.brass, { cap1: true }).pop();
+      m.push().at(x, 0.197, 0.11, 0, Math.PI / 2).lathe([[0.018, 0], [0, 0.002]], 12, o.glow ?? M.ley).pop();
+    }
   }
-  m.pop();
-  // Arms: sleeve, shoulder, forearm, hand.
-  for (const [ub, fb] of [[B.UARM_L, B.FARM_L], [B.UARM_R, B.FARM_R]]) {
+
+  // --- Arms: deltoid, continuous tapered sleeves, articulated hands.
+  for (const [ub, fb, side] of [[B.UARM_L, B.FARM_L, 1], [B.UARM_R, B.FARM_R, -1]]) {
     m.bone = ub;
-    m.sphere(0.068, 9, o.top);
-    m.lathe([[0.052, -0.3], [0.058, -0.2], [0.065, -0.05], [0.06, 0.02]], 10, o.top);
+    m.push().at(-side * 0.014, -0.03, 0).ellipsoid(0.064, 0.072, 0.066, 18, 12, cloth).pop();
+    m.sweep([[0, -0.02, 0], [0, -0.14, 0.004], [0, -0.29, 0]], [[0.057, 0.061], [0.052, 0.056], [0.041, 0.043]], 22, cloth, { smooth: 1, cap0: true });
+    if (o.armor) {
+      // Riveted, layered pauldron.
+      m.push().at(side * 0.012, -0.005, 0, 0, 0, side * -0.3);
+      m.loft([[-0.06, 0.098, 0.096], [0.0, 0.094, 0.09], [0.04, 0.07, 0.07], [0.065, 0.02, 0.02]], 22, o.armor, { cap1: true, disp: rough(11, 0.002, 5) });
+      m.loft([[-0.09, 0.09, 0.086], [-0.055, 0.092, 0.088]], 22, o.armor);
+      for (let k = 0; k < 6; k++) {
+        const a = (k / 6) * Math.PI * 2;
+        m.push().at(Math.cos(a) * 0.094, -0.055, Math.sin(a) * 0.09).sphere(0.006, 6, M.brass).pop();
+      }
+      m.pop();
+    }
     m.bone = fb;
-    m.lathe([[0.04, -0.25], [0.048, -0.15], [0.054, 0.0], [0.05, 0.03]], 10, fb === B.FARM_R && o.glow && o.hat === 'goggles' ? M.brassTex : o.top);
-    m.push().at(0, -0.3, 0.005).ellipsoid(0.038, 0.055, 0.03, 8, 6, glove).pop();
+    m.sweep([[0, 0.03, 0], [0, -0.09, 0.01], [0, -0.24, 0.005], [0, -0.27, 0.004]], [[0.044, 0.047], [0.046, 0.043], [0.031, 0.027], [0.03, 0.026]], 22, fb === B.FARM_R && o.glow && o.hat === 'goggles' ? M.brassTex : cloth, { smooth: 1 });
+    if (o.glove) m.loft([[-0.27, 0.034, 0.03], [-0.2, 0.038, 0.034]], 16, glove);
+    m.push().at(0, -0.272, 0.004);
+    hand(m, glove, fb === B.FARM_R && o.held ? 0.95 : 0.35, side);
+    m.pop();
   }
-  // Legs and boots.
+
+  // --- Legs: thigh, calf and booted foot with sole.
   for (const [tb, sb] of [[B.THIGH_L, B.SHIN_L], [B.THIGH_R, B.SHIN_R]]) {
     m.bone = tb;
-    m.lathe([[0.065, -0.44], [0.08, -0.25], [0.088, -0.05], [0.085, 0.03]], 10, o.legs);
+    m.sweep([[0, 0.03, 0], [0, -0.2, 0.012], [0, -0.44, 0.004]], [[0.088, 0.09], [0.07, 0.073], [0.05, 0.052]], 22, o.legs, { smooth: 1 });
     m.bone = sb;
-    m.lathe([[0.05, -0.42], [0.06, -0.3], [0.064, -0.15], [0.062, 0.02]], 10, o.legs);
-    m.lathe([[0.058, -0.445], [0.062, -0.3], [0.067, -0.2]], 10, o.boots, { cap0: true });
-    m.push().at(0, -0.45, 0.04).box(0.05, 0.03, 0.105, 0.025, o.boots).pop();
+    m.sweep([[0, 0.02, 0.004], [0, -0.13, -0.012], [0, -0.3, -0.004], [0, -0.42, 0]], [[0.052, 0.056], [0.055, 0.062], [0.042, 0.046], [0.036, 0.04]], 22, o.legs, { smooth: 1 });
+    m.loft([[-0.445, 0.05, 0.058], [-0.3, 0.057, 0.062], [-0.2, 0.062, 0.066], [-0.17, 0.068, 0.072]], 22, o.boots, { smooth: 1 });
+    m.sweep([[0, -0.432, -0.03], [0, -0.448, 0.03], [0, -0.456, 0.1], [0, -0.46, 0.138]], [[0.04, 0.05], [0.036, 0.052], [0.028, 0.046], [0.016, 0.03]], 20, o.boots, { cap0: true, cap1: true, smooth: 1 });
+    m.push().at(0, -0.469, 0.045).box(0.05, 0.007, 0.105, 0.005, M.leatherDark).pop();
   }
-  // Cloak.
+
+  // --- Cloak with gravity folds, hanging from a collar at the shoulders.
   if (o.cloak) {
     m.bone = B.CLOAK;
-    m.lathe([[0.33, -1.02], [0.27, -0.6], [0.2, -0.15], [0.14, 0.02]], 12, o.cloak, { sz: 0.7, a0: Math.PI + 0.25, a1: Math.PI * 2 - 0.25 });
+    m.loft([[-1.02, 0.36, 0.2, 0, 0.04], [-0.6, 0.3, 0.17, 0, 0.05], [-0.2, 0.24, 0.14, 0, 0.06], [0.0, 0.205, 0.12, 0, 0.07]], 26, o.cloak,
+      { a0: Math.PI + 0.12, a1: Math.PI * 2 - 0.12, folds: [7, 0.03], smooth: 1 });
+    m.loft([[-0.02, 0.21, 0.13, 0, 0.07], [0.03, 0.17, 0.12, 0, 0.08]], 24, o.cloak, { a0: Math.PI - 0.3, a1: Math.PI * 2 + 0.3 });
   }
-  // Held item in the right hand: built pointing forward along +Z from the grip.
+
+  // --- Held item, gripped in the right fist and pointing forward (+Z).
   m.bone = B.FARM_R;
-  m.push().at(0, -0.31, 0.01);
+  m.push().at(0.012, -0.33, 0.01);
   if (o.held === 'spear') {
-    m.tube([0, -0.9, 0], [0, 1.0, 0], 0.018, 0.016, 6, M.wood);
-    m.push().at(0, 1.08, 0).lathe([[0.02, -0.08], [0.04, 0], [0, 0.2]], 4, M.steel, { flat: true }).pop();
+    m.sweep([[0, -0.9, 0], [0, 0, 0], [0, 1.0, 0]], [0.016, 0.018, 0.015], 10, M.wood, { cap0: true });
+    m.push().at(0, 1.02, 0).loft([[-0.03, 0.02, 0.012], [0.04, 0.035, 0.006], [0.2, 0.001, 0.001]], 6, M.steel, { flat: true }).pop();
   } else if (o.held === 'sword') {
     m.push().at(0, 0, 0, 0, Math.PI / 2);
-    m.tube([0, -0.08, 0], [0, 0.05, 0], 0.018, 0.018, 6, M.leather);
-    m.push().at(0, 0.05, 0).box(0.09, 0.012, 0.02, 0.006, M.brass).pop();
-    m.push().at(0, 0.42, 0).box(0.025, 0.37, 0.006, 0.004, M.steel).pop();
+    m.sweep([[0, -0.08, 0], [0, 0.05, 0]], [0.016, 0.017], 10, M.leather);
+    m.push().at(0, -0.095, 0).sphere(0.022, 10, M.brass).pop();
+    m.push().at(0, 0.06, 0).box(0.085, 0.012, 0.02, 0.008, M.brass).pop();
+    m.push().at(0, 0.07, 0).loft([[0, 0.022, 0.005], [0.55, 0.018, 0.004], [0.72, 0.001, 0.001]], 4, M.steel, { flat: true }).pop();
     m.pop();
   } else if (o.held === 'staff') {
-    m.tube([0, -0.75, 0], [0, 0.95, 0], 0.02, 0.025, 6, M.woodDark);
-    m.push().at(0, 1.02, 0).sphere(0.05, 8, o.glow ?? M.ley).pop();
+    m.sweep([[0, -0.75, 0], [0.02, 0.1, 0], [0, 0.95, 0]], [0.02, 0.022, 0.026], 10, M.woodDark, { cap0: true, disp: rough(30, 0.002, 6, { stretch: 3 }) });
+    m.push().at(0, 1.02, 0).sphere(0.05, 12, o.glow ?? M.ley).pop();
   } else if (o.held === 'hammer') {
-    m.push().at(0, 0, 0, 0, Math.PI / 2).tube([0, -0.05, 0], [0, 0.45, 0], 0.016, 0.016, 6, M.wood).at(0, 0.48, 0).box(0.06, 0.04, 0.04, 0.012, M.iron).pop();
+    m.push().at(0, 0, 0, 0, Math.PI / 2);
+    m.sweep([[0, -0.06, 0], [0, 0.46, 0]], [0.016, 0.014], 10, M.wood, { cap0: true });
+    m.push().at(0, 0.49, 0).box(0.065, 0.042, 0.042, 0.014, M.iron).pop();
+    m.pop();
   } else if (o.held === 'book') {
-    m.push().at(0, 0.02, 0.05, 0, -0.6).box(0.09, 0.02, 0.12, 0.01, mat('#4e2a3a', 0.7)).pop();
+    m.push().at(-0.03, 0.02, 0.05, 0, -0.6).box(0.09, 0.022, 0.12, 0.01, mat('#4e2a3a', 0.7)).at(0.004, 0, 0).box(0.082, 0.017, 0.114, 0.004, M.parchment).pop();
   }
   m.pop();
+}
+
+/**
+ * Articulated hand hanging from the wrist (origin): lofted palm, four finger sweeps that curl
+ * toward the palm, and an opposed thumb. side is +1 for the left hand (+X) and -1 for the right.
+ * @param {Mesh} m @param {Mat} mt @param {number} curl 0 open .. 1 fist @param {number} side
+ */
+function hand(m, mt, curl, side) {
+  const inward = -side;
+  m.loft([[-0.085, 0.016, 0.038, inward * 0.004, 0], [-0.04, 0.019, 0.041], [0.0, 0.017, 0.032]], 16, mt, { cap0: true, smooth: 1 });
+  [-0.026, -0.009, 0.008, 0.025].forEach((z, k) => {
+    const len = [0.042, 0.048, 0.046, 0.036][k];
+    /** @type {number[][]} */
+    const pts = [[0, -0.08, z]];
+    let ang = 0;
+    let p = pts[0];
+    for (let j = 0; j < 3; j++) {
+      ang += curl * 0.65;
+      const l = len * [0.42, 0.33, 0.25][j];
+      p = [p[0] + inward * Math.sin(ang) * l, p[1] - Math.cos(ang) * l, z];
+      pts.push(p);
+    }
+    m.sweep(pts, [0.0095, 0.0088, 0.008, 0.0068], 8, mt, { cap1: true, sub: 2 });
+  });
+  m.sweep([[inward * 0.006, -0.025, 0.032], [inward * 0.012, -0.05, 0.05], [inward * (0.016 + curl * 0.012), -0.07, 0.054 - curl * 0.012]], [0.012, 0.0105, 0.0085], 8, mt, { cap1: true, sub: 2 });
 }
 
 /** @param {Mesh} m Clockwork Sentinel (and Brass Mite): brass automaton with blade arms and a ley visor. */
 function buildSentinel(m) {
   const plate = M.brassTex;
+  const dent = rough(12, 0.0025, 13);
   m.bone = B.HIPS;
-  m.lathe([[0.12, -0.08], [0.17, 0], [0.16, 0.1], [0.1, 0.14]], 12, M.iron, { cap0: true });
-  m.push().at(0, 0.02, 0, 0, Math.PI / 2).torus(0.11, 0.025, 12, 4, M.brass).pop();
-  m.bone = B.TORSO;
-  m.lathe([[0.1, 0], [0.18, 0.12], [0.23, 0.3], [0.22, 0.44], [0.12, 0.54]], 14, plate, { sz: 0.75, cap0: true, cap1: true });
-  m.push().at(0, 0.3, 0.16, 0, Math.PI / 2).lathe([[0.07, 0], [0.07, 0.03]], 12, M.iron, { cap1: true }).at(0, 0.031, 0).lathe([[0.05, 0], [0, 0.01]], 12, M.ley).pop();
-  for (let k = 0; k < 10; k++) {
-    const a = (k / 10) * Math.PI * 2;
-    m.push().at(Math.cos(a) * 0.235, 0.36, Math.sin(a) * 0.235 * 0.75).sphere(0.012, 5, M.brass).pop();
+  m.loft([[-0.1, 0.1, 0.085], [-0.03, 0.16, 0.12], [0.06, 0.15, 0.11], [0.12, 0.1, 0.08]], 24, M.iron, { cap0: true, smooth: 1 });
+  m.push().at(0, 0.02, 0).torus(0.165, 0.022, 28, 8, M.brass).pop();
+  for (let k = 0; k < 16; k++) {
+    const a = (k / 16) * Math.PI * 2;
+    m.push().at(Math.cos(a) * 0.19, 0.02, Math.sin(a) * 0.19, -a).box(0.012, 0.014, 0.01, 0.004, M.brass).pop();
   }
-  for (const x of [-0.22, 0.22]) m.push().at(x, 0.46, 0, 0, 0, x > 0 ? -0.4 : 0.4).ellipsoid(0.12, 0.08, 0.11, 10, 5, plate, { v0: 0 }).pop();
-  m.bone = B.HEAD;
-  m.push().at(0, 0.1, 0);
-  m.lathe([[0.1, -0.06], [0.11, 0.02], [0.09, 0.1], [0.04, 0.15], [0, 0.16]], 12, plate);
-  m.push().at(0, 0.02, 0.095).box(0.075, 0.014, 0.02, 0.008, M.ley).pop();
-  m.push().at(0, 0.17, 0).lathe([[0.012, 0], [0.008, 0.12]], 5, M.iron).at(0, 0.12, 0).sphere(0.02, 6, M.leySoft).pop();
+  m.bone = B.TORSO;
+  // Barrel chest with riveted bands and a recessed ley core.
+  m.loft([[0.0, 0.11, 0.085], [0.12, 0.18, 0.135], [0.28, 0.232, 0.17], [0.4, 0.222, 0.16], [0.5, 0.14, 0.11], [0.55, 0.08, 0.07]], 28, plate, { cap0: true, cap1: true, smooth: 1, disp: dent });
+  for (const [y, rx, rz] of [[0.18, 0.205, 0.153], [0.36, 0.232, 0.17]]) {
+    m.loft([[y - 0.012, rx, rz], [y + 0.012, rx, rz]], 28, M.bronze);
+    for (let k = 0; k < 18; k++) {
+      const a = (k / 18) * Math.PI * 2;
+      m.push().at(Math.cos(a) * rx, y, Math.sin(a) * rz).sphere(0.0065, 6, M.brass).pop();
+    }
+  }
+  m.push().at(0, 0.29, 0.165, 0, Math.PI / 2);
+  m.lathe([[0.075, -0.01], [0.08, 0.012], [0.062, 0.03]], 22, M.iron, { cap1: true });
+  m.at(0, 0.02, 0).lathe([[0.052, 0], [0.035, 0.012], [0, 0.016]], 18, M.ley);
   m.pop();
+  for (let k = 0; k < 4; k++) m.push().at(-0.06 + k * 0.04, 0.33, -0.165).box(0.008, 0.08, 0.02, 0.005, M.iron).pop();
+  for (const x of [-0.22, 0.22]) {
+    m.push().at(x, 0.47, 0, 0, 0, x > 0 ? -0.45 : 0.45);
+    m.loft([[-0.05, 0.12, 0.11], [0.0, 0.115, 0.105], [0.05, 0.08, 0.075], [0.075, 0.02, 0.02]], 22, plate, { cap1: true, disp: dent });
+    for (let k = 0; k < 7; k++) {
+      const a = (k / 7) * Math.PI * 2;
+      m.push().at(Math.cos(a) * 0.112, -0.035, Math.sin(a) * 0.1).sphere(0.006, 6, M.brass).pop();
+    }
+    m.pop();
+  }
+  m.sweep([[0.03, 0.5, 0], [0.03, 0.62, 0.02]], [0.012, 0.012], 8, M.iron);
+  m.sweep([[-0.03, 0.5, 0], [-0.03, 0.62, 0.02]], [0.012, 0.012], 8, M.iron);
+  m.bone = B.HEAD;
+  // Tall sculpted helm with a ley visor slit and a crest.
+  m.loft([[0.02, 0.06, 0.07, 0, 0.01], [0.07, 0.095, 0.105, 0, 0.012], [0.15, 0.102, 0.11], [0.22, 0.088, 0.096, 0, -0.008], [0.27, 0.05, 0.06, 0, -0.012], [0.29, 0.005, 0.005, 0, -0.012]], 26, plate, { cap0: true, cap1: true, smooth: 1, disp: dent });
+  m.push().at(0, 0.13, 0.102).loft([[-0.012, 0.075, 0.02], [0.012, 0.075, 0.02]], 18, M.ley, { a0: Math.PI / 2 - 0.9, a1: Math.PI / 2 + 0.9 }).pop();
+  m.push().at(0, 0.24, -0.02).box(0.008, 0.06, 0.09, 0.006, M.bronze).pop();
+  m.sweep([[0, 0.28, -0.01], [0, 0.36, -0.03], [0, 0.4, -0.05]], [0.006, 0.005, 0.003], 6, M.iron);
+  m.push().at(0, 0.405, -0.052).sphere(0.016, 10, M.leySoft).pop();
   for (const [ub, fb] of [[B.UARM_L, B.FARM_L], [B.UARM_R, B.FARM_R]]) {
     m.bone = ub;
-    m.sphere(0.07, 8, M.brass);
-    m.tube([0, 0, 0], [0, -0.28, 0], 0.035, 0.03, 7, M.iron);
-    m.tube([0.045, -0.02, 0], [0.045, -0.25, 0], 0.012, 0.012, 5, M.steel);
+    m.sphere(0.072, 14, M.brass);
+    m.sweep([[0, 0, 0], [0, -0.28, 0]], [0.026, 0.024], 12, M.steel);
+    m.loft([[-0.25, 0.04, 0.042], [-0.12, 0.052, 0.054], [-0.03, 0.055, 0.058]], 18, plate, { a0: -0.3, a1: Math.PI + 0.3, disp: dent });
     m.bone = fb;
-    m.sphere(0.05, 7, M.brass);
-    m.lathe([[0.035, -0.25], [0.05, -0.12], [0.045, 0]], 8, plate);
-    // Forearm blade sweeping forward from the wrist.
-    m.push().at(0, -0.27, 0.05, 0, 0.35).box(0.008, 0.035, 0.32, 0.006, M.steel).at(0, -0.03, 0).box(0.01, 0.004, 0.31, 0.003, M.ley).pop();
+    m.sphere(0.052, 12, M.brass);
+    m.loft([[-0.27, 0.034, 0.04], [-0.12, 0.05, 0.056], [0.0, 0.046, 0.05]], 20, plate, { smooth: 1, disp: dent });
+    // Beveled forearm blade with a glowing ley edge.
+    m.push().at(0, -0.28, 0.05, 0, 0.35 + Math.PI / 2);
+    m.loft([[-0.02, 0.008, 0.035], [0.15, 0.007, 0.03], [0.33, 0.001, 0.004]], 4, M.steel, { flat: true });
+    m.pop();
+    m.push().at(0, -0.255, 0.07, 0, 0.35 + Math.PI / 2).box(0.002, 0.15, 0.003, 0.001, M.ley).pop();
   }
   for (const [tb, sb] of [[B.THIGH_L, B.SHIN_L], [B.THIGH_R, B.SHIN_R]]) {
     m.bone = tb;
-    m.sphere(0.06, 7, M.brass);
-    m.lathe([[0.04, -0.44], [0.065, -0.2], [0.07, 0]], 8, plate);
+    m.sphere(0.065, 12, M.brass);
+    m.loft([[-0.44, 0.045, 0.05], [-0.2, 0.07, 0.075], [0.0, 0.075, 0.08]], 20, plate, { smooth: 1, disp: dent });
     m.bone = sb;
-    m.sphere(0.05, 7, M.brass);
-    m.tube([0, 0, 0], [0, -0.42, 0], 0.035, 0.03, 7, M.iron);
-    m.push().at(0, -0.46, 0.05).box(0.06, 0.025, 0.12, 0.02, plate).pop();
+    m.sphere(0.055, 12, M.brass);
+    m.sweep([[0.03, 0, 0], [0.03, -0.42, 0]], [0.014, 0.014], 8, M.steel);
+    m.sweep([[-0.03, 0, 0], [-0.03, -0.42, 0]], [0.014, 0.014], 8, M.steel);
+    m.loft([[-0.4, 0.04, 0.045, 0, 0.01], [-0.22, 0.05, 0.055, 0, 0.012]], 18, plate, { a0: 0, a1: Math.PI, disp: dent });
+    for (const a of [-0.45, 0, 0.45]) m.sweep([[0, -0.44, 0.01], [Math.sin(a) * 0.06, -0.462, 0.07], [Math.sin(a) * 0.09, -0.47, 0.13]], [0.02, 0.016, 0.006], 8, plate, { cap1: true });
   }
 }
 
@@ -1392,30 +1839,34 @@ function buildSentinel(m) {
 function buildGolem(m) {
   const rock = M.basalt;
   const seam = mat('#ff8a3a', 0.6, 0, 3.5);
-  const w = lumpy(3, 0.12, 21);
+  /** @param {number} seed @param {number} [amp] */
+  const crag = (seed, amp = 0.05) => rough(2.6, amp * 1.9, seed, { ridge: 0.45 });
   m.bone = B.HIPS;
-  m.push().at(0, 0, 0).box(0.32, 0.18, 0.22, 0.1, rock).pop();
+  m.ellipsoid(0.34, 0.2, 0.25, 20, 12, rock, { disp: crag(21, 0.035), smooth: 1 });
   m.bone = B.TORSO;
-  m.push().at(0, 0.42, 0).ellipsoid(0.5, 0.42, 0.34, 14, 9, rock, { wob: w }).pop();
-  for (let k = 0; k < 3; k++) m.push().at(-0.12 + k * 0.12, 0.45 + (k % 2) * 0.1, 0.33, 0, 0, 0.6 * (k - 1)).box(0.012, 0.13, 0.01, 0.005, seam).pop();
-  for (const x of [-0.45, 0.45]) m.push().at(x, 0.68, 0).ellipsoid(0.24, 0.2, 0.24, 10, 7, rock, { wob: lumpy(4, 0.18, x > 0 ? 3 : 4) }).pop();
+  m.push().at(0, 0.42, 0).ellipsoid(0.52, 0.44, 0.36, 26, 16, rock, { disp: crag(22), smooth: 1 }).pop();
+  for (const x of [-0.46, 0.46]) m.push().at(x, 0.7, 0).ellipsoid(0.25, 0.22, 0.25, 18, 12, rock, { disp: crag(x > 0 ? 3 : 4, 0.04) }).pop();
+  // Glowing ember seams running over the chest.
+  for (const [a, b] of [[[-0.15, 0.25, 0.33], [-0.05, 0.55, 0.37]], [[0.12, 0.2, 0.34], [0.05, 0.45, 0.37]], [[0.0, 0.6, 0.36], [0.2, 0.7, 0.32]]]) {
+    m.sweep([a, [(a[0] + b[0]) / 2 + 0.03, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2 + 0.012], b], [0.012, 0.014, 0.008], 8, seam, { cap0: true, cap1: true });
+  }
   m.bone = B.HEAD;
-  m.push().at(0, 0.12, 0.06).box(0.15, 0.13, 0.15, 0.06, rock).pop();
-  for (const x of [-0.06, 0.06]) m.push().at(x, 0.14, 0.205).ellipsoid(0.025, 0.014, 0.01, 6, 4, seam).pop();
+  m.push().at(0, 0.12, 0.06).ellipsoid(0.17, 0.15, 0.17, 18, 12, rock, { disp: crag(23, 0.03) }).pop();
+  for (const x of [-0.06, 0.06]) m.push().at(x, 0.14, 0.215).ellipsoid(0.026, 0.014, 0.012, 8, 5, seam).pop();
   for (const [ub, fb] of [[B.UARM_L, B.FARM_L], [B.UARM_R, B.FARM_R]]) {
     m.bone = ub;
-    m.push().at(0, -0.2, 0).ellipsoid(0.16, 0.26, 0.16, 10, 7, rock, { wob: lumpy(5, 0.15, ub) }).pop();
+    m.push().at(0, -0.2, 0).ellipsoid(0.17, 0.27, 0.17, 18, 12, rock, { disp: crag(ub, 0.04), smooth: 1 }).pop();
     m.bone = fb;
-    m.push().at(0, -0.18, 0).ellipsoid(0.15, 0.25, 0.15, 10, 7, rock, { wob: lumpy(5, 0.15, fb) }).pop();
-    m.push().at(0, -0.48, 0.02).box(0.17, 0.15, 0.17, 0.08, rock).pop();
-    m.push().at(0, -0.3, 0.15).box(0.08, 0.01, 0.006, 0.004, seam).pop();
+    m.push().at(0, -0.18, 0).ellipsoid(0.16, 0.26, 0.16, 18, 12, rock, { disp: crag(fb, 0.04), smooth: 1 }).pop();
+    m.push().at(0, -0.49, 0.02).ellipsoid(0.19, 0.17, 0.19, 16, 10, rock, { disp: crag(fb + 40, 0.045) }).pop();
+    m.sweep([[0, -0.15, 0.15], [0.02, -0.3, 0.16], [0, -0.4, 0.15]], [0.009, 0.011, 0.007], 6, seam, { cap0: true, cap1: true });
   }
   for (const [tb, sb] of [[B.THIGH_L, B.SHIN_L], [B.THIGH_R, B.SHIN_R]]) {
     m.bone = tb;
-    m.push().at(0, -0.2, 0).ellipsoid(0.15, 0.25, 0.15, 9, 6, rock, { wob: lumpy(5, 0.12, tb) }).pop();
+    m.push().at(0, -0.2, 0).ellipsoid(0.16, 0.26, 0.16, 16, 10, rock, { disp: crag(tb, 0.035), smooth: 1 }).pop();
     m.bone = sb;
-    m.push().at(0, -0.22, 0).box(0.14, 0.22, 0.15, 0.07, rock).pop();
-    m.push().at(0, -0.44, 0.06).box(0.17, 0.06, 0.22, 0.05, rock).pop();
+    m.push().at(0, -0.22, 0).ellipsoid(0.15, 0.24, 0.16, 16, 10, rock, { disp: crag(sb, 0.035), smooth: 1 }).pop();
+    m.push().at(0, -0.44, 0.06).ellipsoid(0.18, 0.07, 0.24, 16, 8, rock, { disp: crag(sb + 50, 0.03) }).pop();
   }
 }
 
@@ -1469,11 +1920,38 @@ const OUTFITS = {
 /** @type {Map<string, Rig>} */
 const rigCache = new Map();
 
-/** Rig for a character sprite base name (NPC sprite or enemy kind). @param {string} name @returns {Rig} */
-export function getRig(name) {
-  let r = rigCache.get(name);
+/** Every character rig, for warming the caches before play. */
+export const RIG_NAMES = ['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard', 'master', 'keeper', 'captain', 'archivist', 'sentinel', 'golem', 'wisp'];
+
+/** Rig for a character sprite base name (NPC sprite or enemy kind); far builds the low-poly LOD. @param {string} name @param {boolean} [far] @returns {Rig} */
+export function getRig(name, far = false) {
+  const key = far ? `${name}~` : name;
+  let r = rigCache.get(key);
   if (r) return r;
-  const m = new Mesh(8192);
+  const m = new Mesh(16384);
+  DETAIL = far ? 0.45 : 1;
+  try {
+    r = buildRig(name, m);
+  } finally {
+    DETAIL = 1;
+  }
+  // Bake AO with every bone at its rest offset, so armpits, chins and cloak folds darken
+  // where the assembled body actually crowds them.
+  /** @type {number[][]} */
+  const offsets = [];
+  r.parent.forEach((p, i) => {
+    const o = p < 0 ? [0, 0, 0] : offsets[p];
+    offsets.push([o[0] + r.pivot[i][0], o[1] + r.pivot[i][1], o[2] + r.pivot[i][2]]);
+  });
+  finalize(m, { offsets, ao: far ? 0 : 0.9 });
+  rigCache.set(key, r);
+  return r;
+}
+
+/** @param {string} name @param {Mesh} m @returns {Rig} */
+function buildRig(name, m) {
+  /** @type {Rig} */
+  let r;
   if (name === 'wisp') {
     buildWisp(m);
     r = { parent: WISP_PARENT, pivot: WISP_PIVOT, mesh: m, kind: 'wisp', scale: 1 };
@@ -1487,7 +1965,6 @@ export function getRig(name) {
     buildHuman(m, OUTFITS[name] ?? OUTFITS.folk_a);
     r = { parent: HUMAN_PARENT, pivot: HUMAN_PIVOT, mesh: m, kind: 'human', scale: 1 };
   }
-  rigCache.set(name, r);
   return r;
 }
 
@@ -1541,24 +2018,41 @@ export function poseRig(rig, a, x, y, z, out) {
     const s = Math.sin(ph);
     const breath = Math.sin(t * 1.7);
     const stride = golem ? 0.38 : 0.55;
-    oy[0] = -Math.abs(Math.cos(ph)) * 0.035 * w + breath * 0.004;
-    ry[0] = s * 0.08 * w;
+    // Idle weight shift: the body settles onto one leg (that hip rises, the other knee softens)
+    // and drifts slowly to the other; the torso counter-tilts and twists, the chest breathes.
+    const idle = 1 - w;
+    const lean = Math.sin(t * 0.21) * (golem ? 0.4 : 1);
+    const twist = Math.sin(t * 0.17);
+    oy[0] = -Math.abs(Math.cos(ph)) * 0.035 * w + breath * 0.004 - 0.008 * idle * Math.abs(lean);
+    ox[0] = -lean * 0.022 * idle;
+    rz[0] = -lean * 0.05 * idle + 0.035 * s * w;
+    // Walking: hips swing with the stride and the shoulders counter-rotate against them.
+    ry[0] = s * 0.13 * w + twist * 0.04 * idle;
     rx[1] = 0.05 * w + breath * 0.015;
-    ry[1] = -s * 0.12 * w;
-    sc[1] = 1 + breath * 0.008;
-    ry[2] = Math.sin(t * 0.37) * 0.25 * (1 - w) * (golem ? 0.3 : 1);
+    ry[1] = -s * 0.22 * w - twist * 0.06 * idle;
+    rz[1] = lean * 0.055 * idle - 0.03 * s * w;
+    sc[1] = 1 + breath * 0.012;
+    ry[2] = Math.sin(t * 0.37) * 0.25 * idle * (golem ? 0.3 : 1) + s * 0.09 * w;
     rx[2] = Math.sin(t * 0.23) * 0.05 - 0.03 * w;
-    rx[B.THIGH_L] = -s * stride * w;
-    rx[B.THIGH_R] = s * stride * w;
-    rx[B.SHIN_L] = w * (0.1 + 0.75 * Math.max(0, Math.sin(ph + 1.7)));
-    rx[B.SHIN_R] = w * (0.1 + 0.75 * Math.max(0, Math.sin(ph + 1.7 + Math.PI)));
-    rx[B.UARM_L] = s * 0.45 * w + breath * 0.02;
-    rx[B.UARM_R] = -s * 0.45 * w - breath * 0.02;
-    rz[B.UARM_L] = golem ? 0.18 : 0.08;
-    rz[B.UARM_R] = golem ? -0.18 : -0.08;
-    rx[B.FARM_L] = -0.18 - 0.25 * w * Math.max(0, -s);
-    rx[B.FARM_R] = -0.18 - 0.25 * w * Math.max(0, s);
-    rx[B.CLOAK] = 0.08 + w * 0.25 + Math.sin(t * 1.3) * 0.03;
+    rz[2] = -lean * 0.03 * idle;
+    const onLeft = Math.max(0, -lean);
+    const onRight = Math.max(0, lean);
+    rx[B.THIGH_L] = -s * stride * w - 0.06 * idle * onRight;
+    rx[B.THIGH_R] = s * stride * w - 0.06 * idle * onLeft;
+    rz[B.THIGH_L] = lean * 0.05 * idle;
+    rz[B.THIGH_R] = lean * 0.05 * idle;
+    rx[B.SHIN_L] = w * (0.1 + 0.75 * Math.max(0, Math.sin(ph + 1.7))) + 0.16 * idle * onRight;
+    rx[B.SHIN_R] = w * (0.1 + 0.75 * Math.max(0, Math.sin(ph + 1.7 + Math.PI))) + 0.16 * idle * onLeft;
+    const sway = Math.sin(t * 0.9) * 0.025 * idle;
+    rx[B.UARM_L] = s * 0.45 * w + breath * 0.02 + sway;
+    rx[B.UARM_R] = -s * 0.45 * w - breath * 0.02 - sway;
+    rz[B.UARM_L] = (golem ? 0.18 : 0.08) + lean * 0.03 * idle;
+    rz[B.UARM_R] = (golem ? -0.18 : -0.08) + lean * 0.03 * idle;
+    rx[B.FARM_L] = -0.18 - 0.25 * w * Math.max(0, -s) - 0.06 * idle;
+    rx[B.FARM_R] = -0.18 - 0.25 * w * Math.max(0, s) - 0.06 * idle;
+    // Cloak: trails behind with the stride, flutters, and lags the hips' swing.
+    rx[B.CLOAK] = 0.08 + w * 0.3 + Math.sin(t * 1.3) * 0.03 + Math.sin(t * 2.3 + 1) * 0.015 * (0.5 + w);
+    rz[B.CLOAK] = -ry[0] * 0.6 + Math.sin(t * 0.9) * 0.03;
     // Actions.
     const k = ease(clamp01(a.k));
     if (a.act === 'talk') {
@@ -1639,65 +2133,78 @@ export function poseRig(rig, a, x, y, z, out) {
 // First-person viewmodels (camera space: +X right, +Y up, -Z forward)
 // ---------------------------------------------------------------------------
 
-/** @param {Mesh} m @param {Mat} sleeve */
-function arm(m, sleeve) {
-  m.tube([0.06, -0.12, 0.32], [0, 0, 0.02], 0.055, 0.045, 10, sleeve);
-  m.push().at(0.065, -0.135, 0.34).torus(0.05, 0.012, 12, 4, M.brass).pop();
-  m.push().at(0, 0.0, 0.0).ellipsoid(0.05, 0.045, 0.06, 10, 7, M.leatherDark).pop();
+/**
+ * Viewmodel forearm: sleeve, brass bracer and gloved hand.
+ * @param {Mesh} m @param {Mat} sleeve @param {number} [curl] 0 open .. 1 fist @param {boolean} [left]
+ */
+function arm(m, sleeve, curl = 0.95, left = false) {
+  // Sleeve and cuff from the wrist back past the camera, then the gloved hand (fingers forward).
+  const sx = left ? -1 : 1;
+  m.sweep([[0, 0.0, 0.02], [sx * 0.025, -0.06, 0.18], [sx * 0.07, -0.15, 0.4]], [[0.036, 0.034], [0.046, 0.044], [0.058, 0.056]], 20, sleeve, { cap0: true, smooth: 1 });
+  m.loft([[-0.012, 0.04, 0.038], [0.025, 0.043, 0.041]], 18, M.brassTex);
+  for (let k = 0; k < 6; k++) {
+    const a = (k / 6) * Math.PI * 2;
+    m.push().at(Math.cos(a) * 0.043, 0.006, Math.sin(a) * 0.041).sphere(0.004, 5, M.brass).pop();
+  }
+  m.push().at(0, 0.0, 0.0, 0, Math.PI / 2);
+  hand(m, M.leatherDark, curl, left ? 1 : -1);
+  m.pop();
 }
 
 /** @type {Record<string, (m: Mesh) => void>} */
 const VIEWMODELS = {
   fork(m) {
-    const sleeve = mat('#5a2a26', 0.85);
-    arm(m, sleeve);
-    m.push().at(0, 0.0, -0.02, 0, -1.2);
-    m.tube([0, -0.06, 0], [0, 0.07, 0], 0.022, 0.022, 8, M.leather);
-    m.push().at(0, -0.08, 0).sphere(0.03, 8, mat('#3fbfd6', 0.15, 0, 1.2)).pop();
-    m.push().at(0, 0.09, 0).lathe([[0.03, -0.02], [0.05, 0.02], [0.045, 0.05]], 10, M.brass).pop();
-    for (const x of [-0.03, 0.03]) {
-      m.push().at(x, 0.36, 0).box(0.011, 0.24, 0.011, 0.006, M.steel).pop();
-      m.push().at(x, 0.36, 0.012).box(0.004, 0.22, 0.002, 0.002, M.ley).pop();
+    arm(m, mat('#5a2a26', 0.85));
+    m.push().at(0.018, -0.008, -0.05, 0, -1.2);
+    // Leather-wrapped grip with ridged turns, a brass guard and a crystal-core pommel.
+    m.sweep([[0, -0.08, 0], [0, 0.07, 0]], [0.019, 0.019], 16, M.leather, { disp: (_x, y) => 0.0018 * Math.sin(y * 260) });
+    m.push().at(0, -0.1, 0).lathe([[0, -0.03], [0.022, -0.012], [0.024, 0.0], [0.018, 0.012]], 16, M.brass).pop();
+    m.push().at(0, -0.118, 0).lathe([[0, -0.03], [0.016, 0], [0, 0.03]], 6, mat('#5fe0ff', 0.12, 0, 2.2), { flat: true }).pop();
+    m.loft([[0.07, 0.03, 0.022], [0.09, 0.05, 0.026], [0.115, 0.052, 0.024], [0.135, 0.046, 0.018]], 20, M.brassTex, { cap0: true, cap1: true, disp: rough(30, 0.0008, 12) });
+    m.loft([[0.1, 0.054, 0.027], [0.106, 0.054, 0.027]], 20, M.bronze);
+    for (const x of [-0.031, 0.031]) {
+      m.push().at(x, 0.13, 0).loft([[0, 0.012, 0.011], [0.18, 0.01, 0.009], [0.33, 0.008, 0.007], [0.36, 0.004, 0.004]], 6, M.steel, { cap0: true, cap1: true, flat: true }).pop();
+      m.push().at(x, 0.15, 0.011).box(0.003, 0.15, 0.0015, 0.001, M.ley).pop();
     }
-    m.push().at(0, 0.13, 0).box(0.045, 0.02, 0.014, 0.008, M.brass).pop();
     m.pop();
   },
   scatter(m) {
     arm(m, mat('#5a2a26', 0.85));
-    m.push().at(-0.02, 0.04, -0.12, 0, -Math.PI / 2);
-    m.lathe([[0.035, -0.12], [0.034, 0.18], [0.05, 0.3], [0.07, 0.36], [0.065, 0.37]], 14, M.brassTex);
-    m.push().at(0, 0.02, 0).lathe([[0.05, -0.05], [0.055, 0.05]], 12, M.iron).pop();
-    m.push().at(0, 0.05, 0.05).lathe([[0, -0.04], [0.03, 0], [0, 0.05]], 6, M.crystal, { flat: true }).pop();
+    m.push().at(-0.02, 0.045, -0.12, 0, -Math.PI / 2);
+    // Beveled brass chamber with banded rings, flared muzzle and a glowing crystal core.
+    m.lathe([[0.03, -0.14], [0.036, -0.12], [0.038, 0.0], [0.034, 0.12], [0.036, 0.2], [0.05, 0.28], [0.072, 0.35], [0.068, 0.365], [0.05, 0.37]], 24, M.brassTex, { disp: rough(25, 0.0008, 3) });
+    for (const y of [-0.1, 0.02, 0.14, 0.24]) m.push().at(0, y, 0).torus(0.039, 0.006, 24, 6, M.bronze).pop();
+    m.push().at(0, 0.0, 0).lathe([[0.055, -0.06], [0.06, -0.04], [0.06, 0.05], [0.055, 0.07]], 24, M.iron).pop();
+    m.push().at(0, 0.0, 0.05).lathe([[0, -0.045], [0.026, 0], [0, 0.055]], 6, M.crystal, { flat: true }).pop();
     m.pop();
-    m.push().at(-0.01, -0.02, 0.06, 0, 0.3).box(0.025, 0.06, 0.12, 0.02, M.wood).pop();
+    m.sweep([[-0.01, -0.01, -0.02], [-0.012, -0.05, 0.06], [-0.01, -0.07, 0.16]], [[0.024, 0.04], [0.026, 0.05], [0.028, 0.055]], 14, M.wood, { cap1: true, disp: rough(40, 0.001, 4, { stretch: 3 }) });
   },
   crossbow(m) {
     arm(m, mat('#5a2a26', 0.85));
-    m.push().at(-0.02, 0.03, -0.2).box(0.03, 0.03, 0.3, 0.012, M.wood).pop();
+    m.sweep([[-0.02, 0.03, 0.02], [-0.02, 0.035, -0.2], [-0.02, 0.04, -0.48]], [[0.022, 0.028], [0.02, 0.026], [0.018, 0.022]], 12, M.wood, { cap0: true, cap1: true });
     for (const s of [-1, 1]) {
-      m.tube([-0.02, 0.05, -0.47], [-0.02 + s * 0.25, 0.05, -0.38], 0.016, 0.009, 6, M.iron);
-      m.tube([-0.02 + s * 0.25, 0.05, -0.38], [-0.02, 0.06, -0.25], 0.003, 0.003, 3, M.rope);
+      m.sweep([[-0.02, 0.05, -0.47], [-0.02 + s * 0.14, 0.05, -0.47], [-0.02 + s * 0.26, 0.05, -0.38]], [0.016, 0.012, 0.007], 10, M.iron, { cap1: true });
+      m.sweep([[-0.02 + s * 0.26, 0.05, -0.38], [-0.02, 0.06, -0.25]], [0.003, 0.003], 4, M.rope);
     }
-    m.tube([-0.02, 0.07, -0.24], [-0.02, 0.07, -0.55], 0.007, 0.007, 4, M.woodLight);
-    m.push().at(-0.02, 0.07, -0.57, 0, -Math.PI / 2).lathe([[0.012, 0], [0, 0.04]], 4, M.steel).pop();
+    m.sweep([[-0.02, 0.07, -0.24], [-0.02, 0.07, -0.55]], [0.007, 0.007], 6, M.woodLight);
+    m.push().at(-0.02, 0.07, -0.57, 0, -Math.PI / 2).lathe([[0.012, 0], [0, 0.04]], 4, M.steel, { flat: true }).pop();
   },
   cast(m) {
-    arm(m, mat('#5a2a26', 0.85));
-    for (let k = 0; k < 4; k++) m.tube([-0.03 + k * 0.02, 0.02, -0.03], [-0.035 + k * 0.025, 0.06, -0.08], 0.011, 0.009, 5, M.leatherDark);
-    m.push().at(0, 0.02, 0.14).lathe([[0.058, -0.06], [0.06, 0.06]], 12, M.brassTex).pop();
-    // Gathered ley in the palm; the renderer brightens it while a spell is cast.
-    m.push().at(0, 0.075, -0.06).sphere(0.028, 10, mat('#7fe9ff', 0.2, 0, 1.6)).pop();
+    arm(m, mat('#5a2a26', 0.85), 0.25);
+    // Gathered ley above the open palm; the renderer brightens it while a spell is cast.
+    m.push().at(0.035, 0.03, -0.07).sphere(0.03, 16, mat('#7fe9ff', 0.2, 0, 1.6)).pop();
   },
   lantern(m) {
-    arm(m, mat('#4a3a2e', 0.85));
-    m.push().at(0, -0.1, -0.02);
-    m.box(0.055, 0.075, 0.055, 0.008, M.glass);
-    for (const [x, z] of [[-0.06, -0.06], [0.06, -0.06], [-0.06, 0.06], [0.06, 0.06]]) m.tube([x, -0.08, z], [x, 0.08, z], 0.006, 0.006, 4, M.brass);
-    m.at(0, 0.09, 0).lathe([[0.075, 0], [0.02, 0.05], [0, 0.06]], 10, M.brass);
-    m.at(0, -0.19, 0).lathe([[0.075, 0], [0.075, 0.015]], 10, M.brass, { cap0: true });
+    arm(m, mat('#4a3a2e', 0.85), 0.95, true);
+    m.push().at(-0.02, -0.12, -0.04);
+    m.sweep([[0, 0.12, 0], [0, 0.16, 0.0]], [0.004, 0.004], 4, M.iron);
+    m.box(0.05, 0.07, 0.05, 0.008, M.glass);
+    for (const [x, z] of [[-0.058, -0.058], [0.058, -0.058], [-0.058, 0.058], [0.058, 0.058]]) m.sweep([[x, -0.08, z], [x, 0.08, z]], [0.005, 0.005], 6, M.brass);
+    m.push().at(0, 0.085, 0).lathe([[0.075, 0], [0.04, 0.03], [0.012, 0.055], [0, 0.06]], 16, M.brass).pop();
+    m.push().at(0, -0.1, 0).lathe([[0.075, 0], [0.075, 0.016]], 16, M.brass, { cap0: true }).pop();
     m.pop();
   },
-};
+}
 
 /** @type {Map<string, Mesh>} */
 const viewCache = new Map();
@@ -1708,6 +2215,7 @@ export function getViewmodel(id) {
   if (!m) {
     m = new Mesh(4096);
     (VIEWMODELS[id] ?? VIEWMODELS.cast)(m);
+    finalize(m, { ao: 0.7 });
     viewCache.set(id, m);
   }
   return m;

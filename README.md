@@ -10,6 +10,34 @@ It takes after the hands-on dungeons and living towns of the classic *Ultima* ga
 
 You wake in the **Sunken Observatory**. Find the Aether Lantern and the Resonance Tuning Fork, and work out the three levers that relight the anchors (or speak a rune in the Gate Hall), so the **Great Astrolabe Gate** opens onto the Shardlands. Up there the ley-lines are drifting. Master Vance of the Artificers' Guild in **Cinderwick** knows why: the Astrolabe's **Resonant Core** lies in the Drowned Shrine, out in the fen.
 
+## Character creation
+
+**New Game** opens the Astrolabe character creation screen. Name your character (or roll a lore-friendly name), switch the Guided Tutorial on or off, then either:
+
+- **Direct Selection:** pick any of six **Professions** and seven **Mythic Birthsigns** from cards. A live summary shows your attributes, skills, vitals, starting gear, boon and power.
+- **Consult the Astrolabe:** answer the Astral Oracle's four moral dilemmas and one birth omen. The Oracle reads a profession and a sign from your answers; accept its reading unchanged for a **Fated Alignment** (+5% skill gain). You can still change either choice afterwards, but the alignment holds only while both match.
+
+| Profession | Bonuses | Starting gear and perk |
+|---|---|---|
+| Ley-Wright | +2 Artificing, +1 Aether Lore | Brass Scrap, Lockpicks, Calibrated Prism Lens (ranged shots bank off one extra wall) |
+| Shard-Warden | +2 Blade & Parry, +1 Wayfaring | Riveted Leather Brigandine, Whetstone Oil; +15 maximum Health |
+| Aether-Seer | +2 Aether Lore, +1 Artificing | Vita Runestone (for Mending), Lore Compendium; +20 maximum Aether |
+| Fen-Strider | +2 Wayfaring, +1 Blade & Parry | Herbal Poultices; Phase Dash costs 15% less, wider map charting |
+| Guild Factor | +2 Wayfaring, +1 Artificing | 75 Aether Shards; 15% better prices, [Mercantile] persuasion with merchants |
+| Cinder-Alchemist | +2 Aether Lore, +1 Wayfaring | Alchemical Mortar (each draught, tonic and oil brews one extra) and four reagents |
+
+| Birthsign | Boon | Power (R / POWER) |
+|---|---|---|
+| The Pendulum | Timed parries restore stamina and stagger longer | Temporal Stasis: enemies and their orbs slow by 65% for 4 s |
+| The Crucible | 25% less hazard and fall damage; potions 30% stronger | Alchemical Nova: a burning blast that hurls back nearby foes |
+| The Astrolabe | Nearby unlooted chests and vents chime; +15% skill gain from discovery and lockpicking | Astral Sight: enemies, chests and your quest marker show through walls for 12 s |
+| The Spire | +40 maximum Aether; faster Aether recovery while still | Ley-Surge: full Aether and free runes for 5 s |
+| The Hound | +15% speed, +25 carry, longer Phase Dash | Phantom Stride: enemies lose you and you move 50% faster for 6 s |
+| The Veiled Crown | +15 standing with every town and guild; extra lore | Command Resonance: the nearest construct (not a boss) stands down for 15 s |
+| The Shattered Star | 25% critical hits, 30% more shards from chests, but 15% less Health | Supernova Strike: your next hit or rune within 6 s deals triple damage |
+
+Powers recharge over time (75 to 150 seconds) or when you rest. Your profession's gear waits in the starter chest. Townsfolk, guild masters and the Archivist remark on your past, your sign and whether you accepted the Oracle's reading, and some conversations offer options only your profession can take. Your identity is saved with the game, and the creation screen remembers your last choices.
+
 ## Guided tutorial
 
 The title screen has a **Guided Tutorial: ON / OFF** toggle, which is remembered. With it on, a small card at the top of the screen walks you through five steps and moves on by itself as you do each one:
@@ -52,13 +80,16 @@ The card never blocks the game, and its wording follows your controls (desktop o
 | Parry / block | Right click (tap / hold) | PARRY |
 | Interact | E | USE |
 | Dash / jump | Shift (or double-tap WASD) / Space | DASH / JUMP |
-| Hotbar | 1-6, wheel, Q; R switches ammo | Tap a hotbar slot |
+| Hotbar | 1-6, wheel, Q; T switches ammo | Tap a hotbar slot |
+| Birthsign Power | R | POWER |
 | Panels | Tab or I, K, J, M | PACK, SKILLS, LOG, MAP |
 | Save / load | F5 / F9, or Menu | Menu |
 
 Panels release the mouse so you can click; closing a panel locks it again. Some embedded browsers refuse pointer lock. The game then switches to free mouse look, and resting the cursor near a screen edge keeps turning. Touch controls switch on automatically on touch devices, and the **Touch HUD** button toggles them by hand.
 
 ## Running locally
+
+The character-origin rules have a self-check: `node tests/destiny.mjs`.
 
 ES modules don't load from `file://`, so serve the folder over HTTP:
 
@@ -80,8 +111,8 @@ Push the folder with `index.html` at the root. Then go to **Settings â†’ Pages â
 | `src/main.js` | `Game` (rules, time, levels and streaming, interaction, combat resolution, contracts, quests, save/load), `Input`, HUD, the `App` state machine and every modal |
 | `src/renderer.js` | WebGL 2 renderer, physically based and in linear light. World tiles sample 512px texture-array PBR layers (albedo, normal, roughness/specular/cavity/metal), trilinear with 16x anisotropy. Shading is Cook-Torrance (GGX, Smith, Schlick) for the sun or moon and 16 point lights, with hemisphere sky/ground ambient and an environment-reflection approximation; rain darkens and polishes open ground. Props, trees, grass and items are 3D meshes, welded into indexed buffers and hardware-instanced per model, with distance and facing culling and a low-poly far LOD. Characters are skinned to up to 16 bones per draw, and the weapon and lantern viewmodels are 3D too. A 2048px directional shadow map with PCF grounds everything outdoors, SSAO (half-res, depth-aware blur) darkens creases, and fog is exponential distance haze plus analytic height mist that drifts. Rain is a GPU particle system placed entirely in the vertex shader. The frame renders to an HDR buffer and is finished with bloom, FXAA, ACES tone mapping and grading. Internal resolution adapts to hold 60 FPS. |
 | `src/textures.js` | Tileable Perlin, Worley and fBm noise. Painted tiles are softened, graded toward a muted, weathered palette, then grown into 512px albedo, normal and material maps with domain-warped grain, pores, Worley pits and fractures, brass scratches and verdigris patina, mortar crevices, moss creeping from floor seams, wood fibres, wet mud and pebbles. A small "sculptor" also paints the 2D sprite atlas the UI uses for item icons and dialogue portraits. |
-| `src/models.js` | Procedural 3D geometry: a mesh builder with smooth normals (lathes, ellipsoids, rounded boxes, tubes, tori), every prop, tree, plant, item and runestone model, pitched timber-framed roofs and stone door arches, articulated character rigs posed each frame (breathing idle, walk stride, attack windup and swing, stagger, collapse), and the first-person viewmodels. |
-| `src/audio.js` | Web Audio synth: combat, locks, brewing, footsteps by surface, NPC voices, biome ambiences, rain and wind beds, thunder, adaptive music |
+| `src/models.js` | Procedural 3D sculpting. Surfaces are lofted through elliptical cross-sections or swept along Catmull-Rom splines (parallel-transport frames, 24-32 radial segments), Laplacian-smoothed, and roughened by fBm displacement along their normals (chipped stone, bark ridges, craggy basalt, dented plate). Every model is finished with area-weighted smooth normals (hard creases kept) and per-vertex ambient occlusion baked from a voxelized copy of the assembled body. Characters have realistic adult proportions and layered gear (skirted tunics, robes, aprons, belts and pouches, riveted pauldrons, hoods, cloaks with gravity folds, articulated hands gripping their weapons), with idle weight shifts, stride counter-rotation and cloak sway; distant characters and trees switch to lighter LODs. Also the props, items, roofs, door arches and first-person viewmodels. |
+| `src/audio.js` | Web Audio engine, no samples. Music, SFX, Ambience and UI buses run into a warmth shelf, glue compressor and limiter, with two in-memory convolution reverbs (stone hall, open air) crossfaded by place. Enemy steps, attack tells, shots, impacts, fires and vents are placed in 3D (HRTF) with distance air absorption. Foley is layered and modal (surface-aware footsteps, the tuning fork's ring, latches, string snaps, tumblers, grinding stone, bubbling brews, parchment, formant voices). The generative score crossfades between observatory, dungeon, day, night and town stems (Karplus-Strong lute and harp, bowed strings, celesta and bells), with a combat layer of drums, clockwork ticks and a string ostinato. Master, Music and SFX volume sliders sit in the pause menu. |
 | `src/world.js` | Seeded generators (observatory, overworld, towns, dungeons), the `Level` grid with collision and line of sight, the `ChunkStreamer` |
 | `src/rpg.js` | Items, recipes, runes and spells, character, inventory, quests, contracts, pricing, books, dialogue engine |
 | `src/entities.js` | Player controller, constructs and their AI, orbs, projectiles, scheduled NPCs, particles |
