@@ -39,6 +39,9 @@ export function angleDiff(a, b) {
 /** @param {number} v @param {number} lo @param {number} hi */
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
+/** Turn angle a toward b by at most step radians. @param {number} a @param {number} b @param {number} step */
+const turnToward = (a, b, step) => a + clamp(angleDiff(b, a), -step, step);
+
 /** Melee swing shapes, picked by movement direction at the moment of the strike. */
 const SWINGS = {
   sweep: { cos: 0.34, reach: 2.1, mult: 1.0, cd: 0.45, stam: 10 },
@@ -376,6 +379,10 @@ export class Enemy {
     this.lx = 0;
     this.lz = 0;
     this.boss = !!sp.boss;
+    /** Facing for the 3D model (radians, forward = cos, sin). */
+    this.face = Math.random() * Math.PI * 2;
+    /** Seconds since death, for the collapse animation. */
+    this.deadT = 0;
   }
 
   get awake() {
@@ -411,6 +418,9 @@ export class Enemy {
       this.losT = 0.25;
       this.los = dist < 18 && L.los(this.x, this.z, p.x, p.z);
     }
+    if (this.state === 'home') this.face = turnToward(this.face, Math.atan2(this.homeZ - this.z, this.homeX - this.x), dt * 6);
+    else if (this.state === 'lunge') this.face = Math.atan2(this.lz, this.lx);
+    else if (this.state !== 'dormant') this.face = turnToward(this.face, Math.atan2(dz, dx), dt * (this.kind === 'golem' ? 3 : 7));
     if (this.state === 'dormant') {
       if (this.los && dist < 12) this.wake();
       this.y = L.heightAt(this.x, this.z);
@@ -574,7 +584,24 @@ export class Enemy {
     else if (this.slow > 0) tint = [0.7, 1.0, 1.5];
     else if (this.stagger > 0) tint = [1.3, 1.3, 0.8];
     const lift = this.sprite === 'wisp' ? 0.7 + Math.sin(this.anim * 2) * 0.1 : 0;
-    return { x: this.x, y: this.y + lift, z: this.z, w: this.size, h: this.size, frame: SPR[name], emit: 1, tint, sky: 1 };
+    return { x: this.x, y: this.y + lift, z: this.z, w: this.size, h: this.size, frame: SPR[name], emit: 1, tint, sky: 1, model: this.modelDesc() };
+  }
+
+  /**
+   * Pose inputs for the 3D rig: facing, stride and the progress (0..1) of the current attack.
+   * @returns {import('./models.js').ModelDesc}
+   */
+  modelDesc() {
+    const golem = this.kind === 'golem';
+    /** @type {Record<string, number>} */
+    const span = { windup: golem ? 0.85 : this.kind === 'mite' ? 0.45 : 0.55, lunge: 0.3, recover: golem ? 1.1 : 0.6, charge: 0.55 };
+    const act = this.alive && span[this.state] ? this.state : '';
+    const walking = this.alive && (this.state === 'chase' || this.state === 'advance' || this.state === 'home' || this.state === 'hover') && this.stagger <= 0;
+    return {
+      rig: this.sprite, yaw: this.face, t: this.anim, walk: walking ? 1 : 0, phase: this.anim * this.speed * 2.6,
+      act, k: act ? clamp(1 - this.t / span[act], 0, 1) : 0, stagger: Math.max(0, this.stagger),
+      dead: this.alive ? 0 : this.deadT / 1.4, scale: this.size / (this.sprite === 'golem' ? 2.7 : this.sprite === 'wisp' ? 1.4 : 2.2),
+    };
   }
 }
 
@@ -741,6 +768,8 @@ export class NPC {
     this.moving = false;
     this.patrolI = 0;
     this.thinkT = 0;
+    /** Facing for the 3D model (radians, forward = cos, sin). */
+    this.face = this.anim;
   }
 
   /** Where this NPC wants to be at a given hour. @param {number} hour 0..24 @returns {{spot:{x:number, z:number}, phase:string}} */
@@ -777,6 +806,7 @@ export class NPC {
     }
     if (this.talking) {
       this.moving = false;
+      this.face = turnToward(this.face, Math.atan2(game.player.z - this.z, game.player.x - this.x), dt * 5);
       return;
     }
     if (!this.path.length) {
@@ -792,6 +822,7 @@ export class NPC {
     const dz = next.z - this.z;
     const d = Math.hypot(dx, dz);
     const step = 1.6 * dt;
+    if (d > 1e-3) this.face = turnToward(this.face, Math.atan2(dz, dx), dt * 6);
     game.holdDoorAt(next.x, next.z);
     if (d <= step) {
       this.x = next.x;
@@ -809,7 +840,13 @@ export class NPC {
   getSprite(level) {
     const walk = this.moving && Math.floor(this.anim * 4) % 2 === 1;
     const name = walk ? `${this.def.sprite}_walk` : this.def.sprite;
-    return { x: this.x, y: this.y, z: this.z, w: 1.9, h: 1.9, frame: SPR[name], emit: this.def.sprite === 'master' ? 1 : 0, tint: [1, 1, 1], sky: level.covered(this.x, this.z) ? 0 : 1 };
+    return {
+      x: this.x, y: this.y, z: this.z, w: 1.9, h: 1.9, frame: SPR[name], emit: this.def.sprite === 'master' ? 1 : 0, tint: [1, 1, 1], sky: level.covered(this.x, this.z) ? 0 : 1,
+      model: {
+        rig: this.def.sprite, yaw: this.face, t: this.anim, walk: this.moving ? 1 : 0, phase: this.anim * 8.4,
+        act: this.talking ? 'talk' : '', k: 0, stagger: 0, dead: 0, scale: 1,
+      },
+    };
   }
 }
 

@@ -1,8 +1,9 @@
 /**
- * @file Procedural pixel-art generator. Paints 128x128 world tiles (brass observatory,
- * mossy limestone, timber towns, cobbles, biome ground, water) and sculpts lit, palette-
- * ramped 128x128 sprites (constructs, townsfolk, flora, props, item icons) plus 256x256
- * weapon viewmodels with a tiny z-buffered rasterizer. Uploads as NEAREST textures.
+ * @file Procedural texture generator. Paints 128x128 world tiles (brass observatory, mossy
+ * limestone, timber towns, cobbles, biome ground, water) and grows them into 512x512 PBR
+ * material layers (albedo, tangent-space normal, roughness/specular/cavity/metal) in a muted,
+ * weathered palette, uploaded trilinear with 16x anisotropy. Also sculpts the 128x128 sprite
+ * atlas the UI uses for item icons and dialogue portraits (the world itself is 3D: models.js).
  */
 import { mulberry32, hash2, TILE } from './world.js';
 
@@ -12,8 +13,7 @@ const WORLD_ROWS = 4;
 export const SPRITE_FRAME = 128;
 const SPRITE_COLS = 8;
 const ATLAS_W = 1024;
-const ATLAS_H = 2176;
-const VIEW_Y = 1664;
+const ATLAS_H = 1664;
 
 /** Sprite frame names, in atlas order. */
 export const SPRITE_NAMES = Object.freeze([
@@ -33,8 +33,6 @@ export const SPRITE_NAMES = Object.freeze([
 ]);
 /** @type {Readonly<Record<string, number>>} sprite name -> frame index */
 export const SPR = Object.freeze(Object.fromEntries(SPRITE_NAMES.map((n, i) => [n, i])));
-/** Weapon / hand viewmodels (256x256, below the sprite frames). */
-export const VIEW = Object.freeze({ FORK: 0, FORK_SLASH: 1, SCATTER: 2, SCATTER_FIRE: 3, CROSSBOW: 4, CROSSBOW_FIRE: 5, LANTERN: 6, CAST: 7 });
 
 /** Pixel rectangle of a sprite frame in the atlas canvas (for UI icons). @param {number} frame */
 export function spriteRect(frame) {
@@ -42,17 +40,6 @@ export function spriteRect(frame) {
 }
 
 /** @param {number} frame @returns {number[]} [u0, v0, u1, v1] */
-export function spriteUV(frame) {
-  const { sx, sy } = spriteRect(frame);
-  return [(sx + 0.5) / ATLAS_W, (sy + 0.5) / ATLAS_H, (sx + SPRITE_FRAME - 0.5) / ATLAS_W, (sy + SPRITE_FRAME - 0.5) / ATLAS_H];
-}
-
-/** Source rectangle of a viewmodel frame in the sprite atlas canvas. @param {number} view */
-export function viewRect(view) {
-  return { sx: (view % 4) * 256, sy: VIEW_Y + Math.floor(view / 4) * 256, size: 256 };
-}
-
-
 /** @param {number} w @param {number} h */
 function canvas2d(w, h) {
   const c = document.createElement('canvas');
@@ -2167,189 +2154,28 @@ function sculptSprites(ctx) {
   });
 }
 
-/** Alchemical Crossbow viewmodel. @param {Sculpt} S @param {boolean} fired */
-function sculptCrossbow(S, fired) {
-  S.capsule([186, 262, 14], [138, 120, -20], 15, 9, PAL2.wood);
-  for (let k = 0; k < 4; k++) S.inlay([180 - k * 11, 236 - k * 30, 168 - k * 11, 240 - k * 30], 0.55, 1.4);
-  S.box(150, 170, 26, 34, 16, PAL.brass, 6);
-  S.sphere(163, 186, 32, 4, PAL.crystal);
-  S.ring(136, 112, -20, 74, 4.5, 1.15, 0.05, PAL.steel, { from: Math.PI * 1.02, to: Math.PI * 1.98 });
-  S.ring(136, 112, -20, 74, 2, 1.15, 0.05, PAL.brass, { from: Math.PI * 1.45, to: Math.PI * 1.55 });
-  const sy = fired ? 98 : 136;
-  S.inlay([64, 104, 136, sy, 208, 104], [220, 210, 180], 1.4);
-  if (!fired) {
-    S.capsule([136, 134, -14], [128, 58, -30], 2.6, 2.6, PAL2.wood);
-    S.poly([128, 44, 134, 58, 128, 64, 122, 58], -10, [0.3, -0.3, 0.9], PAL.steel);
-  } else {
-    S.sphere(128, 60, 10, 12, PAL.gGold, { emit: true });
-    S.sparkle(128, 60, 14);
-  }
-}
 
-/** Lantern held in the off hand. @param {Sculpt} S */
-function sculptLanternHand(S) {
-  S.capsule([30, 270, 10], [92, 196, 8], 16, 12, PAL.leather);
-  S.sphere(96, 190, 14, 12, PAL2.skin);
-  S.ring(100, 160, 10, 18, 3, 0, 0, PAL.brass, { from: Math.PI, to: Math.PI * 2 });
-  S.poly([74, 170, 126, 170, 100, 150], 14, [0, -0.5, 0.85], PAL.brass);
-  S.box(78, 170, 44, 62, 6, PAL.gAmber, 8, { emit: true });
-  for (const x of [78, 100, 122]) S.capsule([x, 170, 16], [x, 232, 16], 2, 2, PAL.brass);
-  S.box(74, 230, 52, 14, 12, PAL.brass, 4);
-  S.sphere(100, 202, 18, 9, PAL2.fire, { emit: true });
-  S.sphere(98, 198, 26, 4, PAL.gWhite, { emit: true });
-}
 
-/** Casting hand with a glowing rune circle. @param {Sculpt} S */
-function sculptCastHand(S) {
-  S.capsule([200, 270, 10], [160, 190, 8], 18, 13, PAL2.crimson);
-  S.ring(196, 250, 12, 20, 3, 1.1, -0.4, PAL.brass);
-  S.sphere(150, 176, 12, 15, PAL2.skin);
-  for (const [dx, dy] of [[-18, -14], [-10, -24], [0, -26], [10, -22], [16, -8]]) S.capsule([150 + dx * 0.4, 170 + dy * 0.3, 14], [150 + dx, 168 + dy, 16], 4, 3, PAL2.skin);
-  S.ring(128, 112, 30, 46, 2.4, 0.5, 0.3, PAL.gCyan, { emit: true });
-  S.ring(128, 112, 30, 34, 1.6, 0.5, -0.3, PAL.gCyan, { emit: true });
-  for (let k = 0; k < 6; k++) glyph(S, 128 + Math.cos(k * 1.05) * 40 - 5, 112 + Math.sin(k * 1.05) * 24 - 5, 10, 600 + k, INK.cyan, 2);
-  S.sparkle(118, 104, 8);
-}
 
 /**
- * Sculpt the sprite atlas: every named sprite frame plus the weapon and hand viewmodels.
+ * Sculpt the sprite atlas (UI icons and dialogue portraits): every named sprite frame.
  * @returns {HTMLCanvasElement}
  */
 export function buildSpriteAtlas() {
   const { c: canvas, ctx } = canvas2d(ATLAS_W, ATLAS_H);
   sculptSprites(ctx);
-  /** @type {[number, (S: Sculpt) => void][]} */
-  const views = [
-    [VIEW.FORK, (S) => sculptFork(S, false)],
-    [VIEW.FORK_SLASH, (S) => sculptFork(S, true)],
-    [VIEW.SCATTER, (S) => sculptScatter(S, false)],
-    [VIEW.SCATTER_FIRE, (S) => sculptScatter(S, true)],
-    [VIEW.CROSSBOW, (S) => sculptCrossbow(S, false)],
-    [VIEW.CROSSBOW_FIRE, (S) => sculptCrossbow(S, true)],
-    [VIEW.LANTERN, sculptLanternHand],
-    [VIEW.CAST, sculptCastHand],
-  ];
-  for (const [v, fn] of views) {
-    const r = viewRect(v);
-    const S = new Sculpt(r.size, 256);
-    fn(S);
-    S.finish();
-    S.blit(ctx, r.sx, r.sy);
-  }
   return canvas;
-}
-
-
-/** Resonance Tuning Fork viewmodel. @param {Sculpt} S @param {boolean} swing */
-function sculptFork(S, swing) {
-  if (swing) S.rotate(-0.5, 168, 256);
-  // Leather-wrapped grip with stitching and a gem pommel.
-  S.capsule([150, 184, 10], [172, 262, 0], 15, 17, PAL.brass);
-  for (let k = 0; k < 5; k++) {
-    const t = 0.25 + k * 0.15;
-    const x = 150 + 22 * t;
-    const y = 184 + 78 * t;
-    S.capsule([x - 15, y + 4, 20], [x + 16, y - 4, 20], 3.4, 3.4, PAL.leather);
-    for (let s = -12; s <= 12; s += 4) S.inlay([x + s, y - s * 0.26 - 2.4, x + s + 1.2, y - s * 0.26 - 2.7], INK.stitch, 0.7);
-  }
-  // Engraved collar.
-  S.ring(149, 182, 14, 16, 3, 1.2, 0.28, PAL.brass);
-  S.sphere(148, 178, 12, 13, PAL.brass);
-  S.scratch(spiralPts(144, 174, 7, 1.3, 1, Math.PI), 0.55, 1);
-  S.inlay(spiralPts(143.5, 173.5, 7, 1.3, 1, Math.PI), INK.gold, 0.6);
-  S.sphere(152, 182, 22, 3.5, PAL.crystal);
-  // Yoke and tines.
-  for (let k = 0; k < 12; k++) {
-    const a0 = (Math.PI * k) / 12;
-    const a1 = (Math.PI * (k + 1)) / 12;
-    S.capsule([148 + 30 * Math.cos(a0), 150 + 28 * Math.sin(a0), 6], [148 + 30 * Math.cos(a1), 150 + 28 * Math.sin(a1), 6], 10, 10, PAL.steel);
-  }
-  S.scratch(arcPts(148, 150, 30, 28, 0.15, Math.PI - 0.15), 0.6, 1.2);
-  S.capsule([118, 150, 6], [100, 20, -30], 10, 6.5, PAL.steel);
-  S.capsule([178, 150, 6], [172, 14, -30], 10, 6.5, PAL.steel);
-  // Glowing runes inlaid along each tine.
-  for (let k = 0; k < 4; k++) {
-    glyph(S, 107 - k * 3.2, 104 - k * 24, 8, 400 + k, INK.cyan, 1.2);
-    glyph(S, 171 - k * 1.4, 102 - k * 24, 8, 500 + k, INK.cyan, 1.2);
-  }
-  S.inlay([116, 140, 101, 26], INK.white, 0.8);
-  S.inlay([176, 140, 171, 20], INK.white, 0.8);
-  // Standing resonance waves.
-  for (let k = 0; k < 4; k++) S.ring(140, 62 + k * 24, -8, 24, 1.8, 0, 0, PAL.gCyan, { emit: true, from: Math.PI * 1.15, to: Math.PI * 1.85 });
-  S.rotate(0);
-  if (swing) {
-    for (const r of [70, 92, 114]) S.ring(80, 116, 40, r, r === 92 ? 3 : 2, 0, 0, r === 92 ? PAL.gWhite : PAL.gCyan, { emit: true, from: Math.PI * 1.05, to: Math.PI * 1.6 });
-  }
-}
-
-/** Prism Scattergun viewmodel. @param {Sculpt} S @param {boolean} fire */
-function sculptScatter(S, fire) {
-  if (fire) {
-    SPECTRUM.forEach((rmp, k) => S.capsule([160, 30, 40], [40 + k * 36, -4, 40], 4, 1.5, rmp, { emit: true }));
-    S.sphere(160, 32, 44, 18, PAL.gWhite, { emit: true });
-  }
-  // Housing: engraved filigree plate, screws, twin pressure gauges.
-  S.box(118, 168, 84, 100, 0, PAL.brass, 14);
-  S.scratch(spiralPts(132, 228, 10, 1.4, 1, Math.PI), 0.55, 1.2);
-  S.scratch(spiralPts(188, 228, 10, 1.4, -1, 0), 0.55, 1.2);
-  S.inlay(spiralPts(131, 227, 10, 1.4, 1, Math.PI), INK.gold, 0.7);
-  S.inlay(spiralPts(187, 227, 10, 1.4, -1, 0), INK.gold, 0.7);
-  S.box(128, 184, 64, 26, 14, PAL.obsidian, 5);
-  for (const [x, dir] of [[148, 1], [174, -1]]) {
-    S.sphere(x, 197, 20, 8, PAL.glass);
-    for (let t = 0; t < 9; t++) {
-      const a = Math.PI * (0.8 + t * 0.175);
-      S.inlay([x + Math.cos(a) * 5.5, 197 + Math.sin(a) * 5.5, x + Math.cos(a) * 7, 197 + Math.sin(a) * 7], t > 6 ? [194, 31, 74] : [20, 30, 40], 0.6);
-    }
-    S.ring(x, 197, 20, 9, 1.6, 0, 0, PAL.brass);
-    S.capsule([x, 197, 28], [x + dir * 5, 191, 28], 1, 0.6, PAL.crimson);
-    S.sparkle(x - 3, 194, 1.5);
-  }
-  for (const [x, y] of [[124, 176], [196, 176], [124, 250], [196, 250]]) {
-    S.sphere(x, y, 14, 3, PAL.brass);
-    S.scratch([x - 2, y + 1, x + 2, y - 1], 0.4, 0.8);
-  }
-  // Pipes with joint collars.
-  S.capsule([112, 240, 12], [124, 150, -4], 6, 6, PAL.brass);
-  S.capsule([210, 240, 12], [198, 150, -4], 6, 6, PAL.brass);
-  for (const t of [0.3, 0.7]) {
-    S.ring(112 + 12 * t, 240 - 90 * t, 12 - 16 * t + 2, 6.5, 1.6, 1.35, 0.13, PAL.steel);
-    S.ring(210 - 12 * t, 240 - 90 * t, 12 - 16 * t + 2, 6.5, 1.6, 1.35, -0.13, PAL.steel);
-  }
-  // Barrel shroud and muzzle.
-  S.box(134, 102, 52, 72, -6, PAL.brass, 10);
-  for (let k = 0; k < 3; k++) S.capsule([134, 118 + k * 18, 4], [186, 118 + k * 18, 4], 3, 3, PAL.steel);
-  for (let k = 0; k < 2; k++) glyph(S, 150 + k * 12, 125, 8, 600 + k, INK.cyan, 1);
-  S.ring(160, 104, -6, 26, 4, 1.35, 0, PAL.steel);
-  // Prism with refraction lines and glints.
-  const A = [160, 22];
-  const BL = [118, 100];
-  const BR = [202, 100];
-  const BF = [160, 110];
-  const C = [160, 72];
-  S.poly([...A, ...BL, ...C], 16, [-0.7, -0.3, 0.65], PAL.crystal);
-  S.poly([...A, ...C, ...BR], 16, [0.6, -0.35, 0.7], PAL.crystal);
-  S.poly([...BL, ...BF, ...C], 16, [-0.3, 0.5, 0.8], PAL.crystal);
-  S.poly([...C, ...BF, ...BR], 16, [0.3, 0.5, 0.8], PAL.crystal);
-  S.capsule([160, 26, 18], [160, 72, 18], 1, 1, PAL.crystal);
-  S.inlay([146, 46, 138, 86, 150, 100], INK.pale, 0.8);
-  S.inlay([172, 52, 184, 92], INK.pale, 0.7);
-  S.inlay([130, 92, 160, 80, 190, 94], [255, 140, 200], 0.6);
-  S.sphere(148, 62, 20, 4, PAL.gWhite, { emit: true });
-  S.sparkle(176, 76, 4);
-  S.capsule([114, 106, 18], [126, 84, 22], 4, 3, PAL.brass);
-  S.capsule([206, 106, 18], [194, 84, 22], 4, 3, PAL.brass);
 }
 
 // ---------------------------------------------------------------------------
 // Surface synthesis: tileable gradient (Perlin) noise, Worley cells and fBm,
-// used to grow each 128px painted tile into 256x256 albedo + normal +
-// roughness/specular/cavity/metal maps with grain, scratches, mortar,
-// creeping moss, patina, wood fibre and wetness layers.
+// used to grow each 128px painted tile into 512x512 albedo + normal +
+// roughness/specular/cavity/metal maps with domain-warped grain, pores,
+// fractures, scratches, mortar, creeping moss, patina, wood fibre and wetness.
 // ---------------------------------------------------------------------------
 
 /** Material texture edge, in texels. */
-export const MAT_SIZE = 256;
+export const MAT_SIZE = 512;
 
 /**
  * Tileable Perlin gradient noise over a period of `cells` lattice cells per unit square.
@@ -2489,13 +2315,38 @@ const SURFACES = {
  */
 
 /**
- * Grow every painted 128px world tile into 256px albedo / normal / material layers.
+ * Naturalistic grade per surface kind: chroma kept, multiplicative tint and gain. Pulls the
+ * painted tiles toward weathered, earthy tones (slate, limestone, oxidised bronze, dark timber,
+ * muted moss, rich soil).
+ * @type {Record<SurfaceDef['kind'], {sat: number, tint: number[], gain: number}>}
+ */
+const GRADE = {
+  stone: { sat: 0.42, tint: [0.97, 0.97, 1.0], gain: 0.84 },
+  brass: { sat: 0.62, tint: [0.92, 0.84, 0.72], gain: 0.82 },
+  obsidian: { sat: 0.6, tint: [1, 1, 1], gain: 1 },
+  wood: { sat: 0.6, tint: [0.95, 0.86, 0.76], gain: 0.82 },
+  timber: { sat: 0.5, tint: [0.96, 0.9, 0.84], gain: 0.88 },
+  plaster: { sat: 0.35, tint: [0.98, 0.95, 0.9], gain: 0.9 },
+  clay: { sat: 0.55, tint: [0.95, 0.82, 0.76], gain: 0.82 },
+  grass: { sat: 0.3, tint: [0.92, 0.9, 0.66], gain: 0.62 },
+  mud: { sat: 0.55, tint: [0.86, 0.82, 0.72], gain: 0.78 },
+  soil: { sat: 0.58, tint: [0.95, 0.85, 0.72], gain: 0.84 },
+  water: { sat: 0.6, tint: [0.8, 0.92, 0.92], gain: 0.8 },
+};
+
+/**
+ * Grow every painted 128px world tile into 512px PBR layers: albedo, tangent-space normal and
+ * roughness/specular/cavity/metal. The painted tile is softened first (so pixel-art steps and
+ * dithering become smooth gradients), graded toward a muted naturalistic palette, then detailed
+ * with domain-warped fBm grain, fine pores, Worley pits and fractures, scratches, patina, moss,
+ * fibre and wetness at full resolution.
  * @param {HTMLCanvasElement} base the painted world atlas from buildWorldAtlas()
  * @returns {WorldMaterials}
  */
 export function buildWorldMaterials(base) {
   const N = MAT_SIZE;
   const M = N - 1;
+  const T = TILE_SIZE;
   const layers = WORLD_COLS * WORLD_ROWS;
   const bctx = base.getContext('2d');
   if (!bctx) throw new Error('2D canvas is not available');
@@ -2519,7 +2370,12 @@ export function buildWorldMaterials(base) {
     if (!a) { a = field(make()); cache.set(key, a); }
     return a;
   };
-  const grainF = field(makeFbm(32, 3, 101));
+  // Domain-warped grain: fBm sampled through a second, low-frequency fBm offset field.
+  const warpA = makeFbm(4, 3, 111);
+  const warpB = makeFbm(4, 3, 222);
+  const grainBase = makeFbm(24, 4, 101);
+  const grainF = field((u, v) => grainBase(u + warpA(u, v) * 0.05, v + warpB(u, v) * 0.05));
+  const poreF = field(makeFbm(64, 2, 151));
   const midF = field(makeFbm(6, 4, 202));
   const lowF = field(makeFbm(3, 3, 303));
   const h = new Float32Array(N * N);
@@ -2527,83 +2383,130 @@ export function buildWorldMaterials(base) {
   const spec = new Float32Array(N * N);
   const metal = new Float32Array(N * N);
   const col = new Float32Array(N * N * 3);
+  // Softened copy of one painted tile (two passes of a wrapping 3x3 Gaussian).
+  const soft = new Float32Array(T * T * 3);
+  const tmp = new Float32Array(T * T * 3);
 
   for (let t = 0; t < layers; t++) {
     const S = SURFACES[t] ?? { kind: 'stone', bump: 3, rough: 0.8, spec: 0.1 };
-    const ox = (t % WORLD_COLS) * TILE_SIZE;
-    const oy = Math.floor(t / WORLD_COLS) * TILE_SIZE;
+    const G = GRADE[S.kind];
+    const ox = (t % WORLD_COLS) * T;
+    const oy = Math.floor(t / WORLD_COLS) * T;
+    for (let y = 0; y < T; y++) {
+      for (let x = 0; x < T; x++) {
+        const s4 = ((oy + y) * BW + ox + x) * 4;
+        const d = (y * T + x) * 3;
+        soft[d] = src[s4];
+        soft[d + 1] = src[s4 + 1];
+        soft[d + 2] = src[s4 + 2];
+      }
+    }
+    for (let pass = 0; pass < 2; pass++) {
+      const from = pass === 0 ? soft : tmp;
+      const to = pass === 0 ? tmp : soft;
+      for (let y = 0; y < T; y++) {
+        const ym = ((y + T - 1) % T) * T;
+        const yp = ((y + 1) % T) * T;
+        const yr = y * T;
+        for (let x = 0; x < T; x++) {
+          const xm = (x + T - 1) % T;
+          const xp = (x + 1) % T;
+          for (let c = 0; c < 3; c++) {
+            to[(yr + x) * 3 + c] = (from[(yr + x) * 3 + c] * 4
+              + (from[(yr + xm) * 3 + c] + from[(yr + xp) * 3 + c] + from[(ym + x) * 3 + c] + from[(yp + x) * 3 + c]) * 2
+              + from[(ym + xm) * 3 + c] + from[(ym + xp) * 3 + c] + from[(yp + xm) * 3 + c] + from[(yp + xp) * 3 + c]) / 16;
+          }
+        }
+      }
+    }
     const isStone = S.kind === 'stone' || S.kind === 'clay';
     const pitF = isStone ? lazy('pit', () => { const w = makeWorley(24, 404); return (u, v) => w(u, v)[0]; }) : null;
+    const fractureF = isStone ? lazy('fracture', () => {
+      const w = makeWorley(5, 414);
+      const f = makeFbm(8, 2, 415);
+      return (u, v) => { const r = w(u + f(u, v) * 0.03, v + f(v, u) * 0.03); return r[1] - r[0]; };
+    }) : null;
     const lichenF = S.kind === 'clay' ? lazy('lichen', () => { const w = makeWorley(18, 707); return (u, v) => w(u, v)[0]; }) : null;
     const knotF = S.kind === 'brass' || S.kind === 'wood' || S.kind === 'timber' ? lazy('knot', () => { const w = makeWorley(5, 505); return (u, v) => w(u, v)[0]; }) : null;
     const crackF = S.kind === 'plaster' || S.kind === 'timber' || S.kind === 'soil' ? lazy('crack', () => { const w = makeWorley(7, 606); return (u, v) => { const r = w(u, v); return r[1] - r[0]; }; }) : null;
     const scratchF = S.kind === 'brass' ? lazy('scratch', () => {
       const a = makePerlin(6, 808);
       const b = makePerlin(10, 909);
-      return (u, v) => Math.min(Math.abs(a(u * 0.25 + v * 0.02, v * 6 + u * 0.3)) / 0.035, Math.abs(b(u * 5 + v * 0.4, v * 0.3 - u * 0.05)) / 0.025);
+      return (u, v) => Math.min(Math.abs(a(u * 0.25 + v * 0.02, v * 6 + u * 0.3)) / 0.03, Math.abs(b(u * 5 + v * 0.4, v * 0.3 - u * 0.05)) / 0.02);
     }) : null;
     const fibreF = S.kind === 'wood' || S.kind === 'timber' ? lazy(S.vertical ? 'fibreV' : 'fibreH', () => {
       const f = makeFbm(4, 3, 1001);
       return S.vertical
-        ? (u, v) => Math.sin((u * 48 + f(v * 0.5, u * 4) * 3) * Math.PI * 2)
-        : (u, v) => Math.sin((v * 48 + f(u * 0.5, v * 4) * 3) * Math.PI * 2);
+        ? (u, v) => Math.sin((u * 64 + f(v * 0.5, u * 4) * 3) * Math.PI * 2)
+        : (u, v) => Math.sin((v * 64 + f(u * 0.5, v * 4) * 3) * Math.PI * 2);
     }) : null;
     const pebbleF = S.kind === 'soil' ? lazy('pebble', () => { const w = makeWorley(18, 707); return (u, v) => { const r = w(u, v); return r[0] + Math.floor(r[2]) * 4; }; }) : null;
     const rippleF = S.kind === 'water' ? lazy('ripple', () => makeFbm(5, 3, 1102)) : null;
 
     for (let y = 0; y < N; y++) {
       const v = y / N;
-      const fy = v * TILE_SIZE - 0.5;
+      const fy = v * T - 0.5;
       const iy = Math.floor(fy);
       const ay = fy - iy;
-      const r0 = (oy + ((iy + TILE_SIZE) % TILE_SIZE)) * BW;
-      const r1 = (oy + ((iy + 1 + TILE_SIZE) % TILE_SIZE)) * BW;
+      const r0 = ((iy + T) % T) * T;
+      const r1 = ((iy + 1 + T) % T) * T;
       for (let x = 0; x < N; x++) {
         const p = y * N + x;
         const u = x / N;
-        // Bilinear, wrapping upsample of the painted 128px tile (unrolled).
-        const fx = u * TILE_SIZE - 0.5;
+        // Bilinear, wrapping upsample of the softened tile (unrolled).
+        const fx = u * T - 0.5;
         const ix = Math.floor(fx);
         const ax = fx - ix;
-        const c0 = (ox + ((ix + TILE_SIZE) % TILE_SIZE)) * 4;
-        const c1 = (ox + ((ix + 1 + TILE_SIZE) % TILE_SIZE)) * 4;
+        const c0 = (ix + T) % T;
+        const c1 = (ix + 1 + T) % T;
         const w00 = (1 - ax) * (1 - ay);
         const w10 = ax * (1 - ay);
         const w01 = (1 - ax) * ay;
         const w11 = ax * ay;
-        const a00 = r0 * 4 + c0;
-        const a10 = r0 * 4 + c1;
-        const a01 = r1 * 4 + c0;
-        const a11 = r1 * 4 + c1;
-        let r = src[a00] * w00 + src[a10] * w10 + src[a01] * w01 + src[a11] * w11;
-        let g = src[a00 + 1] * w00 + src[a10 + 1] * w10 + src[a01 + 1] * w01 + src[a11 + 1] * w11;
-        let b = src[a00 + 2] * w00 + src[a10 + 2] * w10 + src[a01 + 2] * w01 + src[a11 + 2] * w11;
+        const a00 = (r0 + c0) * 3;
+        const a10 = (r0 + c1) * 3;
+        const a01 = (r1 + c0) * 3;
+        const a11 = (r1 + c1) * 3;
+        let r = soft[a00] * w00 + soft[a10] * w10 + soft[a01] * w01 + soft[a11] * w11;
+        let g = soft[a00 + 1] * w00 + soft[a10 + 1] * w10 + soft[a01 + 1] * w01 + soft[a11 + 1] * w11;
+        let b = soft[a00 + 2] * w00 + soft[a10 + 2] * w10 + soft[a01 + 2] * w01 + soft[a11 + 2] * w11;
+        // Grade toward the muted palette; ley-cyan glow texels keep their chroma for the emissive mask.
+        const glow = b - r > 50 && g - r > 30 && b > 110;
+        if (!glow) {
+          const l = 0.3 * r + 0.59 * g + 0.11 * b;
+          r = (l + (r - l) * G.sat) * G.tint[0] * G.gain;
+          g = (l + (g - l) * G.sat) * G.tint[1] * G.gain;
+          b = (l + (b - l) * G.sat) * G.tint[2] * G.gain;
+        }
         const lum = (0.3 * r + 0.59 * g + 0.11 * b) / 255;
         const gr = grainF[p];
+        const pore = poreF[p];
         const md = midF[p];
-        let hh = lum + gr * 0.06;
-        let ro = S.rough;
+        let hh = lum * 0.8 + gr * 0.07 + pore * 0.025;
+        let ro = S.rough + pore * 0.05;
         let sp = S.spec;
         let me = 0;
-        let shade = 1 + gr * 0.1;
+        let shade = (1 + gr * 0.12 + pore * 0.05) * (1 + lowF[p] * 0.12);
         const crevice = Math.max(0, 0.42 - lum) * 2.4;
 
-        if (pitF) {
+        if (pitF && fractureF) {
           const f1 = pitF[p];
-          if (f1 < 0.2) { shade *= 0.82 + f1; hh -= (0.2 - f1) * 0.6; }
-          if (hash2(x, y, 7 + t) > 0.985) shade *= 1.18;
+          if (f1 < 0.2) { shade *= 0.84 + f1 * 0.8; hh -= (0.2 - f1) * 0.5; }
+          const fr = fractureF[p];
+          if (fr < 0.03 && md > -0.05) { shade *= 0.72 + fr * 6; hh -= (0.03 - fr) * 3; ro += 0.08; }
+          if (hash2(x, y, 7 + t) > 0.992) shade *= 1.15;
           ro += gr * 0.08 + crevice * 0.1;
-          if (lichenF && lichenF[p] < 0.12 && md > 0.1) { r = r * 0.5 + 120; g = g * 0.5 + 130; b = b * 0.5 + 60; ro = 0.9; }
+          if (lichenF && lichenF[p] < 0.12 && md > 0.1) { r = r * 0.55 + 92; g = g * 0.55 + 98; b = b * 0.55 + 62; ro = 0.92; }
         } else if (S.kind === 'brass' && scratchF && knotF) {
           me = 1;
-          if (scratchF[p] < 1) { shade *= 1.16; hh -= 0.025; ro -= 0.12; }
+          if (scratchF[p] < 1) { shade *= 1.14; hh -= 0.02; ro -= 0.12; }
           hh += Math.max(0, 0.35 - knotF[p]) * 0.12;
-          const patina = Math.min(1, Math.max(0, crevice * 1.2 + md * 0.8 + (v - 0.6) * 0.8 - 0.35));
+          const patina = Math.min(1, Math.max(0, crevice * 0.9 + md * 0.6 + (v - 0.7) * 0.7 - 0.42));
           if (patina > 0) {
-            const k = Math.min(0.85, patina * 1.6);
-            r = r * (1 - k) + 66 * k;
-            g = g * (1 - k) + 136 * k;
-            b = b * (1 - k) + 112 * k;
+            const k = Math.min(0.65, patina * 1.4);
+            r = r * (1 - k) + 70 * k;
+            g = g * (1 - k) + 112 * k;
+            b = b * (1 - k) + 98 * k;
             ro += k * 0.5;
             sp *= 1 - k * 0.7;
             me *= 1 - k;
@@ -2620,16 +2523,16 @@ export function buildWorldMaterials(base) {
             ro += 0.1;
           } else {
             shade *= 1 + md * 0.05;
-            if (crackF && crackF[p] < 0.025 && lowF[p] > 0.05) { shade *= 0.72; hh -= 0.06; }
+            if (crackF && crackF[p] < 0.02 && lowF[p] > 0.05) { shade *= 0.72; hh -= 0.06; }
             ro = 0.88;
             sp = 0.05;
           }
         } else if (S.kind === 'plaster') {
           shade *= 1 + md * 0.06;
-          if (crackF && crackF[p] < 0.02 && lowF[p] > 0.1) { shade *= 0.7; hh -= 0.06; }
+          if (crackF && crackF[p] < 0.015 && lowF[p] > 0.1) { shade *= 0.7; hh -= 0.06; }
         } else if (S.kind === 'grass') {
-          const blade = hash2(x >> 1, (y >> 2) + (x & 1), 31);
-          shade *= 0.86 + blade * 0.3;
+          const blade = hash2(x >> 1, (y >> 3) + (x & 1), 31);
+          shade *= 0.86 + blade * 0.28;
           hh += blade * 0.1;
           g *= 1 + lowF[p] * 0.12;
           r *= 1 - lowF[p] * 0.08;
@@ -2637,16 +2540,16 @@ export function buildWorldMaterials(base) {
           const wet = md + lowF[p] * 0.5;
           if (wet > 0.08) {
             const k = Math.min(1, (wet - 0.08) * 4);
-            shade *= 1 - k * 0.22;
-            ro = ro * (1 - k) + 0.12 * k;
+            shade *= 1 - k * 0.25;
+            ro = ro * (1 - k) + 0.1 * k;
             sp = sp * (1 - k) + 0.75 * k;
             hh -= k * 0.08;
           }
         } else if (pebbleF) {
           const pv = pebbleF[p];
           const p1 = pv % 4;
-          if (p1 < 0.3) { shade *= 1.05 + hash2(Math.floor(pv / 4), 3, 5) * 0.2; hh += (0.3 - p1) * 0.5; }
-          if (crackF && crackF[p] < 0.03) { shade *= 0.7; hh -= 0.08; }
+          if (p1 < 0.3) { shade *= 1.04 + hash2(Math.floor(pv / 4), 3, 5) * 0.18; hh += (0.3 - p1) * 0.5; ro -= 0.08; }
+          if (crackF && crackF[p] < 0.025) { shade *= 0.7; hh -= 0.08; }
         } else if (rippleF) {
           hh = rippleF[p] * 0.5 + 0.5;
           shade *= 1 + rippleF[p] * 0.08;
@@ -2659,9 +2562,9 @@ export function buildWorldMaterials(base) {
           if (m > 0) {
             const k = Math.min(1, m * 1.4);
             const mg = 0.75 + gr * 0.5;
-            r = r * (1 - k) + 54 * mg * k;
-            g = g * (1 - k) + 96 * mg * k;
-            b = b * (1 - k) + 40 * mg * k;
+            r = r * (1 - k) + 58 * mg * k;
+            g = g * (1 - k) + 80 * mg * k;
+            b = b * (1 - k) + 42 * mg * k;
             hh += k * 0.08;
             ro = ro * (1 - k) + 0.95 * k;
             sp *= 1 - k * 0.8;
@@ -2679,30 +2582,31 @@ export function buildWorldMaterials(base) {
     }
     // Normals from height (wrapping central differences) and cavity from local height deficit.
     const base4 = t * N * N * 4;
+    const bump = S.bump * 2.6;
     for (let y = 0; y < N; y++) {
       const ym = ((y - 1) & M) * N;
       const yp = ((y + 1) & M) * N;
-      const y2m = ((y - 2) & M) * N;
-      const y2p = ((y + 2) & M) * N;
-      const y3m = ((y - 3) & M) * N;
-      const y3p = ((y + 3) & M) * N;
+      const y4m = ((y - 4) & M) * N;
+      const y4p = ((y + 4) & M) * N;
+      const y6m = ((y - 6) & M) * N;
+      const y6p = ((y + 6) & M) * N;
       const yr = y * N;
       for (let x = 0; x < N; x++) {
         const p = yr + x;
         const xm = (x - 1) & M;
         const xp = (x + 1) & M;
-        const x2m = (x - 2) & M;
-        const x2p = (x + 2) & M;
-        const dx = (h[yr + xp] - h[yr + xm]) * S.bump;
-        const dy = (h[yp + x] - h[ym + x]) * S.bump;
+        const x4m = (x - 4) & M;
+        const x4p = (x + 4) & M;
+        const dx = (h[yr + xp] - h[yr + xm]) * bump;
+        const dy = (h[yp + x] - h[ym + x]) * bump;
         const l = Math.hypot(dx, dy, 1);
-        const avg = (h[yr + ((x - 3) & M)] + h[yr + ((x + 3) & M)] + h[y3m + x] + h[y3p + x] + h[y2m + x2m] + h[y2p + x2p] + h[y2p + x2m] + h[y2m + x2p]) / 8;
-        const cav = Math.max(0.45, Math.min(1, 1 - (avg - h[p]) * 2.2));
-        const ao = 0.75 + 0.25 * cav;
+        const avg = (h[yr + ((x - 6) & M)] + h[yr + ((x + 6) & M)] + h[y6m + x] + h[y6p + x] + h[y4m + x4m] + h[y4p + x4p] + h[y4p + x4m] + h[y4m + x4p]) / 8;
+        const cav = Math.max(0.4, Math.min(1, 1 - (avg - h[p]) * 2.4));
+        const ao = 0.72 + 0.28 * cav;
         const o = base4 + p * 4;
-        albedo[o] = Math.min(255, col[p * 3] * ao);
-        albedo[o + 1] = Math.min(255, col[p * 3 + 1] * ao);
-        albedo[o + 2] = Math.min(255, col[p * 3 + 2] * ao);
+        albedo[o] = Math.max(0, Math.min(255, col[p * 3] * ao));
+        albedo[o + 1] = Math.max(0, Math.min(255, col[p * 3 + 1] * ao));
+        albedo[o + 2] = Math.max(0, Math.min(255, col[p * 3 + 2] * ao));
         albedo[o + 3] = 255;
         normal[o] = (-dx / l) * 127.5 + 127.5;
         normal[o + 1] = (-dy / l) * 127.5 + 127.5;
@@ -2744,24 +2648,6 @@ export function buildDetailTexture() {
   return out;
 }
 
-/**
- * Upload a canvas as a mipmapped 2D texture. Magnification stays LINEAR; the shader's
- * pixel-art sampler keeps texel edges crisp while mips stop distant shimmer.
- * @param {WebGL2RenderingContext} gl @param {HTMLCanvasElement} canvas @param {number} maxLevel highest mip level
- * @param {number} aniso anisotropy (1 = off) @returns {WebGLTexture}
- */
-export function uploadTexture(gl, canvas, maxLevel, aniso) {
-  const tex = gl.createTexture();
-  if (!tex) throw new Error('Could not create texture');
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, maxLevel);
-  gl.generateMipmap(gl.TEXTURE_2D);
-  setFilters(gl, gl.TEXTURE_2D, gl.CLAMP_TO_EDGE, aniso);
-  return tex;
-}
 
 /**
  * Upload stacked RGBA layers as a mipmapped, repeating 2D texture array.

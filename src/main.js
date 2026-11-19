@@ -11,7 +11,7 @@ import {
 } from './world.js';
 import { Renderer } from './renderer.js';
 import { AudioEngine } from './audio.js';
-import { SPR, VIEW, spriteRect, viewRect } from './textures.js';
+import { SPR, spriteRect } from './textures.js';
 import { Player, Enemy, Orb, NPC, Particle, angleDiff } from './entities.js';
 import {
   Character, QuestLog, Dialogue, ITEMS, RECIPES, SPELLS, SKILLS, ATTRIBUTES, PERKS, FACTIONS, SHOPS, BOOKS,
@@ -137,6 +137,8 @@ export class Game {
     this.player = new Player(this.level.spawn.x, 0, this.level.spawn.z, this.level.spawn.yaw);
     /** @type {Enemy[]} */
     this.enemies = [];
+    /** Slain enemies still playing their collapse animation. @type {Enemy[]} */
+    this.fallen = [];
     /** @type {NPC[]} */
     this.npcs = [];
     /** @type {Orb[]} */
@@ -158,7 +160,7 @@ export class Game {
     this.flowOz = 0;
     this.flow = new Int16Array(48 * 48);
     this.fx = { dash: 0, parry: 0, hurt: 0, flash: 0 };
-    /** Dynamic weather (not saved: it rerolls on load). */
+    /** Dynamic weather (saved; thunderT is transient). */
     this.weather = { kind: /** @type {keyof typeof WEATHER} */ ('clear'), rain: 0, wind: 0.15, next: 0, thunderT: 8 };
     /** @type {{text:string, t:number}[]} */
     this.notes = [];
@@ -248,6 +250,7 @@ export class Game {
     p.lastSafe = { x, z, y: p.y };
     this.enemies = L.spawns.filter((s) => !this.world.killed[s.key]).map((s) => new Enemy(s, L.heightAt(s.x, s.z)));
     this.npcs = L.npcDefs.map((d) => new NPC(d, L));
+    this.fallen = [];
     this.orbs = [];
     this.projectiles = [];
     this.particles = [];
@@ -309,6 +312,8 @@ export class Game {
     this._shields();
     for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 4900) e.update(dt, this);
     this._separate();
+    for (const e of this.enemies) if (!e.alive && e.state !== 'fall') this.fallen.push(e);
+    this.fallen = this.fallen.filter((e) => (e.deadT += dt) < 1.6);
     this.enemies = this.enemies.filter((e) => e.alive);
     for (const n of this.npcs) n.update(dt, this, Math.hypot(n.x - p.x, n.z - p.z) < 50);
     for (const o of this.orbs) o.update(dt, this);
@@ -393,8 +398,13 @@ export class Game {
       const dens = [0.026, 0.016, 0.02][biome];
       let fog = mix3([0.06, 0.07, 0.13], dayFog, day);
       fog = mix3(fog, [0.75, 0.42, 0.28], dusk * 0.45);
-      const sunCol = mix3([0, 0, 0], [1.0, 0.9, 0.75], day).map((v, k) => v + [0.5, 0.2, 0.05][k] * dusk * 0.6);
-      const l = Math.hypot(Math.cos(ang), Math.max(0.15, sy), 0.35);
+      // After dark the key light is a cool, dim moon opposite the sun's arc.
+      const moon = day < 0.05 ? clamp(-sy * 1.5, 0, 1) : 0;
+      const sunCol = moon > 0 ? [0.13 * moon, 0.16 * moon, 0.26 * moon] : mix3([0, 0, 0], [1.0, 0.9, 0.75], day).map((v, k) => v + [0.5, 0.2, 0.05][k] * dusk * 0.6);
+      const ldx = moon > 0 ? -Math.cos(ang) : Math.cos(ang);
+      const ldy = Math.max(0.15, moon > 0 ? -sy : sy);
+      const ldz = moon > 0 ? -0.25 : 0.35;
+      const l = Math.hypot(ldx, ldy, ldz);
       // Weather greys the haze, thickens it, dims the sun and the sky light.
       const wet = this.weather.rain;
       const overcast = Math.max(wet, this.weather.kind === 'cloudy' ? 0.45 : 0);
@@ -403,7 +413,7 @@ export class Game {
         fog, fogDensity: dens * (day < 0.3 ? 1.4 : 1) * (1 + wet * 0.9),
         ambient: mix3([0.15, 0.16, 0.26], [0.36, 0.37, 0.42], Math.max(day, dusk * 0.6)).map((v) => v * (1 - overcast * 0.25)),
         sunCol: sunCol.map((v) => v * (1 - overcast * 0.65)),
-        sunDir: [Math.cos(ang) / l, Math.max(0.15, sy) / l, 0.35 / l],
+        sunDir: [ldx / l, ldy / l, ldz / l],
       };
     }
     const k = 1 - Math.exp(-dt * 2.5);
@@ -948,6 +958,17 @@ export class Game {
     return s;
   }
 
+  /** First-person viewmodel state for the renderer. @returns {import('./renderer.js').ViewDesc} */
+  viewState() {
+    const p = this.player;
+    const slot = this.selectedSlot();
+    const item = !slot ? null : slot.kind === 'item' ? (['fork', 'scatter', 'crossbow'].includes(slot.id) ? slot.id : null) : 'cast';
+    return {
+      item, swing: p.swingT / 0.28, recoil: p.recoil, cast: p.castT / 0.4, block: p.blocking, bob: p.bob,
+      lantern: this.char.equip.off === 'lantern',
+    };
+  }
+
   /** @param {string} id @param {string} title @param {string} text @param {Marker|null} [marker] */
   startQuest(id, title, text, marker = null) {
     this.quests.start(id, title, id.startsWith('contract') ? 'guild' : 'town');
@@ -1385,6 +1406,7 @@ export class Game {
       }
     }
     for (const e of this.enemies) if (e.alive && (e.x - p.x) ** 2 + (e.z - p.z) ** 2 < 75 * 75) out.push(e.getSprite());
+    for (const e of this.fallen) out.push(e.getSprite());
     for (const n of this.npcs) if ((n.x - p.x) ** 2 + (n.z - p.z) ** 2 < 75 * 75) out.push(n.getSprite(L));
     for (const o of this.orbs) out.push(o.getSprite());
     for (const s of this.projectiles) out.push(s.getSprite());
@@ -1425,6 +1447,7 @@ export class Game {
       player: { x: p.x, z: p.z, yaw: p.yaw }, char: this.char.toJSON(), quests: { quests: this.quests.quests, tracked: this.quests.tracked },
       factions: this.factions, flags: this.flags, contracts: this.contracts, discovered: [...this.discovered], world: this.world,
       markers: this.markers, explored, hotIndex: this.hotIndex, shopStock: this.shopStock,
+      weather: { kind: this.weather.kind, rain: this.weather.rain, wind: this.weather.wind, next: this.weather.next },
     };
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(data));
@@ -1468,6 +1491,11 @@ export class Game {
     g.shopStock = data.shopStock || {};
     g.levels.clear();
     for (const [id, b64] of Object.entries(data.explored || {})) unpackBits(/** @type {string} */ (b64), g.getLevel(id).explored);
+    // Older saves have no weather: keep the defaults, which roll a fresh kind on the first tick.
+    const sw = data.weather;
+    if (sw && Object.hasOwn(WEATHER, sw.kind) && [sw.rain, sw.wind, sw.next].every(Number.isFinite)) {
+      Object.assign(g.weather, { kind: sw.kind, rain: clamp(sw.rain, 0, 1), wind: clamp(sw.wind, 0, 1), next: sw.next });
+    }
     g.enterLevel(data.levelId, data.player.x, data.player.z, data.player.yaw);
     g.notify('Game loaded.');
     return g;
@@ -1619,17 +1647,6 @@ const IVORY = '#f6e7c1';
 const BRASS = '#c99a48';
 const CYAN = '#3fe6ff';
 
-/**
- * Draw a viewmodel frame, skipping its top texel row: when scaled, browsers sample one texel
- * past the source rectangle, which would pull in the bottom row of the frame above in the atlas.
- * @param {CanvasRenderingContext2D} c @param {HTMLCanvasElement} atlas @param {{sx:number, sy:number, size:number}} r
- * @param {number} x @param {number} y @param {number} size
- */
-function viewImage(c, atlas, r, x, y, size) {
-  const k = size / r.size;
-  c.drawImage(atlas, r.sx, r.sy + 1, r.size, r.size - 1, x, y + k, size, size - k);
-}
-
 /** @param {CanvasRenderingContext2D} c @param {number} x @param {number} y @param {number} w @param {number} frac @param {string} col @param {string} label */
 function tube(c, x, y, w, frac, col, label) {
   c.fillStyle = 'rgba(12,8,20,0.75)';
@@ -1649,35 +1666,15 @@ function tube(c, x, y, w, frac, col, label) {
 }
 
 /**
- * @param {CanvasRenderingContext2D} c @param {Game} g @param {HTMLCanvasElement} atlas
+ * @param {CanvasRenderingContext2D} c @param {Game} g
  * @param {number} w @param {number} h @param {boolean} touch @param {Interactable|null} target
  */
-function drawHud(c, g, atlas, w, h, touch, target) {
+function drawHud(c, g, w, h, touch, target) {
   const tutorialOn = g.tutorialActive;
   const p = g.player;
   const ch = g.char;
-  // Viewmodels: weapon or casting hand on the right, lantern on the left.
+  // Weapon and lantern viewmodels are 3D, drawn by the renderer (Game.viewState).
   const slot = g.selectedSlot();
-  const size = Math.min(w, h) * 0.55;
-  const bobX = Math.sin(p.bob) * 6;
-  const bobY = Math.abs(Math.cos(p.bob)) * 6;
-  c.imageSmoothingEnabled = false;
-  if (slot) {
-    /** @type {number} */
-    let view = VIEW.CAST;
-    if (slot.kind === 'item') {
-      if (slot.id === 'fork') view = p.swingT > 0 ? VIEW.FORK_SLASH : VIEW.FORK;
-      else if (slot.id === 'scatter') view = p.recoil > 0.5 ? VIEW.SCATTER_FIRE : VIEW.SCATTER;
-      else view = p.recoil > 0.5 ? VIEW.CROSSBOW_FIRE : VIEW.CROSSBOW;
-    }
-    const r = viewRect(view);
-    const lift = view === VIEW.CAST ? (p.castT > 0 ? -size * 0.08 : size * 0.12) : 0;
-    viewImage(c, atlas, r, w * 0.5 + size * 0.05 + bobX, h - size * 0.9 + bobY + p.recoil * 18 + lift + (p.blocking ? size * 0.15 : 0), size);
-  }
-  if (ch.equip.off === 'lantern') {
-    const r = viewRect(VIEW.LANTERN);
-    viewImage(c, atlas, r, w * 0.5 - size * 1.05 - bobX * 0.5, h - size * 0.85 + bobY, size);
-  }
   // Crosshair and hit marker.
   c.strokeStyle = p.parryT > 0 ? '#ffd36b' : 'rgba(246,231,193,0.85)';
   c.lineWidth = 1.5;
@@ -2606,7 +2603,7 @@ class App {
     this.renderer.render({
       eye: { x: p.x, y: p.y + p.eye + Math.sin(p.bob * 2) * 0.03, z: p.z }, yaw: p.yaw, pitch: p.pitch, time: g.time,
       sprites: g.collectSprites(), lights: g.collectLights(), doors: g.level.doors, fx: g.fx, env: g.env,
-      weather: { rain: g.weather.rain, wind: g.weather.wind },
+      weather: { rain: g.weather.rain, wind: g.weather.wind }, view: this.state === 'TITLE' ? undefined : g.viewState(),
     });
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const w = this.hud.clientWidth;
@@ -2617,7 +2614,7 @@ class App {
     }
     this.hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.hctx.clearRect(0, 0, w, hh);
-    if (this.state !== 'TITLE') drawHud(this.hctx, g, this.renderer.spriteAtlas, w, hh, this.touch, this.state === 'EXPLORE' ? this.target : null);
+    if (this.state !== 'TITLE') drawHud(this.hctx, g, w, hh, this.touch, this.state === 'EXPLORE' ? this.target : null);
   }
 }
 

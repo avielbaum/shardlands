@@ -180,6 +180,8 @@ export class Level {
     this.npcDefs = [];
     /** @type {Landmark[]} */
     this.landmarks = [];
+    /** Building footprints (outer wall extents) that get pitched roofs. @type {{x0:number, z0:number, x1:number, z1:number, base:number}[]} */
+    this.roofs = [];
     /** @type {Map<number, Prop[]>} */
     this.solidGrid = new Map();
     /** @type {Map<number, Prop[]>} */
@@ -690,6 +692,7 @@ function building(L, x0, z0, w, d, side, f, zone, doorOpts) {
       L.zone[k] = zone;
     }
   }
+  L.roofs.push({ x0, z0, x1: x1 + 1, z1: z1 + 1, base: f + 3.3 });
   const di = side === 'N' || side === 'S' ? x0 + Math.floor(w / 2) : side === 'E' ? x1 : x0;
   const dj = side === 'E' || side === 'W' ? z0 + Math.floor(d / 2) : side === 'S' ? z1 : z0;
   const door = L.addDoor(di, dj, { tex: TILE.WOOD_DOOR, height: 2.3, top: f + 3.3, base: f, ...doorOpts });
