@@ -94,6 +94,16 @@ export const SITES = Object.freeze({
 /** @typedef {{x:number, y:number, z:number, r:number, g:number, b:number, flicker?:number}} Light */
 /** @typedef {{level:string, x:number|null, z:number|null, yaw:number}} Portal */
 /**
+ * A timber building's exterior dressing: roof, stone plinth, framing, windows and porch.
+ * @typedef {Object} Roof
+ * @property {number} x0 @property {number} z0 @property {number} x1 @property {number} z1 outer wall faces
+ * @property {number} base wall top, where the roof sits
+ * @property {number} floor ground-floor height
+ * @property {number} di @property {number} dj door cell
+ * @property {'N'|'S'|'E'|'W'} side wall that holds the door
+ * @property {boolean} porch thatched awning over the door
+ */
+/**
  * @typedef {Object} Door
  * @property {string} key
  * @property {number} i
@@ -180,7 +190,7 @@ export class Level {
     this.npcDefs = [];
     /** @type {Landmark[]} */
     this.landmarks = [];
-    /** Building footprints (outer wall extents) that get pitched roofs. @type {{x0:number, z0:number, x1:number, z1:number, base:number}[]} */
+    /** Building footprints (outer wall extents) that get pitched roofs. @type {Roof[]} */
     this.roofs = [];
     /** @type {Map<number, Prop[]>} */
     this.solidGrid = new Map();
@@ -675,26 +685,29 @@ function folkName(rnd) {
  * @param {Level} L @param {number} x0 @param {number} z0 @param {number} w @param {number} d
  * @param {'N'|'S'|'E'|'W'} side wall that holds the door @param {number} f floor height
  * @param {number} zone town index @param {Partial<Door>} doorOpts
+ * @param {number} [storeys] outside height in storeys (the hall inside stays one storey high)
+ * @param {boolean} [porch] thatched awning over the door
  * @returns {{x0:number, z0:number, x1:number, z1:number, door:Door}}
  */
-function building(L, x0, z0, w, d, side, f, zone, doorOpts) {
+function building(L, x0, z0, w, d, side, f, zone, doorOpts, storeys = 1, porch = false) {
   const x1 = x0 + w - 1;
   const z1 = z0 + d - 1;
+  const top = f + 3.3 * storeys;
   for (let j = z0; j <= z1; j++) {
     for (let i = x0; i <= x1; i++) {
       const k = L.idx(i, j);
       const edge = i === x0 || i === x1 || j === z0 || j === z1;
       L.wall[k] = edge ? TILE.TIMBER + 1 : 0;
-      L.wallTop[k] = f + 3.3;
+      L.wallTop[k] = top;
       L.floorTex[k] = TILE.PLANK;
       L.ceil[k] = f + 3;
       L.ceilTex[k] = TILE.PLASTER;
       L.zone[k] = zone;
     }
   }
-  L.roofs.push({ x0, z0, x1: x1 + 1, z1: z1 + 1, base: f + 3.3 });
   const di = side === 'N' || side === 'S' ? x0 + Math.floor(w / 2) : side === 'E' ? x1 : x0;
   const dj = side === 'E' || side === 'W' ? z0 + Math.floor(d / 2) : side === 'S' ? z1 : z0;
+  L.roofs.push({ x0, z0, x1: x1 + 1, z1: z1 + 1, base: top, floor: f, di, dj, side, porch });
   const door = L.addDoor(di, dj, { tex: TILE.WOOD_DOOR, height: 2.3, top: f + 3.3, base: f, ...doorOpts });
   return { x0: x0 + 1, z0: z0 + 1, x1: x1 - 1, z1: z1 - 1, door };
 }
@@ -732,7 +745,8 @@ function stampTown(L, id, zone, f, rnd) {
     const kind = kinds[n];
     const name = /** @type {Record<string, string>} */ (names)[kind] || 'House';
     const locked = kind === 'house';
-    b[kind].push(building(L, cx + x, cz + z, w, d, side, f, zone, { name, locked, lockLevel: locked ? 2 : 0 }));
+    const hall = kind === 'tavern' || kind === 'guild';
+    b[kind].push(building(L, cx + x, cz + z, w, d, side, f, zone, { name, locked, lockLevel: locked ? 2 : 0 }, hall ? 2 : 1, kind !== 'house'));
   });
   const tav = b.tavern[0];
   const guild = b.guild[0];

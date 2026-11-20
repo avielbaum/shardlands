@@ -104,7 +104,8 @@ const M = {
   brass: mat('#b08a4e', 0.38, 1), bronze: mat('#8a6a3c', 0.45, 1), brassTex: mat('#c8c0b0', 0.4, 1, 0, TILE.BRASS), gearTex: mat('#c8c0b0', 0.4, 1, 0, TILE.GEAR),
   verdigris: mat('#5a7a6a', 0.7, 0.3),
   leather: mat('#4a3324', 0.7), leatherDark: mat('#2e2119', 0.75), rope: mat('#8a7655', 0.95),
-  linen: mat('#b7aa92', 0.9), parchment: mat('#c9b88f', 0.92), clay: mat('#8f5f48', 0.8, 0, 0, TILE.ROOF),
+  linen: mat('#b7aa92', 0.9), parchment: mat('#c9b88f', 0.92), thatch: mat('#c9ad78', 0.9, 0, 0, TILE.ROOF), daub: mat('#ffffff', 0.85, 0, 0, TILE.TIMBER),
+  fieldstone: mat('#a39b8e', 0.88, 0, 0, TILE.MOSSY), glassDark: mat('#232a2e', 0.12),
   ley: mat('#6fe8ff', 0.2, 0, 3.5), leySoft: mat('#58c8dc', 0.3, 0, 1.6), ember: mat('#ff7a2a', 0.6, 0, 3), flame: mat('#ffb050', 0.6, 0, 2.6),
   coal: mat('#2a1f1a', 0.9), glass: mat('#ffd9a0', 0.15, 0, 3), void: mat('#050608', 1),
   water: mat('#1c2a2c', 0.08), crystal: mat('#8fe3f0', 0.12, 0, 2.2), crystalDim: mat('#3d5a63', 0.25, 0, 0.3),
@@ -510,11 +511,29 @@ export class Mesh {
 
   /**
    * Rounded box (fillet radius r) centred on the current origin, with smooth normals around its edges.
+   * r = 0 gives a sharp box of 12 triangles, for many small parts (building trim).
    * @param {number} hx @param {number} hy @param {number} hz half extents @param {number} r @param {Mat} mt
    */
   box(hx, hy, hz, r, mt) {
-    r = Math.max(0.002, Math.min(r, hx * 0.95, hy * 0.95, hz * 0.95));
     const h = [hx, hy, hz];
+    if (r <= 0) {
+      for (let ax = 0; ax < 3; ax++) {
+        for (const s of [-1, 1]) {
+          const ua = (ax + 1) % 3;
+          const va = (ax + 2) % 3;
+          const n = [0, 0, 0];
+          n[ax] = s;
+          const P = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => {
+            const p = [0, 0, 0];
+            p[ax] = s * h[ax]; p[ua] = a * h[ua]; p[va] = b * h[va];
+            return p;
+          });
+          this.quad(P, n, mt, P.map((p) => [p[ua] + h[ua], p[va] + h[va]]));
+        }
+      }
+      return this;
+    }
+    r = Math.max(0.002, Math.min(r, hx * 0.95, hy * 0.95, hz * 0.95));
     const inner = h.map((v) => v - r);
     // One bevel strip per edge: its smooth normals read as a rounded fillet under lighting.
     /** @param {number} k */
@@ -938,7 +957,7 @@ function buildWell(m) {
   m.tube([0, 1.75, 0], [0, 1.1, 0], 0.012, 0.012, 4, M.rope);
   m.push().at(0, 0.95, 0).lathe([[0.12, 0], [0.15, 0.2]], 10, M.wood, { cap0: true }).pop();
   for (const s of [-1, 1]) {
-    m.quad([[-1.15, 2.25, 0], [1.15, 2.25, 0], [1.15, 1.75, s * 0.75], [-1.15, 1.75, s * 0.75]], norm([0, 0.83, s * 0.55]), M.clay);
+    m.quad([[-1.15, 2.25, 0], [1.15, 2.25, 0], [1.15, 1.75, s * 0.75], [-1.15, 1.75, s * 0.75]], norm([0, 0.83, s * 0.55]), M.thatch);
   }
 }
 
@@ -1110,7 +1129,7 @@ function buildNotice(m) {
   for (let k = 0; k < 5; k++) {
     m.push().at(-0.5 + k * 0.25 + (rnd() - 0.5) * 0.05, 1.45 + (rnd() - 0.5) * 0.3, 0.065, 0, 0, (rnd() - 0.5) * 0.15).box(0.09, 0.12, 0.004, 0.002, M.parchment).pop();
   }
-  m.quad([[-0.95, 2.3, -0.25], [0.95, 2.3, -0.25], [0.95, 2.05, 0.3], [-0.95, 2.05, 0.3]], norm([0, 0.9, 0.42]), M.clay);
+  m.quad([[-0.95, 2.3, -0.25], [0.95, 2.3, -0.25], [0.95, 2.05, 0.3], [-0.95, 2.05, 0.3]], norm([0, 0.9, 0.42]), M.thatch);
 }
 
 /** Stone lectern with a glowing inscribed slab. @param {Mesh} m */
@@ -1570,59 +1589,116 @@ export function grassTuft(m, x, y, z, s, seed, tint) {
 }
 
 /**
- * Pitched, tiled gable roof with timber posts and plates over a building footprint.
- * @param {Mesh} m @param {{x0:number, z0:number, x1:number, z1:number, base:number}} r
+ * Exterior of a timber building: thick thatched gable roof with a ridge roll over half-timbered
+ * gables, a fieldstone plinth, timber posts, sill and plates, a jetty beam on two-storey halls,
+ * shuttered windows, a stone chimney and, on shops and halls, a thatched porch over the door.
+ * @param {Mesh} m @param {import('./world.js').Roof} r
  */
 export function buildRoof(m, r) {
   const sky = m.sky;
   m.sky = 1;
   const alongX = r.x1 - r.x0 >= r.z1 - r.z0;
-  const o = 0.35;
-  const span = alongX ? r.z1 - r.z0 : r.x1 - r.x0;
-  const rise = span * 0.42;
+  const hl = (alongX ? r.x1 - r.x0 : r.z1 - r.z0) / 2;
+  const hs = (alongX ? r.z1 - r.z0 : r.x1 - r.x0) / 2;
   const y0 = r.base;
-  const cx = (r.x0 + r.x1) / 2;
-  const cz = (r.z0 + r.z1) / 2;
-  const eaveDrop = (o * rise) / (span / 2);
-  if (alongX) {
-    for (const s of [-1, 1]) {
-      const zE = s < 0 ? r.z0 - o : r.z1 + o;
-      const n = norm([0, span / 2, s * rise]);
-      m.quad([[r.x0 - o, y0 - eaveDrop, zE], [r.x1 + o, y0 - eaveDrop, zE], [r.x1 + o, y0 + rise, cz], [r.x0 - o, y0 + rise, cz]], n, M.clay,
-        [[0, 0], [r.x1 - r.x0 + 2 * o, 0], [r.x1 - r.x0 + 2 * o, span / 2 + o], [0, span / 2 + o]]);
+  const H = y0 - r.floor;
+  const o = 0.45;
+  const t = 0.3;
+  const rise = hs * 1.2;
+  const drop = (o * rise) / hs;
+  const X = hl + 0.3;
+  const ez = hs + o;
+  const slope = Math.hypot(ez, rise + drop);
+  const thatchSide = shade(M.thatch, 0.8);
+  // Roof frame: ridge along local x. The roof is symmetric, so the quarter turn's direction does not matter.
+  m.push().at((r.x0 + r.x1) / 2, y0, (r.z0 + r.z1) / 2, alongX ? 0 : Math.PI / 2);
+  for (const s of [-1, 1]) {
+    const up = norm([0, hs, s * rise]);
+    const uv = [[0, 0], [2 * X, 0], [2 * X, slope], [0, slope]];
+    m.quad([[-X, -drop + t, s * ez], [X, -drop + t, s * ez], [X, rise + t, 0], [-X, rise + t, 0]], up, M.thatch, uv);
+    m.quad([[-X, -drop, s * ez], [X, -drop, s * ez], [X, rise, 0], [-X, rise, 0]], [0, -up[1], -up[2]], shade(M.thatch, 0.55), uv);
+    // Eave lip and verges show the thatch's thickness.
+    m.quad([[-X, -drop, s * ez], [X, -drop, s * ez], [X, -drop + t, s * ez], [-X, -drop + t, s * ez]], [0, 0, s], thatchSide, [[0, 0], [2 * X, 0], [2 * X, t], [0, t]]);
+    for (const e of [-1, 1]) {
+      m.quad([[e * X, -drop, s * ez], [e * X, rise, 0], [e * X, rise + t, 0], [e * X, -drop + t, s * ez]], [e, 0, 0], thatchSide, [[0, 0], [slope, 0], [slope, t], [0, t]]);
     }
-    // Gable ends, wound so their normals face outward.
-    m.tri([[r.x0, y0, r.z0], [r.x0, y0, r.z1], [r.x0, y0 + rise, cz]], M.plank, [[0, 0], [span, 0], [span / 2, rise]]);
-    m.tri([[r.x1, y0, r.z1], [r.x1, y0, r.z0], [r.x1, y0 + rise, cz]], M.plank, [[0, 0], [span, 0], [span / 2, rise]]);
-    m.tube([r.x0 - o, y0 + rise + 0.05, cz], [r.x1 + o, y0 + rise + 0.05, cz], 0.09, 0.09, 6, M.woodDark, { cap: true });
-  } else {
-    for (const s of [-1, 1]) {
-      const xE = s < 0 ? r.x0 - o : r.x1 + o;
-      const n = norm([s * rise, span / 2, 0]);
-      m.quad([[xE, y0 - eaveDrop, r.z0 - o], [xE, y0 - eaveDrop, r.z1 + o], [cx, y0 + rise, r.z1 + o], [cx, y0 + rise, r.z0 - o]], n, M.clay,
-        [[0, 0], [r.z1 - r.z0 + 2 * o, 0], [r.z1 - r.z0 + 2 * o, span / 2 + o], [0, span / 2 + o]]);
+  }
+  m.tube([-X - 0.05, rise + t * 0.8, 0], [X + 0.05, rise + t * 0.8, 0], 0.22, 0.22, 8, M.thatch, { cap: true });
+  // Half-timbered gable ends, wound so their normals face outward.
+  m.tri([[-hl, 0, -hs], [-hl, 0, hs], [-hl, rise, 0]], M.daub, [[0, 0], [2 * hs, 0], [hs, rise]]);
+  m.tri([[hl, 0, hs], [hl, 0, -hs], [hl, rise, 0]], M.daub, [[0, 0], [2 * hs, 0], [hs, rise]]);
+  // Stone chimney stack through one slope, with a cap.
+  const chH = rise * 0.6 + t + 0.9;
+  m.push().at(hl * 0.55, rise * 0.45 + chH / 2, hs * 0.3).box(0.38, chH / 2, 0.38, 0, M.fieldstone).pop();
+  m.push().at(hl * 0.55, rise * 0.45 + chH + 0.06, hs * 0.3).box(0.46, 0.07, 0.46, 0, M.stone).pop();
+  m.pop();
+
+  // Each outer wall in its own frame: origin at its left end on the ground floor, local x along the wall, +z outward.
+  /** @type {['N'|'S'|'E'|'W', number, number, number, number, number][]} side, origin x, z, turn, length, door start */
+  const walls = [
+    ['S', r.x0, r.z1, 0, r.x1 - r.x0, r.di - r.x0],
+    ['N', r.x1, r.z0, Math.PI, r.x1 - r.x0, r.x1 - r.di - 1],
+    ['E', r.x1, r.z1, Math.PI / 2, r.z1 - r.z0, r.z1 - r.dj - 1],
+    ['W', r.x0, r.z0, -Math.PI / 2, r.z1 - r.z0, r.dj - r.z0],
+  ];
+  const storeys = Math.round(H / 3.3);
+  for (const [side, ox, oz, ry, W, du] of walls) {
+    const door = side === r.side;
+    m.push().at(ox, r.floor, oz, ry);
+    // Plinth and sill run the length of the wall, broken by the doorway; the ends overlap at the corners.
+    const runs = door ? [[0, du], [du + 1, W]] : [[0, W]];
+    for (const [a0, b0] of runs) {
+      if (b0 - a0 < 0.05) continue;
+      const a = a0 === 0 ? -0.09 : a0;
+      const b = b0 === W ? W + 0.09 : b0;
+      m.push().at((a + b) / 2, -0.075, 0.02).box((b - a) / 2, 0.825, 0.07, 0, M.fieldstone).pop();
+      m.push().at((a + b) / 2, 0.82, 0.05).box((b - a) / 2, 0.07, 0.06, 0, M.woodDark).pop();
     }
-    m.tri([[r.x1, y0, r.z0], [r.x0, y0, r.z0], [cx, y0 + rise, r.z0]], M.plank, [[0, 0], [span, 0], [span / 2, rise]]);
-    m.tri([[r.x0, y0, r.z1], [r.x1, y0, r.z1], [cx, y0 + rise, r.z1]], M.plank, [[0, 0], [span, 0], [span / 2, rise]]);
-    m.tube([cx, y0 + rise + 0.05, r.z0 - o], [cx, y0 + rise + 0.05, r.z1 + o], 0.09, 0.09, 6, M.woodDark, { cap: true });
-  }
-  // Timber framing: corner posts and a top plate proud of the walls.
-  const e = 0.06;
-  for (const [x, z] of [[r.x0 - e, r.z0 - e], [r.x1 + e, r.z0 - e], [r.x0 - e, r.z1 + e], [r.x1 + e, r.z1 + e]]) {
-    m.push().at(x, y0 - 1.7, z).box(0.13, 1.7, 0.13, 0.03, M.woodDark).pop();
-  }
-  for (const [ax, az, bx, bz] of [[r.x0, r.z0 - e, r.x1, r.z0 - e], [r.x0, r.z1 + e, r.x1, r.z1 + e], [r.x0 - e, r.z0, r.x0 - e, r.z1], [r.x1 + e, r.z0, r.x1 + e, r.z1]]) {
-    const mx = (ax + bx) / 2;
-    const mz = (az + bz) / 2;
-    m.push().at(mx, y0 - 0.12, mz).box(Math.abs(bx - ax) / 2 + 0.1, 0.1, Math.abs(bz - az) / 2 + 0.1, 0.03, M.woodDark).pop();
-  }
-  // A stone chimney on larger roofs.
-  if (span > 5) {
-    const px = alongX ? r.x0 + (r.x1 - r.x0) * 0.75 : cx + span * 0.2;
-    const pz = alongX ? cz + span * 0.2 : r.z0 + (r.z1 - r.z0) * 0.75;
-    m.push().at(px, y0 + rise * 0.7, pz).box(0.35, rise * 0.75, 0.35, 0.04, M.stone).pop();
+    m.push().at(0, (H + 0.75) / 2, 0.05).box(0.12, (H - 0.75) / 2, 0.12, 0, M.woodDark).pop();
+    m.push().at(W / 2, H - 0.12, 0.04).box(W / 2 + 0.1, 0.1, 0.08, 0, M.woodDark).pop();
+    if (storeys > 1) {
+      // Jetty: a heavy beam on joist ends where the upper storey would overhang.
+      m.push().at(W / 2, 3.3, 0.1).box(W / 2 + 0.15, 0.13, 0.12, 0, M.woodDark).pop();
+      for (let u = 0.3; u < W; u += 0.5) m.push().at(u, 3.12, 0.12).box(0.06, 0.06, 0.1, 0, M.woodDark).pop();
+    }
+    for (let row = 0; row < storeys; row++) {
+      for (let c = 1; c <= W - 2; c += 2) {
+        if (door && Math.abs(c - du) <= 1) continue;
+        window_(m, c + 0.5, 1.55 + row * 3.3);
+      }
+    }
+    if (door) {
+      const u = du + 0.5;
+      m.push().at(u, -0.1, 0.35).box(0.6, 0.12, 0.3, 0, M.fieldstone).pop();
+      if (r.porch) {
+        // Thatched awning on two braces, sloping away from the wall above the door frame.
+        const d = 1.3;
+        const lift = 0.12;
+        const n = norm([0, d, 0.27]);
+        m.quad([[u - 1.2, 2.62 + lift, 0], [u + 1.2, 2.62 + lift, 0], [u + 1.2, 2.35 + lift, d], [u - 1.2, 2.35 + lift, d]], n, M.thatch, [[0, 0], [2.4, 0], [2.4, d], [0, d]]);
+        m.quad([[u - 1.2, 2.62, 0], [u + 1.2, 2.62, 0], [u + 1.2, 2.35, d], [u - 1.2, 2.35, d]], [0, -n[1], -n[2]], shade(M.thatch, 0.55), [[0, 0], [2.4, 0], [2.4, d], [0, d]]);
+        m.quad([[u - 1.2, 2.35, d], [u + 1.2, 2.35, d], [u + 1.2, 2.35 + lift, d], [u - 1.2, 2.35 + lift, d]], [0, 0, 1], thatchSide, [[0, 0], [2.4, 0], [2.4, lift], [0, lift]]);
+        for (const e of [-1, 1]) m.tube([u + e * 1.0, 1.85, 0.02], [u + e * 1.0, 2.42, d * 0.75], 0.05, 0.05, 6, M.woodDark, { cap: true });
+      }
+    }
+    m.pop();
   }
   m.sky = sky;
+}
+
+/** Shuttered window on a wall frame (local +z outward). @param {Mesh} m @param {number} u along the wall @param {number} y centre height */
+function window_(m, u, y) {
+  m.push().at(u, y, 0);
+  m.quad([[-0.3, -0.4, 0.02], [0.3, -0.4, 0.02], [0.3, 0.4, 0.02], [-0.3, 0.4, 0.02]], [0, 0, 1], M.glassDark);
+  for (const s of [-1, 1]) {
+    m.push().at(0, s * 0.43, 0.05).box(0.37, 0.05, 0.05, 0, M.woodDark).pop();
+    m.push().at(s * 0.33, 0, 0.05).box(0.05, 0.4, 0.05, 0, M.woodDark).pop();
+    m.push().at(s * 0.56, 0, 0.04).box(0.16, 0.43, 0.025, 0, M.wood).pop();
+  }
+  m.push().at(0, 0, 0.05).box(0.02, 0.4, 0.02, 0, M.woodDark).pop();
+  m.push().at(0, 0.05, 0.05).box(0.3, 0.02, 0.02, 0, M.woodDark).pop();
+  m.push().at(0, -0.5, 0.08).box(0.43, 0.035, 0.09, 0, M.woodDark).pop();
+  m.pop();
 }
 
 /**

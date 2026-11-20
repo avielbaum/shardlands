@@ -574,20 +574,16 @@ function paintLandTiles(ctx, at, rnd, na, nb) {
     o[0] = v; o[1] = isBeam ? v * 0.68 : v * 0.94; o[2] = isBeam ? v * 0.42 : v * 0.8;
   });
 
-  // Scalloped roof shingles.
+  // Layered straw thatch: strands run down the slope, each course's ragged butt ends shading the next.
   [ox, oy] = at(TILE.ROOF);
   paint(ctx, ox, oy, (x, y, o) => {
-    const row = Math.floor(y / 16);
-    const sx = (x + (row % 2) * 8) % 16;
-    const dy = (y % 16) / 16;
-    const curve = Math.abs(sx - 8) / 8;
-    const lip = dy > 0.75 - curve * curve * 0.4;
-    const tone = hash2(Math.floor((x + (row % 2) * 8) / 16), row, 6);
-    let v = 120 + tone * 40 + q(na(x, y), 4) * 20;
-    if (lip) v *= 0.55;
-    else if (dy < 0.15) v *= 1.15;
-    if (sx < 1) v *= 0.6;
-    o[0] = v * 1.08; o[1] = v * 0.52; o[2] = v * 0.38;
+    const course = Math.floor(y / 32);
+    const dy = ((y + hash2(x, course, 3) * 7) % 32) / 32;
+    const strand = hash2(x, course, 9);
+    let v = 140 + strand * 70 + q(na(x, y), 4) * 25;
+    v *= 0.45 + 0.55 * Math.min(1, dy * 2.5);
+    if (strand > 0.92) v *= 0.7;
+    o[0] = v; o[1] = v * 0.8; o[2] = v * 0.46;
   });
 
   // Rounded cobblestones.
@@ -2295,7 +2291,7 @@ const SURFACES = {
   [TILE.CAVE_CEIL]: { kind: 'stone', bump: 4.5, rough: 0.9, spec: 0.08 },
   [TILE.TIMBER]: { kind: 'timber', bump: 2.5, rough: 0.8, spec: 0.08 },
   [TILE.PLANK]: { kind: 'wood', bump: 2.5, rough: 0.6, spec: 0.25 },
-  [TILE.ROOF]: { kind: 'clay', bump: 3.5, rough: 0.7, spec: 0.18 },
+  [TILE.ROOF]: { kind: 'wood', bump: 3.5, rough: 0.9, spec: 0.05, vertical: true },
   [TILE.COBBLE]: { kind: 'stone', bump: 4.5, rough: 0.65, spec: 0.25, floor: true, moss: 0.3 },
   [TILE.WOOD_DOOR]: { kind: 'wood', bump: 2.5, rough: 0.65, spec: 0.2, vertical: true },
   [TILE.PLASTER]: { kind: 'plaster', bump: 1.5, rough: 0.85, spec: 0.06 },
