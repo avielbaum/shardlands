@@ -645,6 +645,8 @@ export function vertexNormals(pos, idx, out) {
 export const NPC_MODELS = { archivist: 'assets/models/archivist.glb' };
 /** Most joints one rigged model may use: the skinned shader's uniform budget (4 vectors each). */
 export const GLB_BONES = 32;
+/** Grid cells across a rigged model's largest extent for its far LOD (see clusterLod). */
+const LOD_CELLS = 48;
 /** Rigged models loaded by loadNpcModels(), by role. @type {Map<string, GlbModel>} */
 export const NPC_CHARS = new Map();
 /** Crossfade between animation clips, seconds. */
@@ -692,6 +694,7 @@ const STATE_CLIPS = { idle: /idle|stand|breath/i, walk: /walk|stroll/i, talk: /t
  * centred, scaled to a human height) and then the entity's placement.
  * @typedef {Object} GlbModel
  * @property {GlbPart[]} parts
+ * @property {GlbPart[]} far simplified parts for distant draws and shadows
  * @property {GlbMaterial[]} materials
  * @property {{bytes: Uint8Array, mime: string}[]} images embedded PNG/JPEG, until decoded
  * @property {ImageBitmap[]} bitmaps decoded images (browser only)
@@ -974,7 +977,7 @@ export function parseCharacter(buf) {
 
   /** @type {GlbModel} */
   const c = {
-    parts, materials, images, bitmaps: [], skinned: !!skin, parent, order, rest, fixed,
+    parts, far: clusterLod(parts), materials, images, bitmaps: [], skinned: !!skin, parent, order, rest, fixed,
     joints: Int32Array.from(joints), ibm: Float32Array.from(ibm), fit: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
     height: 0, clips, states, head, neck, headPos: new Float32Array(3),
     tmp: { a: new Float32Array(N * 10), b: new Float32Array(N * 10), world: new Float32Array(N * 16), m: new Float32Array(16), rf: new Float32Array(16) },
@@ -982,6 +985,49 @@ export function parseCharacter(buf) {
   fitModel(c);
   if (states.walk && states.walk !== idle) states.walk.speed = clipSpeed(c, states.walk, nodes);
   return c;
+}
+
+/**
+ * Far LOD by vertex clustering in the bind pose: vertices in one grid cell (1/LOD_CELLS of the
+ * model's coordinate range) facing the same octant merge into the first one, keeping its UV, normal and skin
+ * weights, and triangles that collapse are dropped.
+ * shortcut: clustering smears UV seams and thin parts, fine past CHAR_LOD_DIST; bake an offline (meshoptimizer) LOD into the .glb if far NPCs must look sharper.
+ * @param {GlbPart[]} parts @returns {GlbPart[]}
+ */
+export function clusterLod(parts) {
+  let lo = Infinity, hi = -Infinity;
+  for (const p of parts) for (const v of p.pos) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  const cell = (hi - lo) / LOD_CELLS || 1;
+  return parts.map((p) => {
+    const n = p.pos.length / 3;
+    const map = new Uint32Array(n);
+    /** @type {Map<number, number>} */
+    const cells = new Map();
+    /** @type {number[]} */
+    const keep = [];
+    for (let v = 0; v < n; v++) {
+      const [x, y, z] = [0, 1, 2].map((k) => Math.floor((p.pos[v * 3 + k] - lo) / cell));
+      // The normal's octant keeps the two sides of thin cloth and plates from fusing into holes.
+      const side = (p.nrm[v * 3] > 0 ? 1 : 0) + (p.nrm[v * 3 + 1] > 0 ? 2 : 0) + (p.nrm[v * 3 + 2] > 0 ? 4 : 0);
+      const key = ((x * 64 + y) * 64 + z) * 8 + side;
+      let r = cells.get(key);
+      if (r === undefined) { r = keep.length; cells.set(key, r); keep.push(v); }
+      map[v] = r;
+    }
+    /** @type {number[]} */
+    const idx = [];
+    for (let t = 0; t < p.idx.length; t += 3) {
+      const a = map[p.idx[t]], b = map[p.idx[t + 1]], d = map[p.idx[t + 2]];
+      if (a !== b && b !== d && a !== d) idx.push(a, b, d);
+    }
+    /** @template {Float32Array|Uint16Array} T @param {T} src @param {number} w @returns {T} */
+    const pick = (src, w) => {
+      const out = /** @type {T} */ (new /** @type {any} */ (src.constructor)(keep.length * w));
+      keep.forEach((v, i) => out.set(src.subarray(v * w, v * w + w), i * w));
+      return out;
+    };
+    return { pos: pick(p.pos, 3), nrm: pick(p.nrm, 3), uv: pick(p.uv, 2), joints: pick(p.joints, 4), weights: pick(p.weights, 4), idx: Uint32Array.from(idx), mat: p.mat };
+  });
 }
 
 /** Fresh area-weighted normals. @param {Float32Array} pos @param {Uint32Array} idx */

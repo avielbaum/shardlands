@@ -532,12 +532,44 @@ export class Character {
     return { ...this, inventory: this.inventory.items };
   }
 
-  /** @param {Object<string, any>} o @returns {Character} */
+  /**
+   * Rebuild a saved character field by field. Missing or bad values fall back to a new
+   * character's defaults and unknown item, spell and perk ids are dropped, so a damaged
+   * save can't leave NaN stats or ids that crash lookups later.
+   * @param {any} o @returns {Character}
+   */
   static fromJSON(o) {
+    if (!o || typeof o !== 'object') throw new Error('Save has no character');
     const c = new Character();
-    Object.assign(c, o);
-    c.inventory = new Inventory();
-    c.inventory.items = o.inventory || [];
+    const num = (/** @type {any} */ v, /** @type {number} */ d, lo = 0) => (Number.isFinite(v) && v >= lo ? v : d);
+    const item = (/** @type {any} */ id) => typeof id === 'string' && Object.hasOwn(ITEMS, id);
+    if (typeof o.name === 'string') c.name = o.name.slice(0, 32) || c.name;
+    if (Object.hasOwn(PROFESSIONS, o.profession)) c.profession = o.profession;
+    if (Object.hasOwn(BIRTHSIGNS, o.birthsign)) c.birthsign = o.birthsign;
+    c.fated = o.fated === true;
+    c.powerCD = num(o.powerCD, 0);
+    c.level = Math.floor(num(o.level, 1, 1));
+    for (const k of /** @type {const} */ (['skillUps', 'attrPoints', 'perkPoints', 'shards'])) c[k] = Math.floor(num(o[k], 0));
+    for (const k of /** @type {(keyof Character['attrs'])[]} */ (Object.keys(c.attrs))) c.attrs[k] = num(o.attrs?.[k], c.attrs[k]);
+    for (const k of Object.keys(c.skills)) c.skills[k] = { level: Math.floor(num(o.skills?.[k]?.level, 1, 1)), xp: num(o.skills?.[k]?.xp, 0) };
+    if (Array.isArray(o.perks)) c.perks = o.perks.filter((/** @type {any} */ p) => PERKS.some((q) => q.id === p));
+    if (Array.isArray(o.spells)) c.spells = o.spells.filter((/** @type {any} */ s) => typeof s === 'string' && Object.hasOwn(SPELLS, s));
+    if (Array.isArray(o.inventory)) {
+      for (const it of o.inventory) if (item(it?.id) && num(it.qty, 0, 1)) c.inventory.add(it.id, Math.floor(it.qty));
+    }
+    for (const k of /** @type {(keyof Character['equip'])[]} */ (Object.keys(c.equip))) c.equip[k] = item(o.equip?.[k]) ? o.equip[k] : null;
+    if (item(o.ammo)) c.ammo = o.ammo;
+    if (Array.isArray(o.hotbar)) {
+      c.hotbar = c.hotbar.map((_, i) => {
+        const s = o.hotbar[i];
+        const ok = s && ((s.kind === 'item' && item(s.id)) || (s.kind === 'spell' && c.spells.includes(s.id)));
+        return ok ? { kind: s.kind, id: s.id } : null;
+      });
+    }
+    for (const [k, v] of Object.entries(o.effects ?? {})) if (Number.isFinite(v) && v > 0) c.effects[k] = v;
+    c.hp = Math.min(num(o.hp, c.maxHp), c.maxHp);
+    c.mana = Math.min(num(o.mana, c.maxMana), c.maxMana);
+    c.stamina = Math.min(num(o.stamina, c.maxStamina), c.maxStamina);
     return c;
   }
 }

@@ -26,9 +26,10 @@ const HUMAN_VARIANTS = new Set(['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard
 /** @typedef {import('./world.js').Light} Light */
 /** @typedef {import('./world.js').Prop} Prop */
 /** @typedef {import('./models.js').ModelDesc} ModelDesc */
+/** @typedef {{vao: WebGLVertexArrayObject, count: number, itype: number, mat: import('./meshes.js').GlbMaterial|null}} GlbPartGPU */
 /**
- * A rigged .glb model on the GPU: its textures (by image index) and one VAO per part.
- * @typedef {{tex: WebGLTexture[], parts: {vao: WebGLVertexArrayObject, count: number, itype: number, mat: import('./meshes.js').GlbMaterial|null}[]}} GlbGPU
+ * A rigged .glb model on the GPU: its textures (by image index) and one VAO per part, full and far LOD.
+ * @typedef {{tex: WebGLTexture[], parts: GlbPartGPU[], far: GlbPartGPU[]}} GlbGPU
  */
 /**
  * @typedef {Object} SpriteDesc
@@ -989,7 +990,7 @@ function terrainNormal(L, i, j) {
 /**
  * Build the static world mesh for one chunk: tiles, smooth terrain, door surrounds and roofs.
  * @param {Level} L @param {number} cx @param {number} cz @param {Mesh} b @param {Uint8Array} roofMask
- * @param {{x0:number, z0:number, x1:number, z1:number, base:number}[]} roofs
+ * @param {import('./world.js').Roof[]} roofs
  */
 function buildChunk(L, cx, cz, b, roofMask, roofs) {
   b.reset();
@@ -1237,7 +1238,7 @@ export class Renderer {
     /** @type {Level|null} */
     this.level = null;
     this.roofMask = new Uint8Array(0);
-    /** @type {{x0:number, z0:number, x1:number, z1:number, base:number}[]} */
+    /** @type {import('./world.js').Roof[]} */
     this.roofs = [];
     /** @type {{x:number, z:number}[]} */
     this.wells = [];
@@ -1424,7 +1425,8 @@ export class Renderer {
       return t;
     });
     c.bitmaps = [];
-    const parts = c.parts.map((p) => {
+    /** @param {import('./meshes.js').GlbPart} p @returns {GlbPartGPU} */
+    const upload = (p) => {
       const vao = /** @type {WebGLVertexArrayObject} */ (gl.createVertexArray());
       gl.bindVertexArray(vao);
       /** @param {ArrayBufferView} data @param {number} loc @param {number} size @param {number} type @param {boolean} [int] */
@@ -1444,18 +1446,19 @@ export class Renderer {
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, small ? Uint16Array.from(p.idx) : p.idx, gl.STATIC_DRAW);
       gl.bindVertexArray(null);
       return { vao, count: p.idx.length, itype: small ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT, mat: c.materials[p.mat] ?? null };
-    });
-    g = { tex, parts };
+    };
+    g = { tex, parts: c.parts.map(upload), far: c.far.map(upload) };
     this.glbGpu.set(c, g);
     return g;
   }
 
   /**
    * Draw the characters that have a rigged .glb (ModelDesc.glb), posed by their animator, with
-   * the glb or glb-depth program bound.
+   * the glb or glb-depth program bound. Like _drawChars, distant ones and the shadow pass use the far LOD.
    * @param {{s: SpriteDesc, m: ModelDesc}[]} chars @param {Record<string, WebGLUniformLocation>} u @param {boolean} lit
+   * @param {{x:number, z:number}} eye
    */
-  _drawGlb(chars, u, lit) {
+  _drawGlb(chars, u, lit, eye) {
     const gl = this.gl;
     for (const { s, m } of chars) {
       if (!m.glb) continue;
@@ -1465,15 +1468,16 @@ export class Renderer {
       // right), lookUp is positive upward; poseGlb takes +yaw to the left and +pitch down.
       const gaze = m.gaze ?? 0;
       const n = poseGlb(c, m.glb.layers, trs(s.x, s.y, s.z, Math.PI / 2 - m.yaw, 0, 0, m.scale, this.glbRoot), this.glbBones, -(m.look ?? 0) * gaze, -(m.lookUp ?? 0) * gaze);
-      this._drawGlbParts(g, u, lit, n, c.skinned, s.sky, s.tint);
+      const far = !lit || Math.hypot(s.x - eye.x, s.z - eye.z) > CHAR_LOD_DIST;
+      this._drawGlbParts(g, u, lit, n, c.skinned, s.sky, s.tint, far);
     }
   }
 
   /**
    * @param {GlbGPU} g @param {Record<string, WebGLUniformLocation>} u @param {boolean} lit @param {number} n matrices in glbBones
-   * @param {boolean} skinned @param {number} sky @param {number[]} tint
+   * @param {boolean} skinned @param {number} sky @param {number[]} tint @param {boolean} [far] draw the far LOD
    */
-  _drawGlbParts(g, u, lit, n, skinned, sky, tint) {
+  _drawGlbParts(g, u, lit, n, skinned, sky, tint, far = false) {
     const gl = this.gl;
     gl.uniformMatrix4fv(u.uBones, false, this.glbBones.subarray(0, n * 16));
     gl.uniform1i(u.uUseSkinning, skinned ? 1 : 0);
@@ -1481,7 +1485,7 @@ export class Renderer {
       gl.uniform1f(u.uSky, sky);
       gl.uniform3fv(u.uTint, tint);
     }
-    for (const p of g.parts) {
+    for (const p of far ? g.far : g.parts) {
       if (lit) {
         const mt = p.mat;
         [mt?.base ?? -1, mt?.normal ?? -1, mt?.mr ?? -1].forEach((i, k) => {
@@ -1994,7 +1998,7 @@ export class Renderer {
       this._drawChars(chars, du, false, v.eye);
       gl.useProgram(this.depthGlb.prog);
       gl.uniformMatrix4fv(this.depthGlb.u.uViewProj, false, svp);
-      this._drawGlb(chars, this.depthGlb.u, false);
+      this._drawGlb(chars, this.depthGlb.u, false, v.eye);
       const diu = this.depthInst.u;
       gl.useProgram(this.depthInst.prog);
       gl.uniformMatrix4fv(diu.uViewProj, false, svp);
@@ -2063,7 +2067,7 @@ export class Renderer {
     if (chars.some((c) => c.m.glb)) {
       gl.useProgram(this.glb.prog);
       this._common(this.glb.u, viewProj, v, n, k);
-      this._drawGlb(chars, this.glb.u, true);
+      this._drawGlb(chars, this.glb.u, true, v.eye);
     }
 
     // Instanced props, foliage, grass and items.
