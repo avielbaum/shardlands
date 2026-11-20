@@ -3,7 +3,8 @@
  * World tiles sample 512px texture-array PBR layers (albedo, tangent-space normal,
  * roughness/specular/cavity/metal). Props, foliage, architecture and items are true 3D meshes
  * (models.js), hardware-instanced per model with CPU distance/facing culling and a far LOD;
- * characters are skinned to up to 16 bones per draw. Shading is Cook-Torrance (GGX, Smith,
+ * characters are skinned to up to 16 bones per draw, and rigged .glb NPCs (meshes.js) to up to
+ * 32 joints at 4 weights per vertex with their own baked PBR maps. Shading is Cook-Torrance (GGX, Smith,
  * Schlick) for the sun/moon and 16 point lights, plus hemisphere sky/ground ambient and a
  * split-sum environment approximation. A 2048px directional shadow map (DEPTH_COMPONENT24,
  * 3x3 hardware PCF) grounds everything outdoors; SSAO (half-res, bilateral blur) darkens
@@ -16,6 +17,7 @@ import {
   Mesh, VERT, MAX_BONES, ident, mul, trs, buildModel, hasModel, nominalSize, isItemModel, VARIANTS, grassTuft, buildRoof,
   buildDoorFrame, getRig, poseRig, getViewmodel, RIG_NAMES,
 } from './models.js';
+import { NPC_CHARS, GLB_BONES, poseGlb } from './meshes.js';
 
 /** Townsfolk rigs that come in two looks (constructs and the Archivist have one). */
 const HUMAN_VARIANTS = new Set(['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard', 'master', 'keeper', 'captain']);
@@ -24,6 +26,10 @@ const HUMAN_VARIANTS = new Set(['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard
 /** @typedef {import('./world.js').Light} Light */
 /** @typedef {import('./world.js').Prop} Prop */
 /** @typedef {import('./models.js').ModelDesc} ModelDesc */
+/**
+ * A rigged .glb model on the GPU: its textures (by image index) and one VAO per part.
+ * @typedef {{tex: WebGLTexture[], parts: {vao: WebGLVertexArrayObject, count: number, itype: number, mat: import('./meshes.js').GlbMaterial|null}[]}} GlbGPU
+ */
 /**
  * @typedef {Object} SpriteDesc
  * @property {number} x
@@ -144,6 +150,34 @@ void main() {
   gl_Position = uViewProj * wp;
 }`;
 
+/**
+ * Vertex shader for rigged .glb models: 4 joints and weights per vertex (uUseSkinning), or one
+ * placement matrix in uBones[0] for a static model. Feeds the same varyings as MESH_VS.
+ */
+const GLB_VS = `
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aUV;
+layout(location=3) in uvec4 aJoints;
+layout(location=4) in vec4 aWeights;
+uniform mat4 uBones[${GLB_BONES}];
+uniform bool uUseSkinning;
+uniform mat4 uViewProj;
+uniform float uSky;
+uniform vec3 uTint;
+uniform float uBase;
+out vec3 vPos; out vec3 vNormal; out vec2 vUV; out vec3 vCol; out vec4 vMat; out float vSky; out vec4 vTintEmit;
+out vec3 vObj; out float vH;
+void main() {
+  mat4 B = uBones[0];
+  if (uUseSkinning) B = uBones[aJoints.x] * aWeights.x + uBones[aJoints.y] * aWeights.y + uBones[aJoints.z] * aWeights.z + uBones[aJoints.w] * aWeights.w;
+  vec4 wp = B * vec4(aPos, 1.0);
+  vNormal = mat3(B) * aNormal;
+  vPos = wp.xyz; vUV = aUV; vCol = vec3(1.0); vMat = vec4(0.0); vSky = uSky;
+  vTintEmit = vec4(uTint, 0.0); vObj = aPos; vH = wp.y - uBase;
+  gl_Position = uViewProj * wp;
+}`;
+
 const DEPTH_FS = `
 precision mediump float;
 out vec4 outColor;
@@ -176,6 +210,13 @@ uniform vec3 uSunDir;
 uniform vec3 uSunCol;
 uniform float uStore;
 uniform float uWet;
+#ifdef GLB
+uniform sampler2D uGlbAlbedo;
+uniform sampler2D uGlbNormal;
+uniform sampler2D uGlbMR;
+uniform vec4 uGlbFactor;
+uniform vec3 uGlbMRF;
+#endif
 out vec4 outColor;
 
 vec3 lin(vec3 c) { return pow(max(c, 0.0), vec3(2.2)); }
@@ -293,6 +334,30 @@ void main() {
   float sss = 0.0;
   // Character layers (wool, skin, leather, hair) live on moving, two-sided cloth and bodies.
   bool charL = layer > ${CHAR_LAYER.WOOL - 0.5};
+#ifdef GLB
+  // Rigged .glb character with its own baked maps (glTF: G roughness, B metal; +Y-up normal map,
+  // whose green flips for the cotangent frame). One material covers skin and clothes, so skin is
+  // told by hue: it gets subsurface scattering that rises with curvature, everything organic
+  // keeps the 0.45 light wrap, and fabric gets the grazing fibre sheen.
+  if (dot(N, V) < 0.0) N = -N;
+  vec3 texel = texture(uGlbAlbedo, vUV).rgb * uGlbFactor.rgb;
+  vec4 mr = texture(uGlbMR, vUV);
+  rough = clamp(mr.g * uGlbMRF.y, 0.04, 1.0);
+  metal = clamp(mr.b * uGlbMRF.x, 0.0, 1.0);
+  if (uGlbMRF.z > 0.5) {
+    vec3 tn = texture(uGlbNormal, vUV).xyz * 2.0 - 1.0;
+    N = perturb(N, vPos, vUV, vec3(tn.x, -tn.y, tn.z));
+  }
+  albedo = lin(texel);
+  float sat = (texel.r - texel.b) / max(texel.r, 1e-3);
+  // Soft thresholds: a hard cut flips neighbouring texels of brown cloth between skin and cloth.
+  float skin = smoothstep(0.0, 0.04, texel.g - texel.b) * smoothstep(0.0, 0.04, texel.r - texel.g) * smoothstep(0.1, 0.2, sat) * smoothstep(0.75, 0.6, sat) * smoothstep(0.3, 0.5, texel.r) * (1.0 - metal);
+  float curv = length(fwidth(normalize(vNormal))) / max(length(fwidth(vPos)), 1e-5);
+  sss = skin * clamp(0.3 + curv * 0.009, 0.3, 1.0);
+  wrap = 0.45 * (1.0 - metal);
+  sheen = 0.45 * (1.0 - skin) * (1.0 - metal);
+  rough = mix(rough, clamp(rough, 0.52, 0.65), skin);
+#else
   if (layer >= 0.0) {
     if (charL && dot(N, V) < 0.0) N = -N;
     vec2 uv = vUV;
@@ -366,6 +431,7 @@ void main() {
     wrap = metal < 0.2 && vMat.y > 0.45 ? 0.45 : 0.0;
     emission = lin(vCol) * vMat.w * vTintEmit.w * (0.9 + 0.1 * sin(uTime * 6.0 + vPos.y * 9.0));
   }
+#endif
   albedo *= vTintEmit.rgb;
   emission *= vTintEmit.rgb;
 
@@ -690,6 +756,9 @@ const UNIFORMS = {
   meshInst: ['uViewProj', 'uTime', 'uWind', ...SHARED_FS_UNIFORMS],
   depth: ['uViewProj', 'uBones', 'uTime', 'uWind'],
   depthInst: ['uViewProj', 'uTime', 'uWind'],
+  glb: ['uViewProj', 'uBones', 'uUseSkinning', 'uSky', 'uTint', 'uBase', 'uTime', 'uGlbAlbedo', 'uGlbNormal', 'uGlbMR', 'uGlbFactor', 'uGlbMRF',
+    ...SHARED_FS_UNIFORMS.filter((n) => !['uAlbedo', 'uNormal', 'uMat'].includes(n))],
+  depthGlb: ['uViewProj', 'uBones', 'uUseSkinning'],
   fx: ['uViewProj', 'uCamRight', 'uCamUp', 'uStore'],
   rain: ['uViewProj', 'uEye', 'uTime', 'uWind', 'uCamRight', 'uRainCol', 'uStore'],
   sky: ['uInvViewProj', 'uEye', 'uFog', 'uZenith', 'uSunDir', 'uSunCol', 'uStore'],
@@ -1080,6 +1149,10 @@ export class Renderer {
     this.meshInst = createProgram(gl, glsl(MESH_VS, ['INSTANCED']), glsl(MESH_FS), UNIFORMS.meshInst);
     this.depth = createProgram(gl, glsl(MESH_VS), glsl(DEPTH_FS), UNIFORMS.depth);
     this.depthInst = createProgram(gl, glsl(MESH_VS, ['INSTANCED']), glsl(DEPTH_FS), UNIFORMS.depthInst);
+    this.glb = createProgram(gl, glsl(GLB_VS), glsl(MESH_FS, ['GLB']), UNIFORMS.glb);
+    this.depthGlb = createProgram(gl, glsl(GLB_VS), glsl(DEPTH_FS), UNIFORMS.depthGlb);
+    this.anisoExt = anisoExt;
+    this.aniso = aniso;
     this.fx = createProgram(gl, FX_VS, FX_FS, UNIFORMS.fx);
     this.rain = createProgram(gl, RAIN_VS, RAIN_FS, UNIFORMS.rain);
     this.sky = createProgram(gl, POST_VS, SKY_FS, UNIFORMS.sky);
@@ -1171,6 +1244,14 @@ export class Renderer {
     this.skinMats = new Float32Array(MAX_BONES * 16);
     this.identBones = new Float32Array(MAX_BONES * 16);
     for (let i = 0; i < MAX_BONES; i++) this.identBones.set(ident(), i * 16);
+    /** Rigged .glb models on the GPU. @type {Map<import('./meshes.js').GlbModel, GlbGPU>} */
+    this.glbGpu = new Map();
+    this.glbBones = new Float32Array(GLB_BONES * 16);
+    this.glbRoot = new Float32Array(16);
+    /** 1x1 white texture standing in for a map a .glb material lacks. */
+    this.whiteTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.whiteTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
     this.postVAO = gl.createVertexArray();
     /** @type {Target|null} */
     this.sceneRT = null;
@@ -1196,6 +1277,7 @@ export class Renderer {
     }
     for (const n of ['tree_ley', 'tree_pine', 'tree_dead', 'rock', 'ruin']) for (let k = 0; k < 4; k++) warm.push(() => this._cpuModel(`${n}#${k}`), () => this._cpuModel(`${n}#${k}~`));
     for (const id of ['fork', 'scatter', 'crossbow', 'cast', 'lantern']) warm.push(() => getViewmodel(id));
+    for (const c of NPC_CHARS.values()) warm.push(() => this._glbGpu(c));
     const step = () => {
       const job = warm.shift();
       if (!job) return;
@@ -1303,6 +1385,101 @@ export class Renderer {
     s = this._uploadMesh(make());
     this.skinned.set(key, s);
     return s;
+  }
+
+  /**
+   * Upload a rigged model: one VAO per part, and its embedded images as mipmapped, anisotropic
+   * TEXTURE_2Ds (trilinear). The decoded bitmaps are released once on the GPU.
+   * @param {import('./meshes.js').GlbModel} c @returns {GlbGPU}
+   */
+  _glbGpu(c) {
+    let g = this.glbGpu.get(c);
+    if (g) return g;
+    const gl = this.gl;
+    const tex = c.bitmaps.map((bm) => {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texStorage2D(gl.TEXTURE_2D, 1 + Math.floor(Math.log2(Math.max(bm.width, bm.height))), gl.RGBA8, bm.width, bm.height);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bm);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      if (this.anisoExt) gl.texParameterf(gl.TEXTURE_2D, this.anisoExt.TEXTURE_MAX_ANISOTROPY_EXT, this.aniso);
+      bm.close();
+      return t;
+    });
+    c.bitmaps = [];
+    const parts = c.parts.map((p) => {
+      const vao = /** @type {WebGLVertexArrayObject} */ (gl.createVertexArray());
+      gl.bindVertexArray(vao);
+      /** @param {ArrayBufferView} data @param {number} loc @param {number} size @param {number} type @param {boolean} [int] */
+      const attr = (data, loc, size, type, int = false) => {
+        gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(loc);
+        if (int) gl.vertexAttribIPointer(loc, size, type, 0, 0); else gl.vertexAttribPointer(loc, size, type, false, 0, 0);
+      };
+      attr(p.pos, 0, 3, gl.FLOAT);
+      attr(p.nrm, 1, 3, gl.FLOAT);
+      attr(p.uv, 2, 2, gl.FLOAT);
+      attr(p.joints, 3, 4, gl.UNSIGNED_SHORT, true);
+      attr(p.weights, 4, 4, gl.FLOAT);
+      const small = p.pos.length / 3 <= 65536;
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, small ? Uint16Array.from(p.idx) : p.idx, gl.STATIC_DRAW);
+      gl.bindVertexArray(null);
+      return { vao, count: p.idx.length, itype: small ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT, mat: c.materials[p.mat] ?? null };
+    });
+    g = { tex, parts };
+    this.glbGpu.set(c, g);
+    return g;
+  }
+
+  /**
+   * Draw the characters that have a rigged .glb (ModelDesc.glb), posed by their animator, with
+   * the glb or glb-depth program bound.
+   * @param {{s: SpriteDesc, m: ModelDesc}[]} chars @param {Record<string, WebGLUniformLocation>} u @param {boolean} lit
+   */
+  _drawGlb(chars, u, lit) {
+    const gl = this.gl;
+    for (const { s, m } of chars) {
+      if (!m.glb) continue;
+      const c = m.glb.model;
+      const g = this._glbGpu(c);
+      const n = poseGlb(c, m.glb.layers, trs(s.x, s.y, s.z, Math.PI / 2 - m.yaw, 0, 0, m.scale, this.glbRoot), this.glbBones);
+      this._drawGlbParts(g, u, lit, n, c.skinned, s.sky, s.tint, s.y);
+    }
+  }
+
+  /**
+   * @param {GlbGPU} g @param {Record<string, WebGLUniformLocation>} u @param {boolean} lit @param {number} n matrices in glbBones
+   * @param {boolean} skinned @param {number} sky @param {number[]} tint @param {number} base
+   */
+  _drawGlbParts(g, u, lit, n, skinned, sky, tint, base) {
+    const gl = this.gl;
+    gl.uniformMatrix4fv(u.uBones, false, this.glbBones.subarray(0, n * 16));
+    gl.uniform1i(u.uUseSkinning, skinned ? 1 : 0);
+    if (lit) {
+      gl.uniform1f(u.uSky, sky);
+      gl.uniform3fv(u.uTint, tint);
+      gl.uniform1f(u.uBase, base);
+    }
+    for (const p of g.parts) {
+      if (lit) {
+        const mt = p.mat;
+        [mt?.base ?? -1, mt?.normal ?? -1, mt?.mr ?? -1].forEach((i, k) => {
+          gl.activeTexture(gl.TEXTURE5 + k);
+          gl.bindTexture(gl.TEXTURE_2D, g.tex[i] ?? this.whiteTex);
+        });
+        gl.activeTexture(gl.TEXTURE0);
+        gl.uniform4fv(u.uGlbFactor, mt?.color ?? [1, 1, 1, 1]);
+        gl.uniform3f(u.uGlbMRF, mt?.metal ?? 0, mt?.rough ?? 0.6, mt && g.tex[mt.normal] ? 1 : 0);
+      }
+      gl.bindVertexArray(p.vao);
+      gl.drawElements(gl.TRIANGLES, p.count, p.itype, 0);
+    }
   }
 
   /** Drop every chunk mesh and switch to another level. @param {Level} level */
@@ -1658,6 +1835,7 @@ export class Renderer {
   _drawChars(chars, u, lit, eye) {
     const gl = this.gl;
     for (const { s, m } of chars) {
+      if (m.glb) continue;
       const far = !lit || Math.hypot(s.x - eye.x, s.z - eye.z) > CHAR_LOD_DIST;
       const v = m.variant ?? 0;
       const rig = getRig(m.rig, far, v);
@@ -1707,7 +1885,7 @@ export class Renderer {
     gl.uniform1f(u.uWet, k.wet);
     gl.uniformMatrix4fv(u.uShadowMat, false, this.shadowMat);
     gl.uniform1f(u.uShadowOn, k.shadowOn);
-    [u.uAlbedo, u.uNormal, u.uMat, u.uDetail, u.uShadowMap].forEach((loc, i) => gl.uniform1i(loc, i));
+    [u.uAlbedo, u.uNormal, u.uMat, u.uDetail, u.uShadowMap, u.uGlbAlbedo, u.uGlbNormal, u.uGlbMR].forEach((loc, i) => loc && gl.uniform1i(loc, i));
   }
 
   /** Draw a fullscreen pass into a target (or the canvas). @param {Target|null} rt */
@@ -1799,6 +1977,9 @@ export class Renderer {
       gl.bindVertexArray(this.doorBuf.vao);
       gl.drawArrays(gl.TRIANGLES, 0, this.doorMesh.count);
       this._drawChars(chars, du, false, v.eye);
+      gl.useProgram(this.depthGlb.prog);
+      gl.uniformMatrix4fv(this.depthGlb.u.uViewProj, false, svp);
+      this._drawGlb(chars, this.depthGlb.u, false);
       const diu = this.depthInst.u;
       gl.useProgram(this.depthInst.prog);
       gl.uniformMatrix4fv(diu.uViewProj, false, svp);
@@ -1864,6 +2045,11 @@ export class Renderer {
     gl.drawArrays(gl.TRIANGLES, 0, this.doorMesh.count);
     this._drawChars(chars, u, true, v.eye);
     if (v.view) this._drawViewmodel(v, view, u, eyeSky);
+    if (chars.some((c) => c.m.glb)) {
+      gl.useProgram(this.glb.prog);
+      this._common(this.glb.u, viewProj, v, n, k);
+      this._drawGlb(chars, this.glb.u, true);
+    }
 
     // Instanced props, foliage, grass and items.
     gl.useProgram(this.meshInst.prog);
@@ -2004,16 +2190,27 @@ export class Renderer {
     let rt = null;
     try {
       rt = this._target(null, px, px, true);
+      const glbM = NPC_CHARS.get(rigName);
       const rig = getRig(rigName, false, variant);
-      const gpu = this._skinned(`rig:${rigName}#${variant}`, () => rig.mesh);
       // t = 2.6 s falls between blinks (see poseRig).
       /** @type {import('./models.js').ModelDesc} */
       const desc = { rig: rigName, yaw: Math.PI / 2, t: 2.6, walk: 0, phase: 0, act: '', k: 0, stagger: 0, dead: 0, scale: 1 };
-      const n = poseRig(rig, desc, 0, 0, 0, this.bones);
-      // Frame on the face (head bone is index 2), aiming a little low to take in the shoulders.
-      const H = this.bones.subarray(32, 48);
-      const hp = [0, 0.13, 0.05];
-      const fc = [0, 1, 2].map((i) => H[i] * hp[0] + H[4 + i] * hp[1] + H[8 + i] * hp[2] + H[12 + i]);
+      let n;
+      /** @type {number[]} */
+      let fc;
+      if (glbM) {
+        // Rigged model: the idle's first frame (idles glance about later), framed a little above
+        // its head joint (the skull base).
+        const idle = glbM.states.idle;
+        n = poseGlb(glbM, idle ? [{ clip: idle, time: 0, weight: 1 }] : [], trs(0, 0, 0, 0, 0, 0, 1, this.glbRoot), this.glbBones);
+        fc = [glbM.headPos[0], glbM.headPos[1] + 0.1, glbM.headPos[2] + 0.02];
+      } else {
+        n = poseRig(rig, desc, 0, 0, 0, this.bones);
+        // Frame on the face (head bone is index 2), aiming a little low to take in the shoulders.
+        const H = this.bones.subarray(32, 48);
+        const hp = [0, 0.13, 0.05];
+        fc = [0, 1, 2].map((i) => H[i] * hp[0] + H[4 + i] * hp[1] + H[8 + i] * hp[2] + H[12 + i]);
+      }
       const look = [fc[0], fc[1] - 0.08, fc[2]];
       const eye = [look[0] + Math.sin(0.42) * 0.72, look[1] + 0.05, look[2] + Math.cos(0.42) * 0.72];
       const d = [look[0] - eye[0], look[1] - eye[1], look[2] - eye[2]];
@@ -2041,8 +2238,9 @@ export class Renderer {
         lp.set([fc[0] + l[0], fc[1] + l[1], fc[2] + l[2]], i * 3);
         lc.set([l[3], l[4], l[5]], i * 3);
       });
-      const u = this.mesh.u;
-      gl.useProgram(this.mesh.prog);
+      const prog = glbM ? this.glb : this.mesh;
+      const u = prog.u;
+      gl.useProgram(prog.prog);
       gl.uniformMatrix4fv(u.uViewProj, false, vp);
       gl.uniform3fv(u.uLightPos, lp);
       gl.uniform3fv(u.uLightCol, lc);
@@ -2060,13 +2258,17 @@ export class Renderer {
       gl.uniform1f(u.uWet, 0);
       gl.uniformMatrix4fv(u.uShadowMat, false, ident());
       gl.uniform1f(u.uShadowOn, 0);
-      [u.uAlbedo, u.uNormal, u.uMat, u.uDetail, u.uShadowMap].forEach((loc, i) => gl.uniform1i(loc, i));
-      gl.uniformMatrix4fv(u.uBones, false, this._skin(rig, n));
-      gl.uniform1f(u.uSky, 0);
-      gl.uniform3fv(u.uTint, WHITE);
-      gl.uniform1f(u.uEmit, 1);
-      gl.uniform1f(u.uBase, 0);
-      this._drawIndexed(gpu);
+      [u.uAlbedo, u.uNormal, u.uMat, u.uDetail, u.uShadowMap, u.uGlbAlbedo, u.uGlbNormal, u.uGlbMR].forEach((loc, i) => loc && gl.uniform1i(loc, i));
+      if (glbM) {
+        this._drawGlbParts(this._glbGpu(glbM), u, true, n, glbM.skinned, 0, WHITE, 0);
+      } else {
+        gl.uniformMatrix4fv(u.uBones, false, this._skin(rig, n));
+        gl.uniform1f(u.uSky, 0);
+        gl.uniform3fv(u.uTint, WHITE);
+        gl.uniform1f(u.uEmit, 1);
+        gl.uniform1f(u.uBase, 0);
+        this._drawIndexed(this._skinned(`rig:${rigName}#${variant}`, () => rig.mesh));
+      }
       gl.bindVertexArray(null);
 
       // Read back, average 2x2, ACES tone map and gamma, flip to top-down rows.

@@ -11,7 +11,7 @@ import {
 } from './world.js';
 import { Renderer } from './renderer.js';
 import { setBodies } from './models.js';
-import { loadBodies } from './meshes.js';
+import { loadBodies, loadNpcModels } from './meshes.js';
 import { AudioEngine } from './audio.js';
 import { SPR, spriteRect } from './textures.js';
 import { Player, Enemy, Orb, NPC, Particle, angleDiff } from './entities.js';
@@ -2997,6 +2997,10 @@ class App {
           h('p', {}, 'The lamps of Cinderwick and Oakhaven burn steady tonight. The roads, the vaults and the guilds are still yours to explore.'),
           btn('Continue exploring', () => this.setState('EXPLORE')));
       }
+    } else if (this.state === 'DIALOGUE' && this.talkNpc) {
+      // The world waits during a conversation, but the speaker keeps turning to face the
+      // player and gesturing (its talk animation).
+      this.talkNpc.update(dt, g, true);
     } else if (this.state === 'TITLE') {
       g.player.yaw += dt * 0.1;
       g.time += dt;
@@ -3045,11 +3049,14 @@ class App {
 // back to the procedural bodies.
 requestAnimationFrame(() => requestAnimationFrame(async () => {
   const msg = document.getElementById('boot-error');
+  // Rigged NPC models load alongside; each one that fails leaves its role on the procedural rig.
+  const npcModels = loadNpcModels();
   try {
     setBodies(await loadBodies());
   } catch (err) {
     console.warn('Base meshes unavailable; using procedural bodies.', err);
   }
+  await npcModels;
   try {
     new App();
     if (msg) { msg.textContent = ''; msg.style.display = 'none'; }

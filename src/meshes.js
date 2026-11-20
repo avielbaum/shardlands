@@ -27,6 +27,9 @@ const COMPONENT = {
 };
 const WIDTH = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16 };
 
+/** Required extensions the loader handles: WebP images decode through createImageBitmap like PNG and JPEG. */
+const SUPPORTED_EXTENSIONS = ['EXT_texture_webp'];
+
 /**
  * Split a .glb into its JSON document and binary chunk, validating the container.
  * @param {ArrayBuffer} buf @returns {{json: any, bin: DataView}}
@@ -49,7 +52,8 @@ export function parseGLB(buf) {
     off += 8 + len + ((4 - (len % 4)) % 4);
   }
   if (!json || !bin) throw new Error('glTF is missing its JSON or BIN chunk');
-  if (json.extensionsRequired?.length) throw new Error(`glTF requires unsupported extensions: ${json.extensionsRequired.join(', ')}`);
+  const unsupported = (json.extensionsRequired ?? []).filter((/** @type {string} */ e) => !SUPPORTED_EXTENSIONS.includes(e));
+  if (unsupported.length) throw new Error(`glTF requires unsupported extensions: ${unsupported.join(', ')}`);
   return { json, bin };
 }
 
@@ -626,4 +630,480 @@ export function vertexNormals(pos, idx, out) {
     const l = Math.hypot(out[v], out[v + 1], out[v + 2]) || 1;
     out[v] /= l; out[v + 1] /= l; out[v + 2] /= l;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Rigged, animated NPC models (assets/models/*.glb)
+// ---------------------------------------------------------------------------
+
+/**
+ * Rigged NPC models by role (the NPC's sprite name: archivist, merchant, guard, folk_a, ...).
+ * Once a role's .glb is in assets/models/, add one line here; roles without one keep their
+ * procedural rig, and so does any role whose file fails to load.
+ * @type {Record<string, string>}
+ */
+export const NPC_MODELS = { archivist: 'assets/models/archivist.glb' };
+/** Most joints one rigged model may use: the skinned shader's uniform budget (4 vectors each). */
+export const GLB_BONES = 32;
+/** Rigged models loaded by loadNpcModels(), by role. @type {Map<string, GlbModel>} */
+export const NPC_CHARS = new Map();
+/** Crossfade between animation clips, seconds. */
+const FADE = 0.3;
+/** Keywords that pick each animation state's clip (Meshy names them Idle, Casual_Walk, Talk_with_Hands_Open...). */
+const STATE_CLIPS = { idle: /idle|stand|breath/i, walk: /walk|stroll/i, talk: /talk|speak|convers|gestur/i };
+
+/**
+ * @typedef {Object} GlbChannel
+ * @property {number} node
+ * @property {number} off offset into a node's 10 local floats: 0 translation, 3 rotation, 7 scale
+ * @property {number} w 3 or 4 components
+ * @property {Float32Array} times
+ * @property {Float32Array} values w floats per key
+ * @property {boolean} step STEP interpolation
+ */
+/**
+ * @typedef {Object} GlbClip
+ * @property {string} name
+ * @property {number} dur seconds
+ * @property {GlbChannel[]} ch
+ * @property {number} speed ground speed of the feet at rate 1, m/s (set for the walk clip)
+ */
+/**
+ * @typedef {Object} GlbMaterial
+ * @property {number} base image index of baseColorTexture, or -1
+ * @property {number} normal image index of normalTexture, or -1
+ * @property {number} mr image index of metallicRoughnessTexture (G roughness, B metal), or -1
+ * @property {number[]} color baseColorFactor
+ * @property {number} metal metallicFactor
+ * @property {number} rough roughnessFactor
+ */
+/**
+ * @typedef {Object} GlbPart
+ * @property {Float32Array} pos
+ * @property {Float32Array} nrm
+ * @property {Float32Array} uv
+ * @property {Uint16Array} joints 4 per vertex, into GlbModel.joints
+ * @property {Float32Array} weights 4 per vertex, summing to 1
+ * @property {Uint32Array} idx
+ * @property {number} mat material index, or -1
+ */
+/**
+ * A rigged model ready to pose. Pose matrices map the file's space through `fit` (feet at y = 0,
+ * centred, scaled to a human height) and then the entity's placement.
+ * @typedef {Object} GlbModel
+ * @property {GlbPart[]} parts
+ * @property {GlbMaterial[]} materials
+ * @property {{bytes: Uint8Array, mime: string}[]} images embedded PNG/JPEG, until decoded
+ * @property {ImageBitmap[]} bitmaps decoded images (browser only)
+ * @property {boolean} skinned false: a static model drawn with one matrix
+ * @property {Int16Array} parent node parent, -1 at a root
+ * @property {number[]} order nodes with parents first
+ * @property {Float32Array} rest local TRS per node (t3 r4 s3)
+ * @property {(Float32Array|null)[]} fixed local matrix of nodes given as a matrix
+ * @property {Int32Array} joints node of each joint
+ * @property {Float32Array} ibm inverse bind matrix per joint
+ * @property {Float32Array} fit
+ * @property {number} height metres, after fit
+ * @property {Record<string, GlbClip>} clips
+ * @property {{idle: GlbClip|null, walk: GlbClip|null, talk: GlbClip|null}} states
+ * @property {number} head node of the head joint, or -1
+ * @property {Float32Array} headPos head joint position after the last pose
+ * @property {{a: Float32Array, b: Float32Array, world: Float32Array, m: Float32Array, rf: Float32Array}} tmp
+ */
+
+/** o[oo..] = a[ao..] * b[bo..], column-major 4x4. Out must not alias the inputs. @param {Float32Array} a @param {number} ao @param {Float32Array} b @param {number} bo @param {Float32Array} o @param {number} oo */
+function mulM(a, ao, b, bo, o, oo) {
+  for (let c = 0; c < 4; c++) {
+    const b0 = b[bo + c * 4], b1 = b[bo + c * 4 + 1], b2 = b[bo + c * 4 + 2], b3 = b[bo + c * 4 + 3];
+    for (let r = 0; r < 4; r++) o[oo + c * 4 + r] = a[ao + r] * b0 + a[ao + 4 + r] * b1 + a[ao + 8 + r] * b2 + a[ao + 12 + r] * b3;
+  }
+}
+
+/** Matrix from local TRS (10 floats at s[so]). @param {Float32Array} s @param {number} so @param {Float32Array} o @param {number} oo */
+function trsMat(s, so, o, oo) {
+  const x = s[so + 3], y = s[so + 4], z = s[so + 5], w = s[so + 6];
+  const sx = s[so + 7], sy = s[so + 8], sz = s[so + 9];
+  o[oo] = (1 - 2 * (y * y + z * z)) * sx; o[oo + 1] = 2 * (x * y + z * w) * sx; o[oo + 2] = 2 * (x * z - y * w) * sx; o[oo + 3] = 0;
+  o[oo + 4] = 2 * (x * y - z * w) * sy; o[oo + 5] = (1 - 2 * (x * x + z * z)) * sy; o[oo + 6] = 2 * (y * z + x * w) * sy; o[oo + 7] = 0;
+  o[oo + 8] = 2 * (x * z + y * w) * sz; o[oo + 9] = 2 * (y * z - x * w) * sz; o[oo + 10] = (1 - 2 * (x * x + y * y)) * sz; o[oo + 11] = 0;
+  o[oo + 12] = s[so]; o[oo + 13] = s[so + 1]; o[oo + 14] = s[so + 2]; o[oo + 15] = 1;
+}
+
+/** Sample a clip at time t over the local TRS buffer. @param {GlbClip} clip @param {number} t @param {Float32Array} out */
+function sampleClip(clip, t, out) {
+  for (const ch of clip.ch) {
+    const T = ch.times;
+    const last = T.length - 1;
+    let k = 0;
+    let f = 0;
+    if (t >= T[last]) k = last;
+    else if (t > T[0]) {
+      let lo = 0;
+      let hi = last;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (T[mid] <= t) lo = mid; else hi = mid;
+      }
+      k = lo;
+      if (!ch.step) f = (t - T[lo]) / (T[hi] - T[lo] || 1);
+    }
+    const V = ch.values;
+    const w = ch.w;
+    const a = k * w;
+    const b = Math.min(k + 1, last) * w;
+    const o = ch.node * 10 + ch.off;
+    if (w === 4) {
+      // Normalised lerp along the shorter arc; keys are dense enough that it matches slerp.
+      const s = V[a] * V[b] + V[a + 1] * V[b + 1] + V[a + 2] * V[b + 2] + V[a + 3] * V[b + 3] < 0 ? -1 : 1;
+      let l = 0;
+      for (let i = 0; i < 4; i++) { out[o + i] = V[a + i] * (1 - f) + V[b + i] * s * f; l += out[o + i] * out[o + i]; }
+      l = 1 / Math.sqrt(l || 1);
+      for (let i = 0; i < 4; i++) out[o + i] *= l;
+    } else {
+      for (let i = 0; i < 3; i++) out[o + i] = V[a + i] * (1 - f) + V[b + i] * f;
+    }
+  }
+}
+
+/** Blend local TRS buffer b into a by w (crossfade). @param {Float32Array} a @param {Float32Array} b @param {number} w */
+function mixTRS(a, b, w) {
+  for (let o = 0; o < a.length; o += 10) {
+    for (const i of [0, 1, 2, 7, 8, 9]) a[o + i] += (b[o + i] - a[o + i]) * w;
+    const s = a[o + 3] * b[o + 3] + a[o + 4] * b[o + 4] + a[o + 5] * b[o + 5] + a[o + 6] * b[o + 6] < 0 ? -1 : 1;
+    let l = 0;
+    for (let i = 3; i < 7; i++) { a[o + i] += (b[o + i] * s - a[o + i]) * w; l += a[o + i] * a[o + i]; }
+    l = 1 / Math.sqrt(l || 1);
+    for (let i = 3; i < 7; i++) a[o + i] *= l;
+  }
+}
+
+/**
+ * Pose a rigged model: crossfaded clip layers, the node hierarchy, then one skinning matrix per
+ * joint (root x fit x joint world x inverse bind) into out. A static model gets one matrix.
+ * @param {GlbModel} c @param {{clip: GlbClip, time: number, weight: number}[]} layers base first; each later one blends in by its weight
+ * @param {Float32Array} root entity placement @param {Float32Array} out @returns {number} matrices written
+ */
+export function poseGlb(c, layers, root, out) {
+  const { a, b, world, m, rf } = c.tmp;
+  a.set(c.rest);
+  layers.forEach((L, i) => {
+    if (i === 0) { sampleClip(L.clip, L.time, a); return; }
+    b.set(c.rest);
+    sampleClip(L.clip, L.time, b);
+    mixTRS(a, b, L.weight);
+  });
+  for (const i of c.order) {
+    const p = c.parent[i];
+    const fx = c.fixed[i];
+    if (fx) m.set(fx); else trsMat(a, i * 10, m, 0);
+    if (p < 0) world.set(m, i * 16); else mulM(world, p * 16, m, 0, world, i * 16);
+  }
+  mulM(root, 0, c.fit, 0, rf, 0);
+  if (c.head >= 0) {
+    const h = c.head * 16;
+    for (let r = 0; r < 3; r++) c.headPos[r] = rf[r] * world[h + 12] + rf[4 + r] * world[h + 13] + rf[8 + r] * world[h + 14] + rf[12 + r];
+  }
+  if (!c.skinned) { out.set(rf); return 1; }
+  for (let j = 0; j < c.joints.length; j++) {
+    mulM(world, c.joints[j] * 16, c.ibm, j * 16, m, 0);
+    mulM(rf, 0, m, 0, out, j * 16);
+  }
+  return c.joints.length;
+}
+
+/**
+ * Parse a rigged (or static) .glb: every triangle primitive, its PBR material and embedded
+ * images, the skeleton and inverse binds, and every animation clip. Mesh parts without a skin
+ * in a rigged model ride their node rigidly, as an extra joint.
+ * @param {ArrayBuffer} buf @returns {GlbModel}
+ */
+export function parseCharacter(buf) {
+  const { json, bin } = parseGLB(buf);
+  const nodes = json.nodes ?? [];
+  const N = nodes.length;
+  const parent = new Int16Array(N).fill(-1);
+  nodes.forEach((/** @type {any} */ n, /** @type {number} */ i) => { for (const ch of n.children ?? []) parent[ch] = i; });
+  /** @type {number[]} */
+  const order = [];
+  /** @param {number} i */
+  const visit = (i) => { order.push(i); for (const ch of nodes[i].children ?? []) visit(ch); };
+  for (let i = 0; i < N; i++) if (parent[i] < 0) visit(i);
+  const rest = new Float32Array(N * 10);
+  /** @type {(Float32Array|null)[]} */
+  const fixed = [];
+  nodes.forEach((/** @type {any} */ n, /** @type {number} */ i) => {
+    rest.set([...(n.translation ?? [0, 0, 0]), ...(n.rotation ?? [0, 0, 0, 1]), ...(n.scale ?? [1, 1, 1])], i * 10);
+    fixed[i] = n.matrix ? Float32Array.from(n.matrix) : null;
+  });
+  const skin = json.skins?.[0];
+  if ((json.skins?.length ?? 0) > 1) console.warn('glTF has several skins; only the first is used.');
+  /** @type {number[]} */
+  const joints = skin ? [...skin.joints] : [];
+  /** @type {number[]} */
+  const ibm = skin?.inverseBindMatrices !== undefined ? [...readAccessor(json, bin, skin.inverseBindMatrices)] : joints.flatMap(() => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+  /** @type {GlbPart[]} */
+  const parts = [];
+  if (skin) {
+    for (const ni of order) {
+      const node = nodes[ni];
+      if (node.mesh === undefined) continue;
+      let rigid = -1;
+      if (node.skin === undefined) {
+        // Rigid part: one more joint that is the node itself, with an identity inverse bind.
+        rigid = joints.length;
+        joints.push(ni);
+        ibm.push(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+      }
+      for (const p of json.meshes[node.mesh].primitives) {
+        if ((p.mode ?? 4) !== 4 || p.attributes.POSITION === undefined) continue;
+        const pos = /** @type {Float32Array} */ (readAccessor(json, bin, p.attributes.POSITION));
+        const n = pos.length / 3;
+        const idx = p.indices !== undefined ? /** @type {Uint32Array} */ (readAccessor(json, bin, p.indices, true)) : Uint32Array.from({ length: n }, (_, i) => i);
+        const nrm = p.attributes.NORMAL !== undefined ? /** @type {Float32Array} */ (readAccessor(json, bin, p.attributes.NORMAL)) : normalsOf(pos, idx);
+        const uv = p.attributes.TEXCOORD_0 !== undefined ? /** @type {Float32Array} */ (readAccessor(json, bin, p.attributes.TEXCOORD_0)) : new Float32Array(n * 2);
+        const jo = new Uint16Array(n * 4);
+        const we = new Float32Array(n * 4);
+        if (rigid >= 0 || p.attributes.JOINTS_0 === undefined) {
+          for (let v = 0; v < n; v++) { jo[v * 4] = rigid >= 0 ? rigid : 0; we[v * 4] = 1; }
+        } else {
+          const sj = readAccessor(json, bin, p.attributes.JOINTS_0, true);
+          const sw = readAccessor(json, bin, p.attributes.WEIGHTS_0);
+          for (let v = 0; v < n; v++) {
+            const sum = sw[v * 4] + sw[v * 4 + 1] + sw[v * 4 + 2] + sw[v * 4 + 3];
+            for (let k = 0; k < 4; k++) {
+              jo[v * 4 + k] = sj[v * 4 + k];
+              we[v * 4 + k] = sum > 0 ? sw[v * 4 + k] / sum : +(k === 0);
+            }
+          }
+        }
+        parts.push({ pos, nrm, uv, joints: jo, weights: we, idx, mat: p.material ?? -1 });
+      }
+    }
+  } else {
+    // Static model: node transforms baked in, one matrix places it.
+    for (const g of loadGLB(buf)) {
+      const n = g.pos.length / 3;
+      const we = new Float32Array(n * 4);
+      for (let v = 0; v < n; v++) we[v * 4] = 1;
+      parts.push({ pos: g.pos, nrm: g.nrm ?? normalsOf(g.pos, g.idx), uv: g.uv ?? new Float32Array(n * 2), joints: new Uint16Array(n * 4), weights: we, idx: g.idx, mat: g.material });
+    }
+  }
+  if (!parts.length) throw new Error('glTF has no triangle meshes');
+  if (joints.length > GLB_BONES) throw new Error(`Model has ${joints.length} joints; at most ${GLB_BONES} are supported`);
+  for (const p of parts) for (const j of p.joints) if (j >= Math.max(joints.length, 1)) throw new Error(`Vertex joint ${j} is outside the skin`);
+
+  /** @param {any} ref @returns {number} */
+  const image = (ref) => {
+    const t = ref === undefined ? null : json.textures?.[ref.index];
+    return t?.extensions?.EXT_texture_webp?.source ?? t?.source ?? -1;
+  };
+  /** @type {GlbMaterial[]} */
+  const materials = (json.materials ?? []).map((/** @type {any} */ mt) => {
+    const pbr = mt.pbrMetallicRoughness ?? {};
+    return { base: image(pbr.baseColorTexture), normal: image(mt.normalTexture), mr: image(pbr.metallicRoughnessTexture), color: pbr.baseColorFactor ?? [1, 1, 1, 1], metal: pbr.metallicFactor ?? 1, rough: pbr.roughnessFactor ?? 1 };
+  });
+  // shortcut: only images embedded in the BIN chunk; external or data-URI images are skipped (drawn untextured).
+  const images = (json.images ?? []).map((/** @type {any} */ im) => {
+    if (im.bufferView === undefined) return { bytes: new Uint8Array(0), mime: '' };
+    const bv = json.bufferViews[im.bufferView];
+    return { bytes: new Uint8Array(bin.buffer, bin.byteOffset + (bv.byteOffset ?? 0), bv.byteLength).slice(), mime: im.mimeType ?? 'image/png' };
+  });
+
+  const PATH = { translation: [0, 3], rotation: [3, 4], scale: [7, 3] };
+  /** @type {Record<string, GlbClip>} */
+  const clips = {};
+  (json.animations ?? []).forEach((/** @type {any} */ an, /** @type {number} */ ai) => {
+    /** @type {GlbChannel[]} */
+    const ch = [];
+    let dur = 0;
+    for (const c of an.channels) {
+      const pw = PATH[/** @type {keyof typeof PATH} */ (c.target.path)];
+      if (!pw || c.target.node === undefined) continue;
+      const s = an.samplers[c.sampler];
+      const times = /** @type {Float32Array} */ (readAccessor(json, bin, s.input));
+      let values = /** @type {Float32Array} */ (readAccessor(json, bin, s.output));
+      const w = pw[1];
+      if (s.interpolation === 'CUBICSPLINE') {
+        // Keep each key's value (in-tangent, value, out-tangent) and interpolate it linearly.
+        const v = new Float32Array(times.length * w);
+        for (let k = 0; k < times.length; k++) v.set(values.subarray((k * 3 + 1) * w, (k * 3 + 2) * w), k * w);
+        values = v;
+      }
+      dur = Math.max(dur, times[times.length - 1] ?? 0);
+      ch.push({ node: c.target.node, off: pw[0], w, times, values, step: s.interpolation === 'STEP' });
+    }
+    const name = an.name || `clip${ai}`;
+    clips[name] = { name, dur, ch, speed: 0 };
+  });
+  const list = Object.values(clips);
+  /** @param {RegExp} re */
+  const pick = (re) => list.find((cl) => re.test(cl.name)) ?? null;
+  const idle = pick(STATE_CLIPS.idle) ?? list[0] ?? null;
+  const states = { idle, walk: pick(STATE_CLIPS.walk) ?? idle, talk: pick(STATE_CLIPS.talk) ?? idle };
+  const head = joints.find((j) => /^head$/i.test(nodes[j].name ?? '')) ?? joints.find((j) => /head/i.test(nodes[j].name ?? '')) ?? -1;
+
+  /** @type {GlbModel} */
+  const c = {
+    parts, materials, images, bitmaps: [], skinned: !!skin, parent, order, rest, fixed,
+    joints: Int32Array.from(joints), ibm: Float32Array.from(ibm), fit: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
+    height: 0, clips, states, head, headPos: new Float32Array(3),
+    tmp: { a: new Float32Array(N * 10), b: new Float32Array(N * 10), world: new Float32Array(N * 16), m: new Float32Array(16), rf: new Float32Array(16) },
+  };
+  fitModel(c);
+  if (states.walk && states.walk !== idle) states.walk.speed = clipSpeed(c, states.walk, nodes);
+  return c;
+}
+
+/** Fresh area-weighted normals. @param {Float32Array} pos @param {Uint32Array} idx */
+function normalsOf(pos, idx) {
+  const out = new Float32Array(pos.length);
+  vertexNormals(pos, idx, out);
+  return out;
+}
+
+/** Skinned vertex positions of a pose (CPU, for measuring). @param {GlbModel} c @param {Float32Array} mats @param {(x:number, y:number, z:number) => void} f */
+function eachSkinned(c, mats, f) {
+  for (const p of c.parts) {
+    for (let v = 0; v < p.pos.length / 3; v++) {
+      const x = p.pos[v * 3], y = p.pos[v * 3 + 1], z = p.pos[v * 3 + 2];
+      let X = 0, Y = 0, Z = 0;
+      for (let k = 0; k < 4; k++) {
+        const w = p.weights[v * 4 + k];
+        if (!w) continue;
+        const o = (c.skinned ? p.joints[v * 4 + k] : 0) * 16;
+        X += w * (mats[o] * x + mats[o + 4] * y + mats[o + 8] * z + mats[o + 12]);
+        Y += w * (mats[o + 1] * x + mats[o + 5] * y + mats[o + 9] * z + mats[o + 13]);
+        Z += w * (mats[o + 2] * x + mats[o + 6] * y + mats[o + 10] * z + mats[o + 14]);
+      }
+      f(X, Y, Z);
+    }
+  }
+}
+
+const IDENT = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+/** Measure the idle pose and set fit: feet on y = 0, centred over the origin, human height. @param {GlbModel} c */
+function fitModel(c) {
+  const mats = new Float32Array(Math.max(c.joints.length, 1) * 16);
+  poseGlb(c, c.states.idle ? [{ clip: c.states.idle, time: 0, weight: 1 }] : [], IDENT, mats);
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  eachSkinned(c, mats, (x, y, z) => {
+    lo[0] = Math.min(lo[0], x); lo[1] = Math.min(lo[1], y); lo[2] = Math.min(lo[2], z);
+    hi[0] = Math.max(hi[0], x); hi[1] = Math.max(hi[1], y); hi[2] = Math.max(hi[2], z);
+  });
+  const h = hi[1] - lo[1];
+  if (!(h > 0)) throw new Error('Model has no height');
+  // Models already in metres at a human height keep their size; others are scaled to 1.75 m.
+  const k = h > 1.2 && h < 2.4 ? 1 : 1.75 / h;
+  c.fit.set([k, 0, 0, 0, 0, k, 0, 0, 0, 0, k, 0, -k * (lo[0] + hi[0]) / 2, -k * lo[1], -k * (lo[2] + hi[2]) / 2, 1]);
+  c.height = h * k;
+}
+
+/**
+ * Ground speed of a walk clip at rate 1: how fast the planted (lowest) foot slides back
+ * relative to the hips, averaged over the cycle. Playback is scaled by it so feet don't skate.
+ * @param {GlbModel} c @param {GlbClip} clip @param {any[]} nodes @returns {number} m/s
+ */
+function clipSpeed(c, clip, nodes) {
+  const feet = [...c.joints].filter((j) => /foot|toe|ankle/i.test(nodes[j].name ?? ''));
+  if (!feet.length || !clip.dur) return 0;
+  const hips = c.joints[0];
+  const mats = new Float32Array(c.joints.length * 16);
+  const S = 60;
+  const dt = clip.dur / S;
+  /** @param {number} t @returns {number[][]} per foot [x, y, z] minus the hips' x, z */
+  const at = (t) => {
+    poseGlb(c, [{ clip, time: t, weight: 1 }], IDENT, mats);
+    const W = c.tmp.world;
+    const F = c.fit;
+    /** @param {number} n */
+    const P = (n) => [0, 1, 2].map((r) => F[r] * W[n * 16 + 12] + F[4 + r] * W[n * 16 + 13] + F[8 + r] * W[n * 16 + 14] + F[12 + r]);
+    const hp = P(hips);
+    return feet.map((f) => { const p = P(f); return [p[0] - hp[0], p[1], p[2] - hp[2]]; });
+  };
+  let sum = 0;
+  let prev = at(0);
+  for (let s = 1; s <= S; s++) {
+    const cur = at(Math.min(s * dt, clip.dur));
+    let low = 0;
+    for (let f = 1; f < feet.length; f++) if (prev[f][1] < prev[low][1]) low = f;
+    sum += Math.hypot(cur[low][0] - prev[low][0], cur[low][2] - prev[low][2]) / dt;
+    prev = cur;
+  }
+  return sum / S;
+}
+
+/**
+ * Per-entity animation state for a rigged model: plays the clip for idle, walk or talk and
+ * crossfades over FADE seconds when the state changes. The walk plays at the rate that matches
+ * the entity's ground speed.
+ */
+export class GlbAnimator {
+  /** @param {GlbModel} model */
+  constructor(model) {
+    this.model = model;
+    /** @type {GlbClip|null} */
+    this.cur = null;
+    /** @type {GlbClip|null} */
+    this.prev = null;
+    this.t = 0;
+    this.pt = 0;
+    this.prate = 1;
+    this.rate = 1;
+    this.fade = 1;
+    /** Layers for poseGlb, base first. @type {{clip: GlbClip, time: number, weight: number}[]} */
+    this.layers = [];
+    this._base = { clip: /** @type {GlbClip} */ (/** @type {unknown} */ (null)), time: 0, weight: 1 };
+    this._top = { clip: /** @type {GlbClip} */ (/** @type {unknown} */ (null)), time: 0, weight: 1 };
+  }
+
+  /** @param {'idle'|'walk'|'talk'} state @param {number} dt @param {number} [speed] ground speed, m/s */
+  update(state, dt, speed = 0) {
+    const clip = this.model.states[state];
+    if (clip !== this.cur) {
+      this.prev = this.cur;
+      this.pt = this.t;
+      this.prate = this.rate;
+      this.cur = clip;
+      this.t = 0;
+      this.fade = this.prev ? 0 : 1;
+    }
+    this.rate = state === 'walk' && clip?.speed ? Math.max(0.4, Math.min(2.5, speed / clip.speed)) : 1;
+    this.layers.length = 0;
+    if (!clip) return;
+    this.t = clip.dur ? (this.t + dt * this.rate) % clip.dur : 0;
+    this.fade = Math.min(1, this.fade + dt / FADE);
+    if (this.prev && this.fade < 1) {
+      this.pt = this.prev.dur ? (this.pt + dt * this.prate) % this.prev.dur : 0;
+      Object.assign(this._base, { clip: this.prev, time: this.pt, weight: 1 });
+      Object.assign(this._top, { clip, time: this.t, weight: this.fade * this.fade * (3 - 2 * this.fade) });
+      this.layers.push(this._base, this._top);
+    } else {
+      this.prev = null;
+      Object.assign(this._base, { clip, time: this.t, weight: 1 });
+      this.layers.push(this._base);
+    }
+  }
+}
+
+/**
+ * Fetch, parse and decode every model in NPC_MODELS into NPC_CHARS. A model that is missing or
+ * broken is skipped with a warning, so its role keeps the procedural rig. Never rejects.
+ */
+export async function loadNpcModels() {
+  await Promise.all(Object.entries(NPC_MODELS).map(async ([role, url]) => {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const c = parseCharacter(await r.arrayBuffer());
+      // Raw texels: no colour-space conversion (normal and metal/rough maps are data) or premultiplying.
+      c.bitmaps = await Promise.all(c.images.map((im) => createImageBitmap(new Blob([/** @type {BlobPart} */ (im.bytes)], { type: im.mime }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' })));
+      c.images = [];
+      NPC_CHARS.set(role, c);
+    } catch (err) {
+      console.warn(`${url}: rigged model unavailable; ${role} keeps the procedural rig.`, err);
+    }
+  }));
 }

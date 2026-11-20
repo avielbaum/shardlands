@@ -7,6 +7,7 @@
 import { SPR } from './textures.js';
 import { HAZARD } from './world.js';
 import { ITEMS, SPELLS } from './rpg.js';
+import { NPC_CHARS, GlbAnimator } from './meshes.js';
 
 /** @typedef {import('./main.js').Game} Game */
 /** @typedef {import('./world.js').Level} Level */
@@ -819,6 +820,11 @@ export class NPC {
     this.gaze = 0;
     this.look = 0;
     this.lookUp = 0;
+    const glb = NPC_CHARS.get(def.sprite);
+    /** Rigged .glb model's animation state, when this role has one (else the procedural rig). */
+    this.glb = glb ? new GlbAnimator(glb) : null;
+    /** Walking speed, m/s. Rigged models stroll slower so their walk clip isn't sped up past a natural cadence. */
+    this.speed = glb ? 1.25 : 1.6;
   }
 
   /** Where this NPC wants to be at a given hour. @param {number} hour 0..24 @returns {{spot:{x:number, z:number}, phase:string}} */
@@ -838,6 +844,9 @@ export class NPC {
   /** @param {number} dt @param {Game} game @param {boolean} near player close enough to simulate walking */
   update(dt, game, near) {
     this.anim += dt;
+    // Idle, walk (at the clip rate matching the walking speed) or talk, crossfaded. It follows
+    // the state the previous frame settled on, one frame behind, which is invisible.
+    this.glb?.update(this.talking ? 'talk' : this.moving ? 'walk' : 'idle', dt, this.speed / this.build);
     this.thinkT -= dt;
     const L = game.level;
     // Watch the player when they come close and stand in front, easing in and out; the head
@@ -883,7 +892,7 @@ export class NPC {
     const dx = next.x - this.x;
     const dz = next.z - this.z;
     const d = Math.hypot(dx, dz);
-    const step = 1.6 * dt;
+    const step = this.speed * dt;
     if (d > 1e-3) this.face = turnToward(this.face, Math.atan2(dz, dx), dt * 6);
     game.holdDoorAt(next.x, next.z);
     if (d <= step) {
@@ -907,7 +916,7 @@ export class NPC {
       model: {
         rig: this.def.sprite, yaw: this.face, t: this.anim, walk: this.moving ? 1 : 0, phase: this.anim * 8.4,
         act: this.talking ? 'talk' : '', k: 0, stagger: 0, dead: 0, scale: this.build,
-        gaze: this.gaze, look: this.look, lookUp: this.lookUp, variant: this.variant,
+        gaze: this.gaze, look: this.look, lookUp: this.lookUp, variant: this.variant, glb: this.glb ?? undefined,
       },
     };
   }

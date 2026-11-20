@@ -3240,6 +3240,7 @@ function buildRig(name, m, variant) {
  * @property {number} [look] target bearing minus facing, radians (the game's angle convention)
  * @property {number} [lookUp] pitch toward the target, radians (positive is up)
  * @property {number} [variant] which look of the character (skin, hair, palette, body)
+ * @property {import('./meshes.js').GlbAnimator} [glb] rigged .glb model and its animation state, drawn instead of the rig
  */
 
 const ease = (/** @type {number} */ x) => x * x * (3 - 2 * x);
