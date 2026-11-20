@@ -165,7 +165,6 @@ uniform bool uUseSkinning;
 uniform mat4 uViewProj;
 uniform float uSky;
 uniform vec3 uTint;
-uniform float uBase;
 out vec3 vPos; out vec3 vNormal; out vec2 vUV; out vec3 vCol; out vec4 vMat; out float vSky; out vec4 vTintEmit;
 out vec3 vObj; out float vH;
 void main() {
@@ -174,7 +173,9 @@ void main() {
   vec4 wp = B * vec4(aPos, 1.0);
   vNormal = mat3(B) * aNormal;
   vPos = wp.xyz; vUV = aUV; vCol = vec3(1.0); vMat = vec4(0.0); vSky = uSky;
-  vTintEmit = vec4(uTint, 0.0); vObj = aPos; vH = wp.y - uBase;
+  // vH (height above the feet, for ground grime) is unread by the GLB material block. Keep it a
+  // constant: a uniform feeding it is optimised out by mobile drivers and fails the uniform check.
+  vTintEmit = vec4(uTint, 0.0); vObj = aPos; vH = 0.0;
   gl_Position = uViewProj * wp;
 }`;
 
@@ -756,7 +757,7 @@ const UNIFORMS = {
   meshInst: ['uViewProj', 'uTime', 'uWind', ...SHARED_FS_UNIFORMS],
   depth: ['uViewProj', 'uBones', 'uTime', 'uWind'],
   depthInst: ['uViewProj', 'uTime', 'uWind'],
-  glb: ['uViewProj', 'uBones', 'uUseSkinning', 'uSky', 'uTint', 'uBase', 'uTime', 'uGlbAlbedo', 'uGlbNormal', 'uGlbMR', 'uGlbFactor', 'uGlbMRF',
+  glb: ['uViewProj', 'uBones', 'uUseSkinning', 'uSky', 'uTint', 'uTime', 'uGlbAlbedo', 'uGlbNormal', 'uGlbMR', 'uGlbFactor', 'uGlbMRF',
     ...SHARED_FS_UNIFORMS.filter((n) => !['uAlbedo', 'uNormal', 'uMat'].includes(n))],
   depthGlb: ['uViewProj', 'uBones', 'uUseSkinning'],
   fx: ['uViewProj', 'uCamRight', 'uCamUp', 'uStore'],
@@ -1149,8 +1150,20 @@ export class Renderer {
     this.meshInst = createProgram(gl, glsl(MESH_VS, ['INSTANCED']), glsl(MESH_FS), UNIFORMS.meshInst);
     this.depth = createProgram(gl, glsl(MESH_VS), glsl(DEPTH_FS), UNIFORMS.depth);
     this.depthInst = createProgram(gl, glsl(MESH_VS, ['INSTANCED']), glsl(DEPTH_FS), UNIFORMS.depthInst);
-    this.glb = createProgram(gl, glsl(GLB_VS), glsl(MESH_FS, ['GLB']), UNIFORMS.glb);
-    this.depthGlb = createProgram(gl, glsl(GLB_VS), glsl(DEPTH_FS), UNIFORMS.depthGlb);
+    // Rigged .glb NPCs are optional: if a GPU can't build their programs, every role keeps its
+    // procedural rig (NPCs only get a .glb animator for roles left in NPC_CHARS).
+    let glb = null;
+    let depthGlb = null;
+    try {
+      glb = createProgram(gl, glsl(GLB_VS), glsl(MESH_FS, ['GLB']), UNIFORMS.glb);
+      depthGlb = createProgram(gl, glsl(GLB_VS), glsl(DEPTH_FS), UNIFORMS.depthGlb);
+    } catch (err) {
+      console.warn('Rigged NPC models disabled on this GPU; using procedural rigs.', err);
+      NPC_CHARS.clear();
+    }
+    // Only used when NPC_CHARS has models, which the catch above empties.
+    this.glb = /** @type {{prog: WebGLProgram, u: Record<string, WebGLUniformLocation>}} */ (glb);
+    this.depthGlb = /** @type {{prog: WebGLProgram, u: Record<string, WebGLUniformLocation>}} */ (depthGlb);
     this.anisoExt = anisoExt;
     this.aniso = aniso;
     this.fx = createProgram(gl, FX_VS, FX_FS, UNIFORMS.fx);
@@ -1449,22 +1462,21 @@ export class Renderer {
       const c = m.glb.model;
       const g = this._glbGpu(c);
       const n = poseGlb(c, m.glb.layers, trs(s.x, s.y, s.z, Math.PI / 2 - m.yaw, 0, 0, m.scale, this.glbRoot), this.glbBones);
-      this._drawGlbParts(g, u, lit, n, c.skinned, s.sky, s.tint, s.y);
+      this._drawGlbParts(g, u, lit, n, c.skinned, s.sky, s.tint);
     }
   }
 
   /**
    * @param {GlbGPU} g @param {Record<string, WebGLUniformLocation>} u @param {boolean} lit @param {number} n matrices in glbBones
-   * @param {boolean} skinned @param {number} sky @param {number[]} tint @param {number} base
+   * @param {boolean} skinned @param {number} sky @param {number[]} tint
    */
-  _drawGlbParts(g, u, lit, n, skinned, sky, tint, base) {
+  _drawGlbParts(g, u, lit, n, skinned, sky, tint) {
     const gl = this.gl;
     gl.uniformMatrix4fv(u.uBones, false, this.glbBones.subarray(0, n * 16));
     gl.uniform1i(u.uUseSkinning, skinned ? 1 : 0);
     if (lit) {
       gl.uniform1f(u.uSky, sky);
       gl.uniform3fv(u.uTint, tint);
-      gl.uniform1f(u.uBase, base);
     }
     for (const p of g.parts) {
       if (lit) {
@@ -2260,7 +2272,7 @@ export class Renderer {
       gl.uniform1f(u.uShadowOn, 0);
       [u.uAlbedo, u.uNormal, u.uMat, u.uDetail, u.uShadowMap, u.uGlbAlbedo, u.uGlbNormal, u.uGlbMR].forEach((loc, i) => loc && gl.uniform1i(loc, i));
       if (glbM) {
-        this._drawGlbParts(this._glbGpu(glbM), u, true, n, glbM.skinned, 0, WHITE, 0);
+        this._drawGlbParts(this._glbGpu(glbM), u, true, n, glbM.skinned, 0, WHITE);
       } else {
         gl.uniformMatrix4fv(u.uBones, false, this._skin(rig, n));
         gl.uniform1f(u.uSky, 0);
