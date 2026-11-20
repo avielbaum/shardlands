@@ -2105,7 +2105,10 @@ class App {
     /** @type {AppState} */
     this.state = 'TITLE';
     this.touch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+    /** Pointer lock was refused before it ever worked: free mouse look until a click captures it. */
     this.lockFailed = false;
+    /** Pointer lock has worked this session, so a later refusal is temporary. */
+    this.lockedOnce = false;
     /** @type {number|null} */
     this.cursorX = null;
     this.expectUnlock = false;
@@ -2157,7 +2160,7 @@ class App {
   }
 
   lock() {
-    if (this.touch || this.lockFailed) return;
+    if (this.touch) return;
     try {
       const r = /** @type {any} */ (this.canvas.requestPointerLock());
       if (r && r.catch) r.catch(() => {});
@@ -2200,11 +2203,23 @@ class App {
   _bind() {
     const cv = this.canvas;
     document.addEventListener('pointerlockchange', () => {
-      if (document.pointerLockElement !== cv && this.state === 'EXPLORE' && !this.touch && !this.expectUnlock) this.showPause();
+      if (document.pointerLockElement === cv) {
+        this.lockedOnce = true;
+        if (this.lockFailed) { this.lockFailed = false; document.body.classList.remove('free-look'); }
+      } else if (this.state === 'EXPLORE' && !this.touch && !this.expectUnlock) this.showPause();
       this.expectUnlock = false;
     });
     document.addEventListener('pointerlockerror', () => {
       if (this.lockFailed) return;
+      // Once the lock has worked, a refusal is temporary: Chrome refuses for about a second after
+      // an Esc release, and while the window lacks focus. Pause so Resume can ask again.
+      if (this.lockedOnce) {
+        if (this.state === 'EXPLORE') {
+          this.showPause();
+          this.game.notify('The browser did not capture the mouse. Press Resume to try again.');
+        }
+        return;
+      }
       this.lockFailed = true;
       document.body.classList.add('free-look');
       this.game.notify('Free mouse look: rest the cursor at an edge to keep turning.');
