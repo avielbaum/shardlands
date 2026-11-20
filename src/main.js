@@ -1640,17 +1640,26 @@ export class Game {
     }
   }
 
-  /** @param {AudioEngine} audio @returns {Game|null} */
+  /**
+   * Restore the saved game. A save that is missing, unreadable, damaged or from another version
+   * gives null and is left in storage untouched.
+   * @param {AudioEngine} audio @returns {Game|null}
+   */
   static load(audio) {
-    let data;
     try {
       const raw = localStorage.getItem(SAVE_KEY);
-      if (!raw) return null;
-      data = JSON.parse(raw);
-    } catch {
+      return raw ? Game._restore(JSON.parse(raw), audio) : null;
+    } catch (err) {
+      console.warn('Save could not be loaded.', err);
       return null;
     }
+  }
+
+  /** @param {any} data parsed save @param {AudioEngine} audio @returns {Game|null} */
+  static _restore(data, audio) {
     if (!data || data.v !== 1) return null;
+    const pos = data.player;
+    if (!Number.isFinite(data.seed) || typeof data.levelId !== 'string' || ![pos?.x, pos?.z, pos?.yaw].every(Number.isFinite)) throw new Error('Save has no world seed or position');
     const g = new Game(audio, data.seed);
     g.minutes = data.minutes;
     g.char = Character.fromJSON(data.char);
@@ -2559,7 +2568,15 @@ class App {
   loadGame() {
     this.audio.init();
     const g = Game.load(this.audio);
-    if (!g) return;
+    if (!g) {
+      // Load buttons are only enabled when a save exists, so null means it could not be read.
+      const from = this.state;
+      const back = () => (from === 'TITLE' ? this.showTitle() : from === 'PAUSE' ? this.showPause() : this.setState('EXPLORE'));
+      this.panel(from, 'The save could not be loaded',
+        h('p', {}, 'Your last save is damaged or from another version of the game. It has been left as it is; saving again will replace it.'),
+        h('div', { class: 'row' }, btn('Back', back)));
+      return;
+    }
     this.game = g;
     this.setState('EXPLORE');
   }

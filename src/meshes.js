@@ -707,6 +707,7 @@ const STATE_CLIPS = { idle: /idle|stand|breath/i, walk: /walk|stroll/i, talk: /t
  * @property {Record<string, GlbClip>} clips
  * @property {{idle: GlbClip|null, walk: GlbClip|null, talk: GlbClip|null}} states
  * @property {number} head node of the head joint, or -1
+ * @property {number} neck node of the neck joint, or -1
  * @property {Float32Array} headPos head joint position after the last pose
  * @property {{a: Float32Array, b: Float32Array, world: Float32Array, m: Float32Array, rf: Float32Array}} tmp
  */
@@ -778,12 +779,34 @@ function mixTRS(a, b, w) {
 }
 
 /**
+ * Turn a node's world matrix (in place, about its own origin) by yaw about the model's up axis
+ * and pitch about its side axis: the file's scene space, where models face +Z.
+ * @param {Float32Array} w @param {number} o @param {number} yaw @param {number} pitch
+ */
+function aimNode(w, o, yaw, pitch) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  // R = Ry(yaw) * Rx(pitch), applied to the rotation/scale columns; the translation (pivot) stays.
+  for (let k = 0; k < 3; k++) {
+    const x = w[o + k * 4], y = w[o + k * 4 + 1], z = w[o + k * 4 + 2];
+    const y1 = cp * y - sp * z;
+    const z1 = sp * y + cp * z;
+    w[o + k * 4] = cy * x + sy * z1;
+    w[o + k * 4 + 1] = y1;
+    w[o + k * 4 + 2] = -sy * x + cy * z1;
+  }
+}
+
+/**
  * Pose a rigged model: crossfaded clip layers, the node hierarchy, then one skinning matrix per
  * joint (root x fit x joint world x inverse bind) into out. A static model gets one matrix.
+ * yaw and pitch turn the head toward something on top of the clip (neck 35%, head 65%);
+ * +yaw turns toward the model's left, +pitch tips the face down.
  * @param {GlbModel} c @param {{clip: GlbClip, time: number, weight: number}[]} layers base first; each later one blends in by its weight
- * @param {Float32Array} root entity placement @param {Float32Array} out @returns {number} matrices written
+ * @param {Float32Array} root entity placement @param {Float32Array} out
+ * @param {number} [yaw] radians @param {number} [pitch] radians
+ * @returns {number} matrices written
  */
-export function poseGlb(c, layers, root, out) {
+export function poseGlb(c, layers, root, out, yaw = 0, pitch = 0) {
   const { a, b, world, m, rf } = c.tmp;
   a.set(c.rest);
   layers.forEach((L, i) => {
@@ -797,6 +820,11 @@ export function poseGlb(c, layers, root, out) {
     const fx = c.fixed[i];
     if (fx) m.set(fx); else trsMat(a, i * 10, m, 0);
     if (p < 0) world.set(m, i * 16); else mulM(world, p * 16, m, 0, world, i * 16);
+    // Children are composed after their parent, so they follow the turn.
+    if ((yaw || pitch) && (i === c.neck || i === c.head)) {
+      const k = i === c.head ? 0.65 : 0.35;
+      aimNode(world, i * 16, yaw * k, pitch * k);
+    }
   }
   mulM(root, 0, c.fit, 0, rf, 0);
   if (c.head >= 0) {
@@ -942,12 +970,13 @@ export function parseCharacter(buf) {
   const idle = pick(STATE_CLIPS.idle) ?? list[0] ?? null;
   const states = { idle, walk: pick(STATE_CLIPS.walk) ?? idle, talk: pick(STATE_CLIPS.talk) ?? idle };
   const head = joints.find((j) => /^head$/i.test(nodes[j].name ?? '')) ?? joints.find((j) => /head/i.test(nodes[j].name ?? '')) ?? -1;
+  const neck = joints.find((j) => /neck/i.test(nodes[j].name ?? '')) ?? -1;
 
   /** @type {GlbModel} */
   const c = {
     parts, materials, images, bitmaps: [], skinned: !!skin, parent, order, rest, fixed,
     joints: Int32Array.from(joints), ibm: Float32Array.from(ibm), fit: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
-    height: 0, clips, states, head, headPos: new Float32Array(3),
+    height: 0, clips, states, head, neck, headPos: new Float32Array(3),
     tmp: { a: new Float32Array(N * 10), b: new Float32Array(N * 10), world: new Float32Array(N * 16), m: new Float32Array(16), rf: new Float32Array(16) },
   };
   fitModel(c);

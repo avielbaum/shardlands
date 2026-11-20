@@ -1461,7 +1461,10 @@ export class Renderer {
       if (!m.glb) continue;
       const c = m.glb.model;
       const g = this._glbGpu(c);
-      const n = poseGlb(c, m.glb.layers, trs(s.x, s.y, s.z, Math.PI / 2 - m.yaw, 0, 0, m.scale, this.glbRoot), this.glbBones);
+      // Head tracking: look is a bearing in the game's convention (positive = toward the model's
+      // right), lookUp is positive upward; poseGlb takes +yaw to the left and +pitch down.
+      const gaze = m.gaze ?? 0;
+      const n = poseGlb(c, m.glb.layers, trs(s.x, s.y, s.z, Math.PI / 2 - m.yaw, 0, 0, m.scale, this.glbRoot), this.glbBones, -(m.look ?? 0) * gaze, -(m.lookUp ?? 0) * gaze);
       this._drawGlbParts(g, u, lit, n, c.skinned, s.sky, s.tint);
     }
   }
