@@ -9,7 +9,7 @@ import {
   buildObservatory, buildOverworld, buildDungeon, Level, ChunkStreamer, HAZARD, STEP, TILE,
   BIOME_NAMES, SITES, mulberry32,
 } from './world.js';
-import { Renderer } from './renderer.js';
+import { Renderer as WebGLRenderer } from './renderer.js';
 import { setBodies } from './models.js';
 import { loadBodies, loadNpcModels } from './meshes.js';
 import { AudioEngine } from './audio.js';
@@ -2093,7 +2093,7 @@ class App {
     const hctx = this.hud.getContext('2d');
     if (!hctx) throw new Error('2D canvas is not available');
     this.hctx = hctx;
-    this.renderer = new Renderer(this.canvas);
+    this.renderer = new RendererImpl(this.canvas);
     ATLAS = this.renderer.spriteAtlas;
     this.audio = new AudioEngine();
     this.input = new Input();
@@ -3079,8 +3079,18 @@ class App {
 // Two frames let the "Forging…" status paint before texture synthesis blocks the thread. The
 // sculpted base meshes load first; without them (offline file://, missing assets) townsfolk fall
 // back to the procedural bodies.
+/** The renderer class in use: three.js, or the raw WebGL 2 one with ?renderer=webgl (or if three.js can't load). */
+let RendererImpl = WebGLRenderer;
+
 requestAnimationFrame(() => requestAnimationFrame(async () => {
   const msg = document.getElementById('boot-error');
+  if (new URLSearchParams(location.search).get('renderer') !== 'webgl') {
+    try {
+      RendererImpl = (await import('./renderer3.js')).Renderer;
+    } catch (err) {
+      console.warn('three.js could not load; using the WebGL renderer.', err);
+    }
+  }
   // Rigged NPC models load alongside; each one that fails leaves its role on the procedural rig.
   const npcModels = loadNpcModels();
   try {

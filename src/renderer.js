@@ -20,7 +20,7 @@ import {
 import { NPC_CHARS, GLB_BONES, poseGlb } from './meshes.js';
 
 /** Townsfolk rigs that come in two looks (constructs and the Archivist have one). */
-const HUMAN_VARIANTS = new Set(['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard', 'master', 'keeper', 'captain']);
+export const HUMAN_VARIANTS = new Set(['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard', 'master', 'keeper', 'captain']);
 
 /** @typedef {import('./world.js').Door} Door */
 /** @typedef {import('./world.js').Light} Light */
@@ -79,26 +79,26 @@ const HUMAN_VARIANTS = new Set(['folk_a', 'folk_b', 'folk_c', 'merchant', 'guard
  * @property {ViewDesc} [view]
  */
 
-const MAX_LIGHTS = 16;
-const NEAR = 0.05;
-const FAR = 140;
+export const MAX_LIGHTS = 16;
+export const NEAR = 0.05;
+export const FAR = 140;
 /** Floats per model instance: (x, y, z, yaw) (scale, sky, -, -) (tint rgb, emission). */
-const INST = 12;
+export const INST = 12;
 /** Beyond this distance nature props switch to their low-poly LOD. */
-const LOD_DIST = 20;
+export const LOD_DIST = 20;
 /** Props within this distance of the eye are drawn into the shadow map. */
-const SHADOW_REACH = 40;
+export const SHADOW_REACH = 40;
 /** Characters beyond this distance use their low-poly rig. */
-const CHAR_LOD_DIST = 16;
+export const CHAR_LOD_DIST = 16;
 /** Grass tufts are drawn within this radius. */
-const GRASS_DIST = 28;
+export const GRASS_DIST = 28;
 /** Viewmodels are squeezed into the front of the depth range so they never clip into walls. */
-const VIEW_DEPTH = 0.05;
-const WHITE = [1, 1, 1];
-const FULL_UV = [0, 0, 1, 1];
+export const VIEW_DEPTH = 0.05;
+export const WHITE = [1, 1, 1];
+export const FULL_UV = [0, 0, 1, 1];
 
 /** Vertex shader for every lit mesh: skinned (uBones) or, with INSTANCED, placed per instance. */
-const MESH_VS = `
+export const MESH_VS = `
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
@@ -155,7 +155,7 @@ void main() {
  * Vertex shader for rigged .glb models: 4 joints and weights per vertex (uUseSkinning), or one
  * placement matrix in uBones[0] for a static model. Feeds the same varyings as MESH_VS.
  */
-const GLB_VS = `
+export const GLB_VS = `
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
@@ -180,12 +180,12 @@ void main() {
   gl_Position = uViewProj * wp;
 }`;
 
-const DEPTH_FS = `
+export const DEPTH_FS = `
 precision mediump float;
 out vec4 outColor;
 void main() { outColor = vec4(1.0); }`;
 
-const MESH_FS = `
+export const MESH_FS = `
 precision highp float;
 precision highp sampler2DArray;
 precision highp sampler2DShadow;
@@ -482,7 +482,7 @@ void main() {
   outColor = vec4(col * uStore, 1.0);
 }`;
 
-const POST_VS = `#version 300 es
+export const POST_VS = `#version 300 es
 out vec2 vUV;
 void main() {
   vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
@@ -491,7 +491,7 @@ void main() {
 }`;
 
 // Glow sprites for effects (orbs, bolts, sparks) and soft contact shadows under characters.
-const FX_VS = `#version 300 es
+export const FX_VS = `#version 300 es
 layout(location=0) in vec2 aCorner;
 layout(location=1) in vec4 iPos;
 layout(location=2) in vec4 iCol;
@@ -507,7 +507,7 @@ void main() {
   gl_Position = uViewProj * vec4(p, 1.0);
 }`;
 
-const FX_FS = `#version 300 es
+export const FX_FS = `#version 300 es
 precision highp float;
 in vec2 vC; in vec4 vCol;
 uniform float uStore;
@@ -524,7 +524,7 @@ void main() {
 
 // GPU rain: drops are anchored in world space and wrapped in a box around the eye, so no
 // CPU work per drop; each instance id hashes to its own column, phase and speed.
-const RAIN_VS = `#version 300 es
+export const RAIN_VS = `#version 300 es
 layout(location=0) in vec2 aCorner;
 uniform mat4 uViewProj;
 uniform vec3 uEye;
@@ -550,7 +550,7 @@ void main() {
   gl_Position = uViewProj * vec4(p, 1.0);
 }`;
 
-const RAIN_FS = `#version 300 es
+export const RAIN_FS = `#version 300 es
 precision highp float;
 in vec2 vC;
 in float vDist;
@@ -563,7 +563,7 @@ void main() {
 }`;
 
 // Outdoor sky: horizon haze up to a time-of-day zenith, with a sun (or moon) disc and glow.
-const SKY_FS = `#version 300 es
+export const SKY_FS = `#version 300 es
 precision highp float;
 in vec2 vUV;
 uniform mat4 uInvViewProj;
@@ -585,7 +585,7 @@ void main() {
 }`;
 
 // Screen-space ambient occlusion from the scene depth: 12 hemisphere taps per pixel.
-const SSAO_FS = `#version 300 es
+export const SSAO_FS = `#version 300 es
 precision highp float;
 in vec2 vUV;
 uniform highp sampler2D uDepth;
@@ -627,7 +627,7 @@ void main() {
 }`;
 
 // Depth-aware separable blur so occlusion stays inside its own surface.
-const AO_BLUR_FS = `#version 300 es
+export const AO_BLUR_FS = `#version 300 es
 precision highp float;
 in vec2 vUV;
 uniform sampler2D uAO;
@@ -651,7 +651,7 @@ void main() {
 }`;
 
 // Soft-knee bright pass, downsampling the scene with a 4-tap box filter.
-const BRIGHT_FS = `#version 300 es
+export const BRIGHT_FS = `#version 300 es
 precision highp float;
 in vec2 vUV;
 uniform sampler2D uScene;
@@ -672,7 +672,7 @@ void main() {
 }`;
 
 // Separable 9-tap Gaussian blur.
-const BLUR_FS = `#version 300 es
+export const BLUR_FS = `#version 300 es
 precision highp float;
 in vec2 vUV;
 uniform sampler2D uSrc;
@@ -688,7 +688,7 @@ void main() {
 }`;
 
 // FXAA, ambient occlusion, bloom, gameplay pulses, vignette, ACES tone map, gamma, grade.
-const COMPOSITE_FS = `#version 300 es
+export const COMPOSITE_FS = `#version 300 es
 precision highp float;
 in vec2 vUV;
 uniform sampler2D uScene;
@@ -772,13 +772,13 @@ const UNIFORMS = {
 };
 
 /** Effect glow colours (linear HDR) by sprite name. */
-const FX_COLOR = {
+export const FX_COLOR = {
   orb_enemy: [3.0, 1.0, 0.35], orb_player: [0.6, 2.4, 3.0], shard: [1.2, 2.6, 3.0], bolt: [2.4, 1.9, 0.9],
   flare: [3.2, 1.3, 0.3], frost: [1.2, 2.2, 3.2], spark: [1.6, 1.4, 1.1], bead: [1.5, 2.5, 2.0],
 };
 
 /** Soft fire glow over burning props: [height, size] as fractions of the prop size, then linear rgb. */
-const FIRE_GLOW = /** @type {Record<string, number[]>} */ ({
+export const FIRE_GLOW = /** @type {Record<string, number[]>} */ ({
   campfire_a: [0.35, 1.3, 0.9, 0.42, 0.12], campfire_b: [0.33, 1.2, 0.85, 0.38, 0.1], brazier: [0.75, 1.1, 0.7, 0.45, 0.2],
 });
 
@@ -815,10 +815,10 @@ function createProgram(gl, vs, fs, names) {
 }
 
 /** Prefix a shader body with the version line and optional defines. @param {string} body @param {string[]} [defs] */
-const glsl = (body, defs = []) => `#version 300 es\n${defs.map((d) => `#define ${d}\n`).join('')}${body}`;
+export const glsl = (body, defs = []) => `#version 300 es\n${defs.map((d) => `#define ${d}\n`).join('')}${body}`;
 
 /** @param {number} fovy @param {number} aspect @param {number} near @param {number} far */
-function perspective(fovy, aspect, near, far) {
+export function perspective(fovy, aspect, near, far) {
   const f = 1 / Math.tan(fovy / 2);
   const m = new Float32Array(16);
   m[0] = f / aspect;
@@ -830,7 +830,7 @@ function perspective(fovy, aspect, near, far) {
 }
 
 /** @param {number} l @param {number} r @param {number} b @param {number} t @param {number} n @param {number} f */
-function ortho(l, r, b, t, n, f) {
+export function ortho(l, r, b, t, n, f) {
   const m = new Float32Array(16);
   m[0] = 2 / (r - l);
   m[5] = 2 / (t - b);
@@ -843,7 +843,7 @@ function ortho(l, r, b, t, n, f) {
 }
 
 /** @param {number[]} eye @param {number[]} fwd unit forward */
-function viewMatrix(eye, fwd) {
+export function viewMatrix(eye, fwd) {
   const z = [-fwd[0], -fwd[1], -fwd[2]];
   const xl = Math.hypot(z[2], z[0]) || 1;
   const x = [z[2] / xl, 0, -z[0] / xl];
@@ -853,7 +853,7 @@ function viewMatrix(eye, fwd) {
 }
 
 /** Inverse of a column-major 4x4 matrix (cofactor expansion). @param {Float32Array} m */
-function invert(m) {
+export function invert(m) {
   const [a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33] = m;
   const b00 = a00 * a11 - a01 * a10;
   const b01 = a00 * a12 - a02 * a10;
@@ -883,7 +883,7 @@ function invert(m) {
  * @param {Float32Array} data @param {number} n floats used
  * @returns {{verts: Float32Array, idx: Uint16Array|Uint32Array}}
  */
-function weld(data, n) {
+export function weld(data, n) {
   const count = n / VERT;
   const bits = new Uint32Array(data.buffer, data.byteOffset, n);
   const out = new Float32Array(n);
@@ -918,7 +918,7 @@ function weld(data, n) {
 /** Display colour to linear light (values above 1 stay linear HDR). @param {number} c */
 const toLin = (c) => (c <= 1 ? Math.pow(Math.max(0, c), 2.2) : c);
 /** @param {number[]} c @param {number} [k] */
-const lin3 = (c, k = 1) => [toLin(c[0]) * k, toLin(c[1]) * k, toLin(c[2]) * k];
+export const lin3 = (c, k = 1) => [toLin(c[0]) * k, toLin(c[1]) * k, toLin(c[2]) * k];
 
 // ---------------------------------------------------------------------------
 // World chunk meshing
@@ -929,7 +929,7 @@ const lin3 = (c, k = 1) => [toLin(c[0]) * k, toLin(c[1]) * k, toLin(c[2]) * k];
  * @param {Mesh} b @param {number[]} p 12 floats @param {number[]} uv [u0, v0, u1, v1] @param {number[]} nrm @param {number} emit
  * @param {number[]} tint @param {number} sky @param {number} layer @param {number[]} [ao] per-corner occlusion
  */
-function wquad(b, p, uv, nrm, emit, tint, sky, layer, ao) {
+export function wquad(b, p, uv, nrm, emit, tint, sky, layer, ao) {
   const us = [uv[0], uv[2], uv[2], uv[0]];
   const vs = [uv[1], uv[1], uv[3], uv[3]];
   for (const c of [0, 1, 2, 0, 2, 3]) {
@@ -945,7 +945,7 @@ function wquad(b, p, uv, nrm, emit, tint, sky, layer, ao) {
  * @param {number} y0 @param {number} y1 @param {number} tile @param {number[]} nrm @param {number} emit @param {number} sky
  * @param {number} ceilY height of a ceiling seam to shade, or Infinity
  */
-function vface(b, x0, z0, x1, z1, y0, y1, tile, nrm, emit, sky, ceilY) {
+export function vface(b, x0, z0, x1, z1, y0, y1, tile, nrm, emit, sky, ceilY) {
   if (y1 - y0 < 0.01) return;
   const bands = Math.max(1, Math.round(y1 - y0));
   const step = (y1 - y0) / bands;
@@ -959,12 +959,12 @@ function vface(b, x0, z0, x1, z1, y0, y1, tile, nrm, emit, sky, ceilY) {
 }
 
 /** Horizontal quad over a cell. @param {Mesh} b @param {number} i @param {number} j @param {number} y @param {number} tile @param {number} ny @param {number} emit @param {number} sky @param {number[]} [ao] */
-function hface(b, i, j, y, tile, ny, emit, sky, ao) {
+export function hface(b, i, j, y, tile, ny, emit, sky, ao) {
   wquad(b, [i, y, j, i + 1, y, j, i + 1, y, j + 1, i, y, j + 1], FULL_UV, [0, ny, 0], emit, WHITE, sky, tile, ao);
 }
 
 /** Emissive flag for a floor/wall tile. @param {number} tile */
-const tileEmit = (tile) => (tile === TILE.CONDUIT || tile === TILE.LEY_FLOOR || tile === TILE.GATE || tile === TILE.STAR_CEIL ? 1 : 0);
+export const tileEmit = (tile) => (tile === TILE.CONDUIT || tile === TILE.LEY_FLOOR || tile === TILE.GATE || tile === TILE.STAR_CEIL ? 1 : 0);
 
 /**
  * Corner occlusion at a grid vertex: darker the more of its four cells are walls.
@@ -992,7 +992,7 @@ function terrainNormal(L, i, j) {
  * @param {Level} L @param {number} cx @param {number} cz @param {Mesh} b @param {Uint8Array} roofMask
  * @param {import('./world.js').Roof[]} roofs
  */
-function buildChunk(L, cx, cz, b, roofMask, roofs) {
+export function buildChunk(L, cx, cz, b, roofMask, roofs) {
   b.reset();
   const W = L.w + 1;
   const i0 = cx * CHUNK;
@@ -1114,7 +1114,7 @@ function buildChunk(L, cx, cz, b, roofMask, roofs) {
  */
 
 /** Growable Float32 list. */
-class FloatList {
+export class FloatList {
   /** @param {number} cap */
   constructor(cap) {
     this.data = new Float32Array(cap);
@@ -1130,23 +1130,448 @@ class FloatList {
   }
 }
 
-export class Renderer {
+/**
+ * What every renderer shares and that needs no GPU: level and chunk bookkeeping, prop placement,
+ * the per-frame gather of instances, characters and effects, light packing, skinning matrices,
+ * the sun's shadow box and the viewmodel pose. Subclasses supply the drawing, plus
+ * _model(key) (an entry in this.models with inst, n and ns) and unloadChunk(key).
+ */
+export class RendererBase {
   /** @param {HTMLCanvasElement} canvas */
   constructor(canvas) {
-    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: true, powerPreference: 'high-performance' });
-    if (!gl) throw new Error('WebGL 2.0 is not available in this browser.');
-    this.gl = gl;
     this.canvas = canvas;
     this.renderScale = 1;
     /** Point lights per frame (main.js lowers this on touch devices). */
     this.maxLights = MAX_LIGHTS;
+    this.fxList = new FloatList(256 * 8);
+    this.shadowList = new FloatList(64 * 8);
+    /** Glow markers drawn with the depth test off. */
+    this.xrayList = new FloatList(64 * 8);
+    this.shadowMat = new Float32Array(16);
+    /** @type {Map<number, ChunkMesh>} */
+    this.chunks = new Map();
+    /** @type {Level|null} */
+    this.level = null;
+    this.roofMask = new Uint8Array(0);
+    /** @type {import('./world.js').Roof[]} */
+    this.roofs = [];
+    /** @type {{x:number, z:number}[]} */
+    this.wells = [];
+    /** Dialogue portraits by rig and size (PNG data URLs). @type {Map<string, string>} */
+    this.portraits = new Map();
+    this.bones = new Float32Array(MAX_BONES * 16);
+    /** Skinning matrices (pose x inverse bind) uploaded for a rig. */
+    this.skinMats = new Float32Array(MAX_BONES * 16);
+    this.lightPos = new Float32Array(MAX_LIGHTS * 3);
+    this.lightCol = new Float32Array(MAX_LIGHTS * 3);
+    /** Viewmodel inertia: last camera angles and the current lag offset. @type {{yaw:number, pitch:number}|null} */
+    this.vmLast = null;
+    this.vmSway = [0, 0];
+    /** @type {Map<string, {inst: Float32Array, n: number, ns: number}>} instanced models by key */
+    this.models = new Map();
+    const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+    this.shadowSize = coarse ? 1024 : 2048;
+    /** @type {Map<string, Mesh>} CPU models by key */
+    this.cpuModels = new Map();
+    this.doorMesh = new Mesh(2048);
+  }
+
+  /** CPU mesh for a model key ('name', 'name#variant', '~' suffix for the far LOD, 'grass'). @param {string} key */
+  _cpuModel(key) {
+    let m = this.cpuModels.get(key);
+    if (!m) {
+      const far = key.endsWith('~');
+      const base = far ? key.slice(0, -1) : key;
+      const [name, v] = base.split('#');
+      if (name === 'grass') {
+        m = new Mesh(64);
+        grassTuft(m, 0, 0, 0, 1, Number(v ?? 0) * 977 + 3, [1, 1, 1]);
+      } else m = buildModel(name, Number(v ?? 0), far);
+      this.cpuModels.set(key, m);
+    }
+    return m;
+  }
+
+  /** Sliding door panels plus lintels, into this.doorMesh. @param {Door[]} doors @param {number} time */
+  _buildDoorMesh(doors, time) {
+    const b = this.doorMesh;
+    b.reset();
+    for (const d of doors) {
+      const pulse = Math.sin(time * 4);
+      const tint = d.locked && (d.magic || d.puzzle) ? [0.7, 1.0 + 0.3 * pulse, 1.4 + 0.4 * pulse] : WHITE;
+      const y0 = d.base;
+      const y1 = d.base + d.height;
+      const slide = d.open * 0.95;
+      const emit = tileEmit(d.tex) || (d.magic ? 1 : 0);
+      const sky = this.level && this.level.outdoor && this.level.ceil[this.level.idx(d.i, d.j)] === 0 ? 1 : 0;
+      const ao = [1, 1, 0.65, 0.65];
+      if (d.axis === 'x') {
+        const x0 = d.i + slide;
+        const x1 = x0 + 1;
+        const za = d.j + 0.42;
+        const zb = d.j + 0.58;
+        wquad(b, [x0, y1, za, x1, y1, za, x1, y0, za, x0, y0, za], FULL_UV, [0, 0, -1], emit, tint, sky, d.tex, ao);
+        wquad(b, [x1, y1, zb, x0, y1, zb, x0, y0, zb, x1, y0, zb], FULL_UV, [0, 0, 1], emit, tint, sky, d.tex, ao);
+        wquad(b, [x0, y1, zb, x0, y1, za, x0, y0, za, x0, y0, zb], [0, 0, 0.16, 1], [-1, 0, 0], emit, tint, sky, d.tex, ao);
+        vface(b, d.i, d.j, d.i + 1, d.j, y1, d.top, d.tex, [0, 0, -1], emit, sky, Infinity);
+        vface(b, d.i, d.j + 1, d.i + 1, d.j + 1, y1, d.top, d.tex, [0, 0, 1], emit, sky, Infinity);
+      } else {
+        const z0 = d.j + slide;
+        const z1 = z0 + 1;
+        const xa = d.i + 0.42;
+        const xb = d.i + 0.58;
+        wquad(b, [xa, y1, z1, xa, y1, z0, xa, y0, z0, xa, y0, z1], FULL_UV, [-1, 0, 0], emit, tint, sky, d.tex, ao);
+        wquad(b, [xb, y1, z0, xb, y1, z1, xb, y0, z1, xb, y0, z0], FULL_UV, [1, 0, 0], emit, tint, sky, d.tex, ao);
+        wquad(b, [xa, y1, z0, xb, y1, z0, xb, y0, z0, xa, y0, z0], [0, 0, 0.16, 1], [0, 0, -1], emit, tint, sky, d.tex, ao);
+        vface(b, d.i, d.j + 1, d.i, d.j, y1, d.top, d.tex, [-1, 0, 0], emit, sky, Infinity);
+        vface(b, d.i + 1, d.j, d.i + 1, d.j + 1, y1, d.top, d.tex, [1, 0, 0], emit, sky, Infinity);
+      }
+      hface(b, d.i, d.j, y1, d.tex, -1, emit, 0);
+    }
+  }
+  /**
+   * Camera and pose for a dialogue portrait: head and shoulders, three-quarter view.
+   * @param {string} rigName @param {number} variant
+   */
+  _portraitView(rigName, variant) {
+    const glbM = NPC_CHARS.get(rigName);
+    const rig = getRig(rigName, false, variant);
+    // t = 2.6 s falls between blinks (see poseRig).
+    /** @type {import('./models.js').ModelDesc} */
+    const desc = { rig: rigName, yaw: Math.PI / 2, t: 2.6, walk: 0, phase: 0, act: '', k: 0, stagger: 0, dead: 0, scale: 1 };
+    let n;
+    /** @type {number[]} */
+    let fc;
+    if (glbM) {
+      // Rigged model: the idle's first frame (idles glance about later), framed a little above
+      // its head joint (the skull base).
+      const idle = glbM.states.idle;
+      n = poseGlb(glbM, idle ? [{ clip: idle, time: 0, weight: 1 }] : [], trs(0, 0, 0, 0, 0, 0, 1, this.glbRoot), this.glbBones);
+      fc = [glbM.headPos[0], glbM.headPos[1] + 0.1, glbM.headPos[2] + 0.02];
+    } else {
+      n = poseRig(rig, desc, 0, 0, 0, this.bones);
+      // Frame on the face (head bone is index 2), aiming a little low to take in the shoulders.
+      const H = this.bones.subarray(32, 48);
+      const hp = [0, 0.13, 0.05];
+      fc = [0, 1, 2].map((i) => H[i] * hp[0] + H[4 + i] * hp[1] + H[8 + i] * hp[2] + H[12 + i]);
+    }
+    const look = [fc[0], fc[1] - 0.08, fc[2]];
+    const eye = [look[0] + Math.sin(0.42) * 0.72, look[1] + 0.05, look[2] + Math.cos(0.42) * 0.72];
+    const d = [look[0] - eye[0], look[1] - eye[1], look[2] - eye[2]];
+    const dl = Math.hypot(d[0], d[1], d[2]);
+    const vp = mul(perspective((30 * Math.PI) / 180, 1, 0.05, 10), viewMatrix(eye, d.map((c) => c / dl)));
+
+    return { glbM, rig, n, fc, eye, vp, t: desc.t };
+  }
+
+  /**
+   * Read-back pixels (bottom-up, 2x size) to a tone-mapped, transparent PNG: average 2x2, ACES, gamma.
+   * @param {Float32Array|Uint8Array} raw @param {number} px @param {number} size @param {boolean} hdr float pixels
+   */
+  _portraitPng(raw, px, size, hdr) {
+    const scale = (hdr ? 1 : 1 / 255) / this.store;
+    const aces = (/** @type {number} */ x) => Math.min(1, Math.max(0, (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)));
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = size;
+    const c2 = cv.getContext('2d');
+    if (!c2) throw new Error('2D canvas is not available');
+    const img = c2.createImageData(size, size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const acc = [0, 0, 0, 0];
+        for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+          const s = ((px - 1 - (y * 2 + oy)) * px + x * 2 + ox) * 4;
+          for (let k = 0; k < 4; k++) acc[k] += raw[s + k] * (k < 3 ? scale : hdr ? 1 : 1 / 255);
+        }
+        const a = acc[3] / 4;
+        const o = (y * size + x) * 4;
+        for (let k = 0; k < 3; k++) img.data[o + k] = Math.pow(aces(acc[k] / 4 / Math.max(a, 1e-3)), 1 / 2.2) * 255;
+        img.data[o + 3] = Math.min(1, a) * 255;
+      }
+    }
+    c2.putImageData(img, 0, 0);
+    return cv.toDataURL('image/png');
+  }
+
+  /** @abstract @param {string} key @returns {{inst: Float32Array, n: number, ns: number}} */
+  _model(key) { throw new Error(`_model(${key}) is not implemented`); }
+
+  /** @abstract @param {number} key */
+  unloadChunk(key) { throw new Error(`unloadChunk(${key}) is not implemented`); }
+
+  /** Drop every chunk mesh and switch to another level. @param {Level} level */
+  setLevel(level) {
+    for (const key of [...this.chunks.keys()]) this.unloadChunk(key);
+    this.level = level;
+    this.roofs = level.roofs ?? [];
+    this.roofMask = new Uint8Array(level.w * level.h);
+    for (const r of this.roofs) {
+      for (let j = r.z0; j < r.z1; j++) for (let i = r.x0; i < r.x1; i++) if (level.inBounds(i, j)) this.roofMask[level.idx(i, j)] = 1;
+    }
+    this.wells = level.props.filter((p) => p.sprite === 'well').map((p) => ({ x: p.x, z: p.z }));
+  }
+
+  /**
+   * Facing for a decor prop: market furniture turns toward the town well, the rest is seeded.
+   * @param {Prop} p
+   */
+  _propYaw(p) {
+    if (p.sprite === 'stall' || p.sprite === 'notice') {
+      let best = null;
+      let bd = 15 * 15;
+      for (const w of this.wells) {
+        const d = (w.x - p.x) ** 2 + (w.z - p.z) ** 2;
+        if (d < bd) { bd = d; best = w; }
+      }
+      if (best) return Math.atan2(best.x - p.x, best.z - p.z);
+    }
+    return hash2(Math.floor(p.x * 13.1), Math.floor(p.z * 7.7), 5) * Math.PI * 2;
+  }
+
+  /**
+   * Decor model instances and grass tufts for one chunk.
+   * @param {Level} L @param {number} key @param {number} cx @param {number} cz
+   * @returns {{props: PropInst[], grass: Float32Array}}
+   */
+  _buildClutter(L, key, cx, cz) {
+    /** @type {PropInst[]} */
+    const props = [];
+    for (const p of L.propChunks.get(key) ?? []) {
+      if (p.kind !== 'decor' || p.gone || !hasModel(p.sprite)) continue;
+      const variant = VARIANTS.has(p.sprite) ? Math.floor(hash2(Math.floor(p.x * 13.1), Math.floor(p.z * 7.7), 9) * 4) : 0;
+      const k = `${p.sprite}#${variant}`;
+      props.push({ key: k, far: VARIANTS.has(p.sprite) ? `${k}~` : k, x: p.x, y: L.heightAt(p.x, p.z) + p.lift, z: p.z, yaw: this._propYaw(p), s: p.size / nominalSize(p.sprite), sky: L.covered(p.x, p.z) ? 0 : 1 });
+    }
+    const grass = new FloatList(256 * INST);
+    if (L.outdoor) {
+      for (let j = cz * CHUNK; j < Math.min((cz + 1) * CHUNK, L.h); j++) {
+        for (let i = cx * CHUNK; i < Math.min((cx + 1) * CHUNK, L.w); i++) {
+          const k = L.idx(i, j);
+          const t = L.floorTex[k];
+          if (L.wall[k] || L.ceil[k] || L.hazard[k] || L.zone[k] >= 0 || L.doorAt[k] >= 0 || L.floorH[k] < L.waterLevel + 0.05) continue;
+          const tufts = t === TILE.GRASS ? 2 : t === TILE.FEN ? 1 : 0;
+          for (let n = 0; n < tufts; n++) {
+            const h1 = hash2(i * 3 + n, j, 77);
+            const h2 = hash2(j * 5 + n, i, 91);
+            const x = i + 0.1 + h1 * 0.8;
+            const z = j + 0.1 + h2 * 0.8;
+            grass.grow(INST);
+            grass.data.set([x, L.heightAt(x, z) - 0.02, z, h1 * 6.28, 0.4 + h1 * h2 * 0.4, 1, 0, 0, 0.85 + h1 * 0.25, 0.92 + h2 * 0.18, 0.85, 0], grass.n);
+            grass.n += INST;
+          }
+        }
+      }
+    }
+    return { props, grass: grass.data.slice(0, grass.n) };
+  }
+
+  /** Pick the lights nearest the eye, apply flicker, pack into uniform arrays (linear light). @param {Light[]} lights @param {{x:number,y:number,z:number}} eye @param {number} time */
+  _packLights(lights, eye, time) {
+    const sorted = lights.map((l) => ({ l, d: (l.x - eye.x) ** 2 + (l.z - eye.z) ** 2 })).sort((a, b) => a.d - b.d);
+    const n = Math.min(this.maxLights, MAX_LIGHTS, sorted.length);
+    for (let i = 0; i < n; i++) {
+      const { l } = sorted[i];
+      const f = l.flicker ? 1 - l.flicker * (0.5 + 0.5 * Math.sin(time * 13 + l.x) * Math.sin(time * 7.3 + l.z)) : 1;
+      this.lightPos.set([l.x, l.y, l.z], i * 3);
+      this.lightCol.set(lin3([l.r, l.g, l.b], 2.2 * f), i * 3);
+    }
+    return n;
+  }
+
+  /**
+   * Queue one instance of a model for this frame.
+   * @param {string} key @param {number} x @param {number} y @param {number} z @param {number} yaw @param {number} s
+   * @param {number} sky @param {number[]} tint @param {number} emit
+   */
+  _queue(key, x, y, z, yaw, s, sky, tint, emit) {
+    const g = this._model(key);
+    if ((g.n + 1) * INST > g.inst.length) {
+      const next = new Float32Array(g.inst.length * 2);
+      next.set(g.inst);
+      g.inst = next;
+    }
+    const d = g.inst;
+    let i = g.n * INST;
+    d[i++] = x; d[i++] = y; d[i++] = z; d[i++] = yaw; d[i++] = s; d[i++] = sky; d[i++] = 0; d[i++] = 0;
+    d[i++] = tint[0]; d[i++] = tint[1]; d[i++] = tint[2]; d[i] = emit;
+    g.n++;
+  }
+
+  /**
+   * Gather this frame's instances (decor, grass, interactable props, items), characters and effects.
+   * @param {RenderView} v @param {number} fx @param {number} fz view direction on the ground
+   */
+  _gather(v, fx, fz) {
+    for (const g of this.models.values()) g.n = 0;
+    const ex = v.eye.x;
+    const ez = v.eye.z;
+    // Props near enough to cast into the shadow box are queued first, so the shadow pass draws
+    // just the leading instances of each model; distant props are queued after.
+    /** @type {{p: PropInst, d: number}[]} */
+    const far = [];
+    /** Keep anything near (it may cast a shadow into view); drop distant things behind the eye. */
+    const keep = (/** @type {number} */ x, /** @type {number} */ z, /** @type {number} */ r) => {
+      const dx = x - ex;
+      const dz = z - ez;
+      const d = Math.hypot(dx, dz);
+      if (d > 64 + r) return -1;
+      if (d > 24 + r && (dx * fx + dz * fz) / d < -0.3) return -1;
+      return d;
+    };
+    for (const c of this.chunks.values()) {
+      const ccx = (c.cx + 0.5) * CHUNK;
+      const ccz = (c.cz + 0.5) * CHUNK;
+      if (keep(ccx, ccz, CHUNK * 0.75) < 0) continue;
+      for (const p of c.props) {
+        const d = keep(p.x, p.z, 3);
+        if (d < 0) continue;
+        if (d > SHADOW_REACH) far.push({ p, d });
+        else this._queue(d > LOD_DIST ? p.far : p.key, p.x, p.y, p.z, p.yaw, p.s, p.sky, WHITE, 1);
+      }
+      if (Math.hypot(ccx - ex, ccz - ez) < GRASS_DIST + CHUNK) {
+        const gr = c.grass;
+        for (let i = 0; i < gr.length; i += INST) {
+          const dx = gr[i] - ex;
+          const dz = gr[i + 2] - ez;
+          const d2 = dx * dx + dz * dz;
+          if (d2 > GRASS_DIST * GRASS_DIST || (d2 > 16 && dx * fx + dz * fz < -0.2 * Math.sqrt(d2))) continue;
+          const g = this._model(`grass#${(i / INST) & 3}`);
+          if ((g.n + 1) * INST > g.inst.length) {
+            const next = new Float32Array(g.inst.length * 2);
+            next.set(g.inst);
+            g.inst = next;
+          }
+          g.inst.set(gr.subarray(i, i + INST), g.n * INST);
+          g.n++;
+        }
+      }
+    }
+    /** @type {{s: SpriteDesc, m: ModelDesc}[]} */
+    const chars = [];
+    const fxl = this.fxList;
+    fxl.n = 0;
+    this.xrayList.n = 0;
+    const shl = this.shadowList;
+    shl.n = 0;
+    for (const s of v.sprites) {
+      if (s.model) {
+        if (keep(s.x, s.z, 2) < 0) continue;
+        chars.push({ s, m: s.model });
+        shl.grow(8);
+        shl.data.set([s.x, s.y, s.z, 0.42 * s.model.scale * (1 - Math.min(1, s.model.dead)), 0, 0, 0, 1], shl.n);
+        shl.n += 8;
+        continue;
+      }
+      const name = SPRITE_NAMES[s.frame] ?? 'spark';
+      if (hasModel(name)) {
+        const d = keep(s.x, s.z, 2);
+        if (d < 0) continue;
+        const seed = hash2(Math.floor(s.x * 31), Math.floor(s.z * 17), 3);
+        if (isItemModel(name)) {
+          this._queue(name, s.x, s.y + 0.08 + Math.sin(v.time * 2 + seed * 6) * 0.03, s.z, v.time * 0.8 + seed * 6.28, Math.max(0.8, s.h / 0.6), s.sky, s.tint, 1);
+        } else {
+          const emit = s.emit > 0 || name === 'campfire_b' ? 1 : 0.25;
+          this._queue(name, s.x, s.y, s.z, seed * 6.28, s.h / nominalSize(name), s.sky, s.tint, emit);
+          const fire = FIRE_GLOW[name];
+          if (fire) {
+            const flick = 0.85 + 0.15 * Math.sin(v.time * 11 + seed * 9) * Math.sin(v.time * 7.3);
+            fxl.grow(8);
+            fxl.data.set([s.x, s.y + s.h * fire[0], s.z, s.h * fire[1], fire[2] * flick, fire[3] * flick, fire[4] * flick, 0], fxl.n);
+            fxl.n += 8;
+          }
+        }
+        continue;
+      }
+      const col = /** @type {Record<string, number[]>} */ (FX_COLOR)[name] ?? FX_COLOR.spark;
+      const list = s.xray ? this.xrayList : fxl;
+      list.grow(8);
+      list.data.set([s.x, s.y + s.h / 2, s.z, s.w, col[0] * s.tint[0], col[1] * s.tint[1], col[2] * s.tint[2], 0], list.n);
+      list.n += 8;
+    }
+    for (const g of this.models.values()) g.ns = g.n;
+    for (const { p, d } of far) this._queue(d > LOD_DIST ? p.far : p.key, p.x, p.y, p.z, p.yaw, p.s, p.sky, WHITE, 1);
+    return chars;
+  }
+
+  /**
+   * Skinning matrices for a posed rig: each bone's pose times its inverse bind.
+   * @param {import('./models.js').Rig} rig @param {number} n bones posed @returns {Float32Array}
+   */
+  _skin(rig, n) {
+    for (let i = 0; i < n; i++) mul(this.bones.subarray(i * 16, i * 16 + 16), rig.invBind.subarray(i * 16, i * 16 + 16), this.skinMats.subarray(i * 16, i * 16 + 16));
+    return this.skinMats.subarray(0, Math.max(n, 1) * 16);
+  }
+
+  /**
+   * Fit the sun's orthographic shadow box around the view, snapped to whole texels so
+   * shadow edges do not shimmer as the player moves.
+   * @param {RenderView} v @param {number[]} fwd
+   */
+  _shadowViewProj(v, fwd) {
+    const R = 30;
+    const c = [v.eye.x + fwd[0] * R * 0.5, v.eye.y, v.eye.z + fwd[2] * R * 0.5];
+    const sd = v.env.sunDir;
+    const view = viewMatrix([0, 0, 0], [-sd[0], -sd[1], -sd[2]]);
+    const cx = view[0] * c[0] + view[4] * c[1] + view[8] * c[2];
+    const cy = view[1] * c[0] + view[5] * c[1] + view[9] * c[2];
+    const cz = view[2] * c[0] + view[6] * c[1] + view[10] * c[2];
+    const unit = (2 * R) / this.shadowSize;
+    const sx = Math.round(cx / unit) * unit;
+    const sy = Math.round(cy / unit) * unit;
+    const vp = mul(ortho(sx - R, sx + R, sy - R, sy + R, -cz - 90, -cz + 90), view);
+    const bias = new Float32Array([0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0.5, 0, 0.5, 0.5, 0.5, 1]);
+    mul(bias, vp, this.shadowMat);
+    return vp;
+  }
+
+  /**
+   * First-person weapon (right) and lantern (left) placements, with inertia that lags fast turns.
+   * @param {RenderView} v @param {Float32Array} view @returns {[string, Float32Array][]}
+   */
+  _viewmodelParts(v, view) {
+    const vm = /** @type {ViewDesc} */ (v.view);
+    const cam = invert(view);
+    // Inertia: the held items lag behind fast turns and settle back.
+    const last = this.vmLast ?? { yaw: v.yaw, pitch: v.pitch };
+    let dyaw = v.yaw - last.yaw;
+    dyaw -= Math.round(dyaw / (Math.PI * 2)) * Math.PI * 2;
+    const dpitch = v.pitch - last.pitch;
+    this.vmLast = { yaw: v.yaw, pitch: v.pitch };
+    const sway = this.vmSway;
+    sway[0] += (Math.max(-0.05, Math.min(0.05, -dyaw * 1.6)) - sway[0]) * 0.18;
+    sway[1] += (Math.max(-0.04, Math.min(0.04, -dpitch * 1.6)) - sway[1]) * 0.18;
+    const bx = Math.sin(vm.bob) * 0.012 + sway[0];
+    const by = -Math.abs(Math.cos(vm.bob)) * 0.012 + sway[1];
+    /** @type {[string, Float32Array][]} */
+    const parts = [];
+    if (vm.item) {
+      const sw = vm.item === 'fork' ? Math.sin(Math.min(1, vm.swing) * Math.PI) : 0;
+      const rec = vm.recoil;
+      const cast = vm.item === 'cast' ? vm.cast : 0;
+      const blk = vm.block ? 1 : 0;
+      const local = trs(
+        0.24 + bx - 0.14 * sw - 0.1 * blk, -0.25 + by + 0.06 * sw + 0.08 * blk - (vm.item === 'cast' ? 0.03 : 0), -0.42 + 0.06 * rec - 0.12 * cast,
+        0.35 + 0.9 * sw, 0.25 * rec - 0.4 * sw, 0.7 * blk + 0.5 * sw, 1,
+      );
+      parts.push([vm.item, mul(cam, local)]);
+    }
+    if (vm.lantern) parts.push(['lantern', mul(cam, trs(-0.34 - bx * 0.5, -0.24 + by, -0.62, -0.2, 0, 0, 0.75))]);
+    return parts;
+  }
+}
+
+export class Renderer extends RendererBase {
+  /** @param {HTMLCanvasElement} canvas */
+  constructor(canvas) {
+    super(canvas);
+    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: true, powerPreference: 'high-performance' });
+    if (!gl) throw new Error('WebGL 2.0 is not available in this browser.');
+    this.gl = gl;
     /** Half-float scene buffer when the GPU can render to it; otherwise 8-bit at half scale. */
     this.hdr = !!gl.getExtension('EXT_color_buffer_float');
     this.store = this.hdr ? 1 : 0.5;
     const anisoExt = gl.getExtension('EXT_texture_filter_anisotropic');
     const aniso = anisoExt ? Math.min(16, gl.getParameter(anisoExt.MAX_TEXTURE_MAX_ANISOTROPY_EXT)) : 1;
-    const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
-    this.shadowSize = coarse ? 1024 : 2048;
     this.mesh = createProgram(gl, glsl(MESH_VS), glsl(MESH_FS), UNIFORMS.mesh);
     this.meshInst = createProgram(gl, glsl(MESH_VS, ['INSTANCED']), glsl(MESH_FS), UNIFORMS.meshInst);
     this.depth = createProgram(gl, glsl(MESH_VS), glsl(DEPTH_FS), UNIFORMS.depth);
@@ -1211,10 +1636,6 @@ export class Renderer {
       gl.vertexAttribDivisor(l, 1);
     }
     gl.bindVertexArray(null);
-    this.fxList = new FloatList(256 * 8);
-    this.shadowList = new FloatList(64 * 8);
-    /** Glow markers drawn with the depth test off. */
-    this.xrayList = new FloatList(64 * 8);
     // Directional shadow map: hardware depth comparison gives bilinear PCF per tap.
     this.shadowTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
@@ -1232,30 +1653,13 @@ export class Renderer {
     gl.readBuffer(gl.NONE);
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('Shadow framebuffer is incomplete');
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.shadowMat = new Float32Array(16);
-    /** @type {Map<number, ChunkMesh>} */
-    this.chunks = new Map();
-    /** @type {Level|null} */
-    this.level = null;
-    this.roofMask = new Uint8Array(0);
-    /** @type {import('./world.js').Roof[]} */
-    this.roofs = [];
-    /** @type {{x:number, z:number}[]} */
-    this.wells = [];
     this.chunkMesh = new Mesh(16384);
     this.doorMesh = new Mesh(2048);
     this.doorBuf = this._makeBuffer();
-    /** @type {Map<string, Mesh>} CPU models by key */
-    this.cpuModels = new Map();
     /** @type {Map<string, ModelGPU>} GPU models by key */
     this.models = new Map();
     /** @type {Map<string, {vao: WebGLVertexArrayObject, vbo: WebGLBuffer, ebo: WebGLBuffer, count: number, itype: number}>} skinned rigs and viewmodels */
     this.skinned = new Map();
-    /** Dialogue portraits by rig and size (PNG data URLs). @type {Map<string, string>} */
-    this.portraits = new Map();
-    this.bones = new Float32Array(MAX_BONES * 16);
-    /** Skinning matrices (pose x inverse bind) uploaded for a rig. */
-    this.skinMats = new Float32Array(MAX_BONES * 16);
     this.identBones = new Float32Array(MAX_BONES * 16);
     for (let i = 0; i < MAX_BONES; i++) this.identBones.set(ident(), i * 16);
     /** Rigged .glb models on the GPU. @type {Map<import('./meshes.js').GlbModel, GlbGPU>} */
@@ -1277,11 +1681,6 @@ export class Renderer {
     this.aoA = null;
     /** @type {Target|null} */
     this.aoB = null;
-    this.lightPos = new Float32Array(MAX_LIGHTS * 3);
-    this.lightCol = new Float32Array(MAX_LIGHTS * 3);
-    /** Viewmodel inertia: last camera angles and the current lag offset. @type {{yaw:number, pitch:number}|null} */
-    this.vmLast = null;
-    this.vmSway = [0, 0];
     // Sculpting and AO-baking a rig or tree takes 0.1-0.3 s, so build them all in small steps
     // while the title screen is up instead of hitching the first time one comes into view.
     /** @type {(() => void)[]} */
@@ -1349,22 +1748,6 @@ export class Renderer {
         gl.vertexAttribDivisor(l, 1);
       }
     }
-  }
-
-  /** CPU mesh for a model key ('name', 'name#variant', '~' suffix for the far LOD, 'grass'). @param {string} key */
-  _cpuModel(key) {
-    let m = this.cpuModels.get(key);
-    if (!m) {
-      const far = key.endsWith('~');
-      const base = far ? key.slice(0, -1) : key;
-      const [name, v] = base.split('#');
-      if (name === 'grass') {
-        m = new Mesh(64);
-        grassTuft(m, 0, 0, 0, 1, Number(v ?? 0) * 977 + 3, [1, 1, 1]);
-      } else m = buildModel(name, Number(v ?? 0), far);
-      this.cpuModels.set(key, m);
-    }
-    return m;
   }
 
   /** GPU instanced model for a key, built on first use. @param {string} key @returns {ModelGPU} */
@@ -1501,72 +1884,6 @@ export class Renderer {
     }
   }
 
-  /** Drop every chunk mesh and switch to another level. @param {Level} level */
-  setLevel(level) {
-    for (const key of [...this.chunks.keys()]) this.unloadChunk(key);
-    this.level = level;
-    this.roofs = level.roofs ?? [];
-    this.roofMask = new Uint8Array(level.w * level.h);
-    for (const r of this.roofs) {
-      for (let j = r.z0; j < r.z1; j++) for (let i = r.x0; i < r.x1; i++) if (level.inBounds(i, j)) this.roofMask[level.idx(i, j)] = 1;
-    }
-    this.wells = level.props.filter((p) => p.sprite === 'well').map((p) => ({ x: p.x, z: p.z }));
-  }
-
-  /**
-   * Facing for a decor prop: market furniture turns toward the town well, the rest is seeded.
-   * @param {Prop} p
-   */
-  _propYaw(p) {
-    if (p.sprite === 'stall' || p.sprite === 'notice') {
-      let best = null;
-      let bd = 15 * 15;
-      for (const w of this.wells) {
-        const d = (w.x - p.x) ** 2 + (w.z - p.z) ** 2;
-        if (d < bd) { bd = d; best = w; }
-      }
-      if (best) return Math.atan2(best.x - p.x, best.z - p.z);
-    }
-    return hash2(Math.floor(p.x * 13.1), Math.floor(p.z * 7.7), 5) * Math.PI * 2;
-  }
-
-  /**
-   * Decor model instances and grass tufts for one chunk.
-   * @param {Level} L @param {number} key @param {number} cx @param {number} cz
-   * @returns {{props: PropInst[], grass: Float32Array}}
-   */
-  _buildClutter(L, key, cx, cz) {
-    /** @type {PropInst[]} */
-    const props = [];
-    for (const p of L.propChunks.get(key) ?? []) {
-      if (p.kind !== 'decor' || p.gone || !hasModel(p.sprite)) continue;
-      const variant = VARIANTS.has(p.sprite) ? Math.floor(hash2(Math.floor(p.x * 13.1), Math.floor(p.z * 7.7), 9) * 4) : 0;
-      const k = `${p.sprite}#${variant}`;
-      props.push({ key: k, far: VARIANTS.has(p.sprite) ? `${k}~` : k, x: p.x, y: L.heightAt(p.x, p.z) + p.lift, z: p.z, yaw: this._propYaw(p), s: p.size / nominalSize(p.sprite), sky: L.covered(p.x, p.z) ? 0 : 1 });
-    }
-    const grass = new FloatList(256 * INST);
-    if (L.outdoor) {
-      for (let j = cz * CHUNK; j < Math.min((cz + 1) * CHUNK, L.h); j++) {
-        for (let i = cx * CHUNK; i < Math.min((cx + 1) * CHUNK, L.w); i++) {
-          const k = L.idx(i, j);
-          const t = L.floorTex[k];
-          if (L.wall[k] || L.ceil[k] || L.hazard[k] || L.zone[k] >= 0 || L.doorAt[k] >= 0 || L.floorH[k] < L.waterLevel + 0.05) continue;
-          const tufts = t === TILE.GRASS ? 2 : t === TILE.FEN ? 1 : 0;
-          for (let n = 0; n < tufts; n++) {
-            const h1 = hash2(i * 3 + n, j, 77);
-            const h2 = hash2(j * 5 + n, i, 91);
-            const x = i + 0.1 + h1 * 0.8;
-            const z = j + 0.1 + h2 * 0.8;
-            grass.grow(INST);
-            grass.data.set([x, L.heightAt(x, z) - 0.02, z, h1 * 6.28, 0.4 + h1 * h2 * 0.4, 1, 0, 0, 0.85 + h1 * 0.25, 0.92 + h2 * 0.18, 0.85, 0], grass.n);
-            grass.n += INST;
-          }
-        }
-      }
-    }
-    return { props, grass: grass.data.slice(0, grass.n) };
-  }
-
   /** Build and upload one chunk's mesh and clutter. @param {number} key */
   loadChunk(key) {
     if (!this.level || this.chunks.has(key)) return;
@@ -1656,179 +1973,13 @@ export class Renderer {
     this.aoB = this._target(this.aoB, aw, ah, false, false);
   }
 
-  /** Sliding door panels plus lintels. @param {Door[]} doors @param {number} time */
+  /** Rebuild the door panels and upload them. @param {Door[]} doors @param {number} time */
   _buildDoors(doors, time) {
+    this._buildDoorMesh(doors, time);
     const b = this.doorMesh;
-    b.reset();
-    for (const d of doors) {
-      const pulse = Math.sin(time * 4);
-      const tint = d.locked && (d.magic || d.puzzle) ? [0.7, 1.0 + 0.3 * pulse, 1.4 + 0.4 * pulse] : WHITE;
-      const y0 = d.base;
-      const y1 = d.base + d.height;
-      const slide = d.open * 0.95;
-      const emit = tileEmit(d.tex) || (d.magic ? 1 : 0);
-      const sky = this.level && this.level.outdoor && this.level.ceil[this.level.idx(d.i, d.j)] === 0 ? 1 : 0;
-      const ao = [1, 1, 0.65, 0.65];
-      if (d.axis === 'x') {
-        const x0 = d.i + slide;
-        const x1 = x0 + 1;
-        const za = d.j + 0.42;
-        const zb = d.j + 0.58;
-        wquad(b, [x0, y1, za, x1, y1, za, x1, y0, za, x0, y0, za], FULL_UV, [0, 0, -1], emit, tint, sky, d.tex, ao);
-        wquad(b, [x1, y1, zb, x0, y1, zb, x0, y0, zb, x1, y0, zb], FULL_UV, [0, 0, 1], emit, tint, sky, d.tex, ao);
-        wquad(b, [x0, y1, zb, x0, y1, za, x0, y0, za, x0, y0, zb], [0, 0, 0.16, 1], [-1, 0, 0], emit, tint, sky, d.tex, ao);
-        vface(b, d.i, d.j, d.i + 1, d.j, y1, d.top, d.tex, [0, 0, -1], emit, sky, Infinity);
-        vface(b, d.i, d.j + 1, d.i + 1, d.j + 1, y1, d.top, d.tex, [0, 0, 1], emit, sky, Infinity);
-      } else {
-        const z0 = d.j + slide;
-        const z1 = z0 + 1;
-        const xa = d.i + 0.42;
-        const xb = d.i + 0.58;
-        wquad(b, [xa, y1, z1, xa, y1, z0, xa, y0, z0, xa, y0, z1], FULL_UV, [-1, 0, 0], emit, tint, sky, d.tex, ao);
-        wquad(b, [xb, y1, z0, xb, y1, z1, xb, y0, z1, xb, y0, z0], FULL_UV, [1, 0, 0], emit, tint, sky, d.tex, ao);
-        wquad(b, [xa, y1, z0, xb, y1, z0, xb, y0, z0, xa, y0, z0], [0, 0, 0.16, 1], [0, 0, -1], emit, tint, sky, d.tex, ao);
-        vface(b, d.i, d.j + 1, d.i, d.j, y1, d.top, d.tex, [-1, 0, 0], emit, sky, Infinity);
-        vface(b, d.i + 1, d.j, d.i + 1, d.j + 1, y1, d.top, d.tex, [1, 0, 0], emit, sky, Infinity);
-      }
-      hface(b, d.i, d.j, y1, d.tex, -1, emit, 0);
-    }
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.doorBuf.vbo);
     gl.bufferData(gl.ARRAY_BUFFER, b.data.subarray(0, b.n), gl.DYNAMIC_DRAW);
-  }
-
-  /** Pick the lights nearest the eye, apply flicker, pack into uniform arrays (linear light). @param {Light[]} lights @param {{x:number,y:number,z:number}} eye @param {number} time */
-  _packLights(lights, eye, time) {
-    const sorted = lights.map((l) => ({ l, d: (l.x - eye.x) ** 2 + (l.z - eye.z) ** 2 })).sort((a, b) => a.d - b.d);
-    const n = Math.min(this.maxLights, MAX_LIGHTS, sorted.length);
-    for (let i = 0; i < n; i++) {
-      const { l } = sorted[i];
-      const f = l.flicker ? 1 - l.flicker * (0.5 + 0.5 * Math.sin(time * 13 + l.x) * Math.sin(time * 7.3 + l.z)) : 1;
-      this.lightPos.set([l.x, l.y, l.z], i * 3);
-      this.lightCol.set(lin3([l.r, l.g, l.b], 2.2 * f), i * 3);
-    }
-    return n;
-  }
-
-  /**
-   * Queue one instance of a model for this frame.
-   * @param {string} key @param {number} x @param {number} y @param {number} z @param {number} yaw @param {number} s
-   * @param {number} sky @param {number[]} tint @param {number} emit
-   */
-  _queue(key, x, y, z, yaw, s, sky, tint, emit) {
-    const g = this._model(key);
-    if ((g.n + 1) * INST > g.inst.length) {
-      const next = new Float32Array(g.inst.length * 2);
-      next.set(g.inst);
-      g.inst = next;
-    }
-    const d = g.inst;
-    let i = g.n * INST;
-    d[i++] = x; d[i++] = y; d[i++] = z; d[i++] = yaw; d[i++] = s; d[i++] = sky; d[i++] = 0; d[i++] = 0;
-    d[i++] = tint[0]; d[i++] = tint[1]; d[i++] = tint[2]; d[i] = emit;
-    g.n++;
-  }
-
-  /**
-   * Gather this frame's instances (decor, grass, interactable props, items), characters and effects.
-   * @param {RenderView} v @param {number} fx @param {number} fz view direction on the ground
-   */
-  _gather(v, fx, fz) {
-    for (const g of this.models.values()) g.n = 0;
-    const ex = v.eye.x;
-    const ez = v.eye.z;
-    // Props near enough to cast into the shadow box are queued first, so the shadow pass draws
-    // just the leading instances of each model; distant props are queued after.
-    /** @type {{p: PropInst, d: number}[]} */
-    const far = [];
-    /** Keep anything near (it may cast a shadow into view); drop distant things behind the eye. */
-    const keep = (/** @type {number} */ x, /** @type {number} */ z, /** @type {number} */ r) => {
-      const dx = x - ex;
-      const dz = z - ez;
-      const d = Math.hypot(dx, dz);
-      if (d > 64 + r) return -1;
-      if (d > 24 + r && (dx * fx + dz * fz) / d < -0.3) return -1;
-      return d;
-    };
-    for (const c of this.chunks.values()) {
-      const ccx = (c.cx + 0.5) * CHUNK;
-      const ccz = (c.cz + 0.5) * CHUNK;
-      if (keep(ccx, ccz, CHUNK * 0.75) < 0) continue;
-      for (const p of c.props) {
-        const d = keep(p.x, p.z, 3);
-        if (d < 0) continue;
-        if (d > SHADOW_REACH) far.push({ p, d });
-        else this._queue(d > LOD_DIST ? p.far : p.key, p.x, p.y, p.z, p.yaw, p.s, p.sky, WHITE, 1);
-      }
-      if (Math.hypot(ccx - ex, ccz - ez) < GRASS_DIST + CHUNK) {
-        const gr = c.grass;
-        for (let i = 0; i < gr.length; i += INST) {
-          const dx = gr[i] - ex;
-          const dz = gr[i + 2] - ez;
-          const d2 = dx * dx + dz * dz;
-          if (d2 > GRASS_DIST * GRASS_DIST || (d2 > 16 && dx * fx + dz * fz < -0.2 * Math.sqrt(d2))) continue;
-          const g = this._model(`grass#${(i / INST) & 3}`);
-          if ((g.n + 1) * INST > g.inst.length) {
-            const next = new Float32Array(g.inst.length * 2);
-            next.set(g.inst);
-            g.inst = next;
-          }
-          g.inst.set(gr.subarray(i, i + INST), g.n * INST);
-          g.n++;
-        }
-      }
-    }
-    /** @type {{s: SpriteDesc, m: ModelDesc}[]} */
-    const chars = [];
-    const fxl = this.fxList;
-    fxl.n = 0;
-    this.xrayList.n = 0;
-    const shl = this.shadowList;
-    shl.n = 0;
-    for (const s of v.sprites) {
-      if (s.model) {
-        if (keep(s.x, s.z, 2) < 0) continue;
-        chars.push({ s, m: s.model });
-        shl.grow(8);
-        shl.data.set([s.x, s.y, s.z, 0.42 * s.model.scale * (1 - Math.min(1, s.model.dead)), 0, 0, 0, 1], shl.n);
-        shl.n += 8;
-        continue;
-      }
-      const name = SPRITE_NAMES[s.frame] ?? 'spark';
-      if (hasModel(name)) {
-        const d = keep(s.x, s.z, 2);
-        if (d < 0) continue;
-        const seed = hash2(Math.floor(s.x * 31), Math.floor(s.z * 17), 3);
-        if (isItemModel(name)) {
-          this._queue(name, s.x, s.y + 0.08 + Math.sin(v.time * 2 + seed * 6) * 0.03, s.z, v.time * 0.8 + seed * 6.28, Math.max(0.8, s.h / 0.6), s.sky, s.tint, 1);
-        } else {
-          const emit = s.emit > 0 || name === 'campfire_b' ? 1 : 0.25;
-          this._queue(name, s.x, s.y, s.z, seed * 6.28, s.h / nominalSize(name), s.sky, s.tint, emit);
-          const fire = FIRE_GLOW[name];
-          if (fire) {
-            const flick = 0.85 + 0.15 * Math.sin(v.time * 11 + seed * 9) * Math.sin(v.time * 7.3);
-            fxl.grow(8);
-            fxl.data.set([s.x, s.y + s.h * fire[0], s.z, s.h * fire[1], fire[2] * flick, fire[3] * flick, fire[4] * flick, 0], fxl.n);
-            fxl.n += 8;
-          }
-        }
-        continue;
-      }
-      const col = /** @type {Record<string, number[]>} */ (FX_COLOR)[name] ?? FX_COLOR.spark;
-      const list = s.xray ? this.xrayList : fxl;
-      list.grow(8);
-      list.data.set([s.x, s.y + s.h / 2, s.z, s.w, col[0] * s.tint[0], col[1] * s.tint[1], col[2] * s.tint[2], 0], list.n);
-      list.n += 8;
-    }
-    for (const g of this.models.values()) g.ns = g.n;
-    for (const { p, d } of far) this._queue(d > LOD_DIST ? p.far : p.key, p.x, p.y, p.z, p.yaw, p.s, p.sky, WHITE, 1);
-    const gl = this.gl;
-    for (const g of this.models.values()) {
-      if (!g.n) continue;
-      gl.bindBuffer(gl.ARRAY_BUFFER, g.ibo);
-      gl.bufferData(gl.ARRAY_BUFFER, g.inst.subarray(0, g.n * INST), gl.STREAM_DRAW);
-    }
-    return chars;
   }
 
   /**
@@ -1872,15 +2023,6 @@ export class Renderer {
   }
 
   /**
-   * Skinning matrices for a posed rig: each bone's pose times its inverse bind.
-   * @param {import('./models.js').Rig} rig @param {number} n bones posed @returns {Float32Array}
-   */
-  _skin(rig, n) {
-    for (let i = 0; i < n; i++) mul(this.bones.subarray(i * 16, i * 16 + 16), rig.invBind.subarray(i * 16, i * 16 + 16), this.skinMats.subarray(i * 16, i * 16 + 16));
-    return this.skinMats.subarray(0, Math.max(n, 1) * 16);
-  }
-
-  /**
    * Uniforms shared by the lit mesh programs.
    * @param {Record<string, WebGLUniformLocation>} u @param {Float32Array} viewProj @param {RenderView} v @param {number} lights
    * @param {{fog:number[], zen:number[], amb:number[], sun:number[], wet:number, wind:number, shadowOn:number}} k
@@ -1916,28 +2058,6 @@ export class Renderer {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  /**
-   * Fit the sun's orthographic shadow box around the view, snapped to whole texels so
-   * shadow edges do not shimmer as the player moves.
-   * @param {RenderView} v @param {number[]} fwd
-   */
-  _shadowViewProj(v, fwd) {
-    const R = 30;
-    const c = [v.eye.x + fwd[0] * R * 0.5, v.eye.y, v.eye.z + fwd[2] * R * 0.5];
-    const sd = v.env.sunDir;
-    const view = viewMatrix([0, 0, 0], [-sd[0], -sd[1], -sd[2]]);
-    const cx = view[0] * c[0] + view[4] * c[1] + view[8] * c[2];
-    const cy = view[1] * c[0] + view[5] * c[1] + view[9] * c[2];
-    const cz = view[2] * c[0] + view[6] * c[1] + view[10] * c[2];
-    const unit = (2 * R) / this.shadowSize;
-    const sx = Math.round(cx / unit) * unit;
-    const sy = Math.round(cy / unit) * unit;
-    const vp = mul(ortho(sx - R, sx + R, sy - R, sy + R, -cz - 90, -cz + 90), view);
-    const bias = new Float32Array([0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0.5, 0, 0.5, 0.5, 0.5, 1]);
-    mul(bias, vp, this.shadowMat);
-    return vp;
-  }
-
   /** Render one frame. @param {RenderView} v */
   render(v) {
     this.resize();
@@ -1969,6 +2089,11 @@ export class Renderer {
 
     const n = this._packLights(v.lights, v.eye, v.time);
     const chars = this._gather(v, Math.cos(v.yaw), Math.sin(v.yaw));
+    for (const g of this.models.values()) {
+      if (!g.n) continue;
+      gl.bindBuffer(gl.ARRAY_BUFFER, g.ibo);
+      gl.bufferData(gl.ARRAY_BUFFER, g.inst.subarray(0, g.n * INST), gl.STREAM_DRAW);
+    }
     this._buildDoors(v.doors, v.time);
 
     // Sun/moon shadow map.
@@ -2209,32 +2334,9 @@ export class Renderer {
     let rt = null;
     try {
       rt = this._target(null, px, px, true);
-      const glbM = NPC_CHARS.get(rigName);
-      const rig = getRig(rigName, false, variant);
-      // t = 2.6 s falls between blinks (see poseRig).
-      /** @type {import('./models.js').ModelDesc} */
-      const desc = { rig: rigName, yaw: Math.PI / 2, t: 2.6, walk: 0, phase: 0, act: '', k: 0, stagger: 0, dead: 0, scale: 1 };
-      let n;
-      /** @type {number[]} */
-      let fc;
-      if (glbM) {
-        // Rigged model: the idle's first frame (idles glance about later), framed a little above
-        // its head joint (the skull base).
-        const idle = glbM.states.idle;
-        n = poseGlb(glbM, idle ? [{ clip: idle, time: 0, weight: 1 }] : [], trs(0, 0, 0, 0, 0, 0, 1, this.glbRoot), this.glbBones);
-        fc = [glbM.headPos[0], glbM.headPos[1] + 0.1, glbM.headPos[2] + 0.02];
-      } else {
-        n = poseRig(rig, desc, 0, 0, 0, this.bones);
-        // Frame on the face (head bone is index 2), aiming a little low to take in the shoulders.
-        const H = this.bones.subarray(32, 48);
-        const hp = [0, 0.13, 0.05];
-        fc = [0, 1, 2].map((i) => H[i] * hp[0] + H[4 + i] * hp[1] + H[8 + i] * hp[2] + H[12 + i]);
-      }
-      const look = [fc[0], fc[1] - 0.08, fc[2]];
-      const eye = [look[0] + Math.sin(0.42) * 0.72, look[1] + 0.05, look[2] + Math.cos(0.42) * 0.72];
-      const d = [look[0] - eye[0], look[1] - eye[1], look[2] - eye[2]];
-      const dl = Math.hypot(d[0], d[1], d[2]);
-      const vp = mul(perspective((30 * Math.PI) / 180, 1, 0.05, 10), viewMatrix(eye, d.map((c) => c / dl)));
+      const { glbM, rig, n, fc, eye, vp, t } = this._portraitView(rigName, variant);
+      // Upload first: a first upload binds on the active unit and would displace a texture bound below.
+      if (glbM) this._glbGpu(glbM);
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo);
       gl.viewport(0, 0, px, px);
@@ -2265,7 +2367,7 @@ export class Renderer {
       gl.uniform3fv(u.uLightCol, lc);
       gl.uniform1i(u.uLightCount, lights.length);
       gl.uniform3f(u.uEye, eye[0], eye[1], eye[2]);
-      gl.uniform1f(u.uTime, desc.t);
+      gl.uniform1f(u.uTime, t);
       gl.uniform1f(u.uWind, 0);
       gl.uniform3fv(u.uFog, [0, 0, 0]);
       gl.uniform3fv(u.uZenith, [0, 0, 0]);
@@ -2293,28 +2395,7 @@ export class Renderer {
       // Read back, average 2x2, ACES tone map and gamma, flip to top-down rows.
       const raw = this.hdr ? new Float32Array(px * px * 4) : new Uint8Array(px * px * 4);
       gl.readPixels(0, 0, px, px, gl.RGBA, this.hdr ? gl.FLOAT : gl.UNSIGNED_BYTE, raw);
-      const scale = (this.hdr ? 1 : 1 / 255) / this.store;
-      const aces = (/** @type {number} */ x) => Math.min(1, Math.max(0, (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)));
-      const cv = document.createElement('canvas');
-      cv.width = cv.height = size;
-      const c2 = cv.getContext('2d');
-      if (!c2) throw new Error('2D canvas is not available');
-      const img = c2.createImageData(size, size);
-      for (let y = 0; y < size; y++) {
-        for (let x = 0; x < size; x++) {
-          const acc = [0, 0, 0, 0];
-          for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
-            const s = ((px - 1 - (y * 2 + oy)) * px + x * 2 + ox) * 4;
-            for (let k = 0; k < 4; k++) acc[k] += raw[s + k] * (k < 3 ? scale : this.hdr ? 1 : 1 / 255);
-          }
-          const a = acc[3] / 4;
-          const o = (y * size + x) * 4;
-          for (let k = 0; k < 3; k++) img.data[o + k] = Math.pow(aces(acc[k] / 4 / Math.max(a, 1e-3)), 1 / 2.2) * 255;
-          img.data[o + 3] = Math.min(1, a) * 255;
-        }
-      }
-      c2.putImageData(img, 0, 0);
-      url = cv.toDataURL('image/png');
+      url = this._portraitPng(raw, px, size, this.hdr);
     } catch (err) {
       console.warn('Portrait unavailable:', err);
       url = '';
@@ -2338,32 +2419,7 @@ export class Renderer {
   _drawViewmodel(v, view, u, sky) {
     const vm = /** @type {ViewDesc} */ (v.view);
     const gl = this.gl;
-    const cam = invert(view);
-    // Inertia: the held items lag behind fast turns and settle back.
-    const last = this.vmLast ?? { yaw: v.yaw, pitch: v.pitch };
-    let dyaw = v.yaw - last.yaw;
-    dyaw -= Math.round(dyaw / (Math.PI * 2)) * Math.PI * 2;
-    const dpitch = v.pitch - last.pitch;
-    this.vmLast = { yaw: v.yaw, pitch: v.pitch };
-    const sway = this.vmSway;
-    sway[0] += (Math.max(-0.05, Math.min(0.05, -dyaw * 1.6)) - sway[0]) * 0.18;
-    sway[1] += (Math.max(-0.04, Math.min(0.04, -dpitch * 1.6)) - sway[1]) * 0.18;
-    const bx = Math.sin(vm.bob) * 0.012 + sway[0];
-    const by = -Math.abs(Math.cos(vm.bob)) * 0.012 + sway[1];
-    /** @type {[string, Float32Array][]} */
-    const parts = [];
-    if (vm.item) {
-      const sw = vm.item === 'fork' ? Math.sin(Math.min(1, vm.swing) * Math.PI) : 0;
-      const rec = vm.recoil;
-      const cast = vm.item === 'cast' ? vm.cast : 0;
-      const blk = vm.block ? 1 : 0;
-      const local = trs(
-        0.24 + bx - 0.14 * sw - 0.1 * blk, -0.25 + by + 0.06 * sw + 0.08 * blk - (vm.item === 'cast' ? 0.03 : 0), -0.42 + 0.06 * rec - 0.12 * cast,
-        0.35 + 0.9 * sw, 0.25 * rec - 0.4 * sw, 0.7 * blk + 0.5 * sw, 1,
-      );
-      parts.push([vm.item, mul(cam, local)]);
-    }
-    if (vm.lantern) parts.push(['lantern', mul(cam, trs(-0.34 - bx * 0.5, -0.24 + by, -0.62, -0.2, 0, 0, 0.75))]);
+    const parts = this._viewmodelParts(v, view);
     if (!parts.length) return;
     gl.depthRange(0, VIEW_DEPTH);
     gl.uniform1f(u.uBase, -1e4);
