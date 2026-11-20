@@ -3505,28 +3505,72 @@ export function poseRig(rig, a, x, y, z, out) {
 // ---------------------------------------------------------------------------
 
 /**
- * Viewmodel forearm: sleeve, brass bracer and gloved hand.
- * @param {Mesh} m @param {Mat} sleeve @param {number} [curl] 0 open .. 1 fist @param {boolean} [left]
+ * Viewmodel hand closed round a grip, with the bare wrist and forearm running back to a rolled sleeve.
+ * The wrist is straight: +X runs from the forearm through the knuckles. Built in a hand frame with
+ * +Y across the palm toward the index finger and the palm on -Z; the grip crosses the palm
+ * diagonally when it is not square to the forearm, as a sword handle does.
+ * @param {Mesh} m @param {number[]} c grip centre @param {number[]} a grip axis (index-finger end)
+ * @param {number[]} back unit direction from the hand along the forearm to the elbow @param {number} R grip radius
+ * @param {Mat} sleeve @param {boolean} [left]
  */
-function arm(m, sleeve, curl = 0.95, left = false) {
-  // Sleeve and cuff from the wrist back past the camera, then the gloved hand (fingers forward).
-  const sx = left ? -1 : 1;
-  m.sweep([[0, 0.0, 0.02], [sx * 0.025, -0.06, 0.18], [sx * 0.07, -0.15, 0.4]], [[0.036, 0.034], [0.046, 0.044], [0.058, 0.056]], 20, sleeve, { cap0: true, smooth: 1 });
-  m.loft([[-0.012, 0.04, 0.038], [0.025, 0.043, 0.041]], 18, M.brassTex);
-  for (let k = 0; k < 6; k++) {
-    const a = (k / 6) * Math.PI * 2;
-    m.push().at(Math.cos(a) * 0.043, 0.006, Math.sin(a) * 0.041).sphere(0.004, 5, M.brass).pop();
-  }
-  m.push().at(0, 0.0, 0.0, 0, Math.PI / 2);
-  hand(m, M.leatherDark, curl, left ? 1 : -1);
+function fist(m, c, a, back, R, sleeve, left = false) {
+  const X = back.map((v) => -v);
+  const A = norm(a);
+  const ax = A[0] * X[0] + A[1] * X[1] + A[2] * X[2];
+  const Y = norm([A[0] - X[0] * ax, A[1] - X[1] * ax, A[2] - X[2] * ax]);
+  // Grip offset toward the knuckles per metre across the palm (tan of the diagonal).
+  const shear = ax / (A[0] * Y[0] + A[1] * Y[1] + A[2] * Y[2]);
+  const Z = left ? cross(X, Y) : cross(Y, X);
+  // A diagonal grip runs from the index knuckle to the heel of the palm: shift the hand forward to match.
+  const hx = 0.03 * shear;
+  const o = [0, 1, 2].map((i) => c[i] + X[i] * hx);
+  const skin = SKIN[0];
+  const pz = -(R + 0.014);
+  // Fingers curl as if round at least a 24 mm grip, so a thin bail sits inside a closed fist.
+  const rho = Math.max(R + 0.0095, 0.024);
+  m.push();
+  m.m = mul(m.m, new Float32Array([...X, 0, ...Y, 0, ...Z, 0, ...o, 1]));
+  m.push().at(-0.04, 0, pz).box(0.05, 0.042, 0.015, 0.013, skin).pop();
+  m.push().at(-0.05, 0.024, pz + 0.008).ellipsoid(0.03, 0.018, 0.016, 12, 8, skin).pop();
+  [[0.03, 0.0095, 0.085], [0.01, 0.0098, 0.095], [-0.01, 0.009, 0.088], [-0.029, 0.008, 0.07]].forEach(([y, rf, len]) => {
+    const p0 = -0.6;
+    const p1 = Math.min(3.4, p0 + (len - 0.015) / rho);
+    /** @type {number[][]} */
+    const pts = [[0.006, y, pz + 0.002]];
+    for (let s = 0; s <= 3; s++) {
+      const p = p0 + ((p1 - p0) * s) / 3;
+      pts.push([y * shear - hx + Math.cos(p) * rho, y - s * 0.0015 * Math.sign(y), Math.sin(p) * rho]);
+    }
+    m.sweep(pts, [rf * 1.05, rf, rf * 0.95, rf * 0.9, rf * 0.8], 8, skin, { cap1: true, sub: 3 });
+    m.push().at(0.006, y, pz - 0.001).sphere(rf, 8, skin).pop();
+  });
+  m.sweep([[-0.05, 0.03, pz + 0.006], [-0.022, 0.048, pz * 0.4], [0.004 + 0.04 * shear - hx, 0.042, rho * 0.75]], [0.014, 0.011, 0.009], 8, skin, { cap1: true, sub: 3 });
   m.pop();
+  // Wrist and forearm from the heel of the palm toward the elbow, then the rolled sleeve.
+  const W = [0, 1, 2].map((i) => o[i] - X[i] * 0.085 + Z[i] * pz);
+  /** @param {number} t distance along the forearm */
+  const at = (t) => W.map((w, i) => w + back[i] * t);
+  m.sweep([W.map((w, i) => w + X[i] * 0.02), at(0.02), at(0.12), at(0.2)], [[0.033, 0.022], [0.031, 0.022], [0.04, 0.032], [0.046, 0.038]], 14, skin, { sub: 3 });
+  m.sweep([at(0.17), at(0.21)], [0.053, 0.053], 16, sleeve, { cap0: true });
+  m.sweep([at(0.2), at(0.36), at(0.55)], [0.048, 0.054, 0.06], 16, sleeve, { cap1: true });
+}
+
+/** Frame at c with +Y along a (an item built along its local Y). @param {number[]} c @param {number[]} a */
+function alongY(c, a) {
+  const Y = norm(a);
+  const X = norm(cross(Y, [0, 0, 1]));
+  const Z = cross(X, Y);
+  return new Float32Array([...X, 0, ...Y, 0, ...Z, 0, ...c, 1]);
 }
 
 /** @type {Record<string, (m: Mesh) => void>} */
 const VIEWMODELS = {
   fork(m) {
-    arm(m, mat('#5a2a26', 0.85));
-    m.push().at(0.018, -0.008, -0.05, 0, -1.2);
+    // Held like a sword: knuckles up and out, the handle across the palm, the tines up and to the left.
+    const g = norm([-0.82, 0.55, 0.05]);
+    fist(m, [0, 0, -0.03], g, norm([0.3, -0.45, 0.84]), 0.02, mat('#5a2a26', 0.85));
+    m.push();
+    m.m = mul(m.m, alongY([-g[0] * 0.005, -g[1] * 0.005, -0.03 - g[2] * 0.005], g));
     // Leather-wrapped grip with ridged turns, a brass guard and a crystal-core pommel.
     m.sweep([[0, -0.08, 0], [0, 0.07, 0]], [0.019, 0.019], 16, M.leather, { disp: (_x, y) => 0.0018 * Math.sin(y * 260) });
     m.push().at(0, -0.1, 0).lathe([[0, -0.03], [0.022, -0.012], [0.024, 0.0], [0.018, 0.012]], 16, M.brass).pop();
@@ -3540,7 +3584,9 @@ const VIEWMODELS = {
     m.pop();
   },
   scatter(m) {
-    arm(m, mat('#5a2a26', 0.85));
+    // Raised and pushed out so the hand on the pistol grip sits on screen.
+    m.push().at(0, 0.05, -0.04);
+    fist(m, [-0.005, -0.065, 0.0], [-0.01, 0.13, -0.04], norm([0.15, -0.3, 0.94]), 0.024, mat('#5a2a26', 0.85));
     m.push().at(-0.02, 0.045, -0.12, 0, -Math.PI / 2);
     // Beveled brass chamber with banded rings, flared muzzle and a glowing crystal core.
     m.lathe([[0.03, -0.14], [0.036, -0.12], [0.038, 0.0], [0.034, 0.12], [0.036, 0.2], [0.05, 0.28], [0.072, 0.35], [0.068, 0.365], [0.05, 0.37]], 24, M.brassTex, { disp: rough(25, 0.0008, 3) });
@@ -3548,10 +3594,14 @@ const VIEWMODELS = {
     m.push().at(0, 0.0, 0).lathe([[0.055, -0.06], [0.06, -0.04], [0.06, 0.05], [0.055, 0.07]], 24, M.iron).pop();
     m.push().at(0, 0.0, 0.05).lathe([[0, -0.045], [0.026, 0], [0, 0.055]], 6, M.crystal, { flat: true }).pop();
     m.pop();
-    m.sweep([[-0.01, -0.01, -0.02], [-0.012, -0.05, 0.06], [-0.01, -0.07, 0.16]], [[0.024, 0.04], [0.026, 0.05], [0.028, 0.055]], 14, M.wood, { cap1: true, disp: rough(40, 0.001, 4, { stretch: 3 }) });
+    // Raked pistol grip under the chamber.
+    m.sweep([[-0.01, 0.0, -0.02], [-0.005, -0.065, 0.0], [0, -0.13, 0.02]], [[0.018, 0.026], [0.02, 0.028], [0.022, 0.03]], 14, M.wood, { cap1: true, disp: rough(40, 0.001, 4, { stretch: 3 }) });
+    m.pop();
   },
   crossbow(m) {
-    arm(m, mat('#5a2a26', 0.85));
+    m.push().at(0, 0.05, -0.04);
+    fist(m, [-0.017, -0.03, 0.0], [-0.006, 0.115, -0.035], norm([0.15, -0.3, 0.94]), 0.022, mat('#5a2a26', 0.85));
+    m.sweep([[-0.02, 0.03, -0.02], [-0.017, -0.03, 0.0], [-0.014, -0.085, 0.015]], [[0.016, 0.024], [0.018, 0.025], [0.02, 0.027]], 12, M.wood, { cap1: true });
     m.sweep([[-0.02, 0.03, 0.02], [-0.02, 0.035, -0.2], [-0.02, 0.04, -0.48]], [[0.022, 0.028], [0.02, 0.026], [0.018, 0.022]], 12, M.wood, { cap0: true, cap1: true });
     for (const s of [-1, 1]) {
       m.sweep([[-0.02, 0.05, -0.47], [-0.02 + s * 0.14, 0.05, -0.47], [-0.02 + s * 0.26, 0.05, -0.38]], [0.016, 0.012, 0.007], 10, M.iron, { cap1: true });
@@ -3559,14 +3609,16 @@ const VIEWMODELS = {
     }
     m.sweep([[-0.02, 0.07, -0.24], [-0.02, 0.07, -0.55]], [0.007, 0.007], 6, M.woodLight);
     m.push().at(-0.02, 0.07, -0.57, 0, -Math.PI / 2).lathe([[0.012, 0], [0, 0.04]], 4, M.steel, { flat: true }).pop();
+    m.pop();
   },
   cast(m) {
-    arm(m, mat('#5a2a26', 0.85), 0.25);
+    // Palm up under the orb: the fingers cup round it as if round a 4 cm grip.
+    fist(m, [0.035, 0.03, -0.07], [1, 0, 0], norm([0.3, -0.4, 0.86]), 0.04, mat('#5a2a26', 0.85));
     // Gathered ley above the open palm; the renderer brightens it while a spell is cast.
     m.push().at(0.035, 0.03, -0.07).sphere(0.03, 16, mat('#7fe9ff', 0.2, 0, 1.6)).pop();
   },
   lantern(m) {
-    arm(m, mat('#4a3a2e', 0.85), 0.95, true);
+    fist(m, [-0.02, 0.02, -0.04], [0, 1, 0], norm([-0.3, -0.35, 0.88]), 0.005, mat('#4a3a2e', 0.85), true);
     m.push().at(-0.02, -0.12, -0.04);
     m.sweep([[0, 0.12, 0], [0, 0.16, 0.0]], [0.004, 0.004], 4, M.iron);
     m.box(0.05, 0.07, 0.05, 0.008, M.glass);
