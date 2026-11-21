@@ -10,7 +10,7 @@ import * as THREE from 'three';
 import { buildWorldAtlas, buildSpriteAtlas, buildWorldMaterials, buildDetailTexture } from './textures.js';
 import { CHUNK } from './world.js';
 import { Mesh, VERT, MAX_BONES, ident, mul, trs, VARIANTS, getRig, poseRig, getViewmodel, RIG_NAMES } from './models.js';
-import { NPC_CHARS, GLB_BONES, poseGlb } from './meshes.js';
+import { NPC_CHARS, GLB_BONES, poseGlb, viewHands } from './meshes.js';
 import {
   RendererBase, HUMAN_VARIANTS, NEAR, FAR, INST, CHAR_LOD_DIST, VIEW_DEPTH, WHITE,
   MESH_VS, GLB_VS, DEPTH_FS, MESH_FS, POST_VS, FX_VS, FX_FS, SKY_FS, COMPOSITE_FS, SSAO_FS, AO_BLUR_FS, BRIGHT_FS, BLUR_FS, RAIN_VS, RAIN_FS,
@@ -150,6 +150,7 @@ export class Renderer extends RendererBase {
     /** @type {Slot[]} */ this.charSlots = [];
     /** @type {Slot[]} */ this.glbSlots = [];
     /** @type {Slot[]} */ this.viewSlots = [];
+    /** @type {Slot[]} */ this.handSlots = [];
     /** .glb models on the GPU: textures by image index and geometry per part, full and far. */
     /** @type {Map<import('./meshes.js').GlbModel, {tex: THREE.Texture[], parts: THREE.BufferGeometry[], far: THREE.BufferGeometry[]}>} */
     this.glbGpu = new Map();
@@ -209,7 +210,8 @@ export class Renderer extends RendererBase {
       for (let v = 0; v < (HUMAN_VARIANTS.has(n) ? 2 : 1); v++) warm.push(() => getRig(n, false, v), () => getRig(n, true, v));
     }
     for (const n of ['tree_ley', 'tree_pine', 'tree_dead', 'rock', 'ruin']) for (let k = 0; k < 4; k++) warm.push(() => this._cpuModel(`${n}#${k}`), () => this._cpuModel(`${n}#${k}~`));
-    for (const id of ['fork', 'scatter', 'crossbow', 'cast', 'lantern']) warm.push(() => getViewmodel(id));
+    for (const id of ['fork', 'scatter', 'crossbow', 'cast', 'lantern']) warm.push(() => getViewmodel(id, !viewHands.model));
+    if (viewHands.model) warm.push(() => this._glbGpu(/** @type {import('./meshes.js').GlbModel} */ (viewHands.model)));
     for (const c of NPC_CHARS.values()) warm.push(() => this._glbGpu(c));
     const step = () => {
       const job = warm.shift();
@@ -584,24 +586,38 @@ export class Renderer extends RendererBase {
   _poseViewmodel(v, view, sky) {
     const parts = v.view ? this._viewmodelParts(v, view) : [];
     const vm = v.view;
+    const hands = viewHands.model;
+    const hg = hands && this._glbGpu(hands);
+    /** @param {THREE.Mesh} o */
+    const near = (o) => {
+      if (o.userData.near) return;
+      // three.js leaves gl.depthRange alone, so the viewmodel can squeeze into the front of it.
+      const gl = this.three.getContext();
+      o.onBeforeRender = () => gl.depthRange(0, VIEW_DEPTH);
+      o.onAfterRender = () => gl.depthRange(0, 1);
+      o.userData.near = true;
+    };
+    let nh = 0;
     parts.forEach(([id, m], i) => {
-      const slot = this._slot(this.viewSlots, i, this.gView, null, () => this._litMat(), null);
-      const o = slot.mesh;
-      if (!o.userData.near) {
-        // three.js leaves gl.depthRange alone, so the viewmodel can squeeze into the front of it.
-        const gl = this.three.getContext();
-        o.onBeforeRender = () => gl.depthRange(0, VIEW_DEPTH);
-        o.onAfterRender = () => gl.depthRange(0, 1);
-        o.userData.near = true;
-      }
-      o.geometry = this._skinnedGeo(`view:${id}`, () => getViewmodel(id));
+      const o = this._slot(this.viewSlots, i, this.gView, null, () => this._litMat(), null).mesh;
+      near(o);
+      o.geometry = this._skinnedGeo(`view:${id}${hands ? '-' : ''}`, () => getViewmodel(id, !hands));
       const u = /** @type {THREE.RawShaderMaterial} */ (o.material).uniforms;
       u.uBones.value.set(m, 0);
       u.uSky.value = sky;
       u.uEmit.value = vm && vm.item === 'cast' ? 1 + vm.cast * 2 : 1;
       o.visible = true;
+      // The hand holding it, placed by the same matrix.
+      const p = hands ? hands.parts.findIndex((q) => q.name === `hand_${id}`) : -1;
+      if (!hands || !hg || p < 0) return;
+      const h = this._slot(this.handSlots, nh++, this.gView, null, () => this._glbMat(), null).mesh;
+      near(h);
+      h.geometry = hg.parts[p];
+      this._glbUniforms(/** @type {THREE.RawShaderMaterial} */ (h.material), hg, h.geometry, m, false, sky, WHITE);
+      h.visible = true;
     });
     for (let i = parts.length; i < this.viewSlots.length; i++) this.viewSlots[i].mesh.visible = false;
+    for (let i = nh; i < this.handSlots.length; i++) this.handSlots[i].mesh.visible = false;
   }
 
   /** Render one frame. @param {RenderView} v */

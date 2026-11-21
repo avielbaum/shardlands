@@ -11,7 +11,7 @@ import {
 } from './world.js';
 import { Renderer as WebGLRenderer } from './renderer.js';
 import { setBodies } from './models.js';
-import { loadBodies, loadNpcModels } from './meshes.js';
+import { loadBodies, loadNpcModels, loadViewHands } from './meshes.js';
 import { AudioEngine } from './audio.js';
 import { SPR, spriteRect } from './textures.js';
 import { Player, Enemy, Orb, NPC, Particle, angleDiff } from './entities.js';
@@ -3093,12 +3093,15 @@ requestAnimationFrame(() => requestAnimationFrame(async () => {
   }
   // Rigged NPC models load alongside; each one that fails leaves its role on the procedural rig.
   const npcModels = loadNpcModels();
+  // Only the three.js renderer draws the .glb hands.
+  const hands = RendererImpl === WebGLRenderer ? null : loadViewHands();
   try {
     setBodies(await loadBodies());
   } catch (err) {
     console.warn('Base meshes unavailable; using procedural bodies.', err);
   }
   await npcModels;
+  await hands;
   try {
     new App();
     if (msg) { msg.textContent = ''; msg.style.display = 'none'; }

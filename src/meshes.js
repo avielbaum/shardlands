@@ -688,6 +688,7 @@ const STATE_CLIPS = { idle: /idle|stand|breath/i, walk: /walk|stroll/i, talk: /t
  * @property {Float32Array} weights 4 per vertex, summing to 1
  * @property {Uint32Array} idx
  * @property {number} mat material index, or -1
+ * @property {string} [name] glTF mesh name (static models)
  */
 /**
  * A rigged model ready to pose. Pose matrices map the file's space through `fit` (feet at y = 0,
@@ -846,9 +847,10 @@ export function poseGlb(c, layers, root, out, yaw = 0, pitch = 0) {
  * Parse a rigged (or static) .glb: every triangle primitive, its PBR material and embedded
  * images, the skeleton and inverse binds, and every animation clip. Mesh parts without a skin
  * in a rigged model ride their node rigidly, as an extra joint.
- * @param {ArrayBuffer} buf @returns {GlbModel}
+ * @param {ArrayBuffer} buf @param {boolean} [fit] false: keep the file's own metres (no human-height fit)
+ * @returns {GlbModel}
  */
-export function parseCharacter(buf) {
+export function parseCharacter(buf, fit = true) {
   const { json, bin } = parseGLB(buf);
   const nodes = json.nodes ?? [];
   const N = nodes.length;
@@ -917,7 +919,7 @@ export function parseCharacter(buf) {
       const n = g.pos.length / 3;
       const we = new Float32Array(n * 4);
       for (let v = 0; v < n; v++) we[v * 4] = 1;
-      parts.push({ pos: g.pos, nrm: g.nrm ?? normalsOf(g.pos, g.idx), uv: g.uv ?? new Float32Array(n * 2), joints: new Uint16Array(n * 4), weights: we, idx: g.idx, mat: g.material });
+      parts.push({ pos: g.pos, nrm: g.nrm ?? normalsOf(g.pos, g.idx), uv: g.uv ?? new Float32Array(n * 2), joints: new Uint16Array(n * 4), weights: we, idx: g.idx, mat: g.material, name: g.name });
     }
   }
   if (!parts.length) throw new Error('glTF has no triangle meshes');
@@ -982,7 +984,7 @@ export function parseCharacter(buf) {
     height: 0, clips, states, head, neck, headPos: new Float32Array(3),
     tmp: { a: new Float32Array(N * 10), b: new Float32Array(N * 10), world: new Float32Array(N * 16), m: new Float32Array(16), rf: new Float32Array(16) },
   };
-  fitModel(c);
+  if (fit) fitModel(c);
   if (states.walk && states.walk !== idle) states.walk.speed = clipSpeed(c, states.walk, nodes);
   return c;
 }
@@ -1170,15 +1172,34 @@ export class GlbAnimator {
 export async function loadNpcModels() {
   await Promise.all(Object.entries(NPC_MODELS).map(async ([role, url]) => {
     try {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const c = parseCharacter(await r.arrayBuffer());
-      // Raw texels: no colour-space conversion (normal and metal/rough maps are data) or premultiplying.
-      c.bitmaps = await Promise.all(c.images.map((im) => createImageBitmap(new Blob([/** @type {BlobPart} */ (im.bytes)], { type: im.mime }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' })));
-      c.images = [];
-      NPC_CHARS.set(role, c);
+      NPC_CHARS.set(role, await fetchModel(url));
     } catch (err) {
       console.warn(`${url}: rigged model unavailable; ${role} keeps the procedural rig.`, err);
     }
   }));
+}
+
+/** Fetch, parse and decode one .glb. @param {string} url @param {boolean} [fit] @returns {Promise<GlbModel>} */
+async function fetchModel(url, fit = true) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const c = parseCharacter(await r.arrayBuffer(), fit);
+  // Raw texels: no colour-space conversion (normal and metal/rough maps are data) or premultiplying.
+  c.bitmaps = await Promise.all(c.images.map((im) => createImageBitmap(new Blob([/** @type {BlobPart} */ (im.bytes)], { type: im.mime }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' })));
+  c.images = [];
+  return c;
+}
+
+/** First-person hands: one mesh per viewmodel id, named hand_<id>, already in that viewmodel's space (metres). */
+export const VIEW_HANDS = 'assets/models/hands.glb';
+/** The loaded hands, or null: the viewmodels then keep their procedural fists. @type {{model: GlbModel|null}} */
+export const viewHands = { model: null };
+
+/** Load VIEW_HANDS into viewHands. Never rejects. */
+export async function loadViewHands() {
+  try {
+    viewHands.model = await fetchModel(VIEW_HANDS, false);
+  } catch (err) {
+    console.warn(`${VIEW_HANDS}: hands unavailable; the viewmodels keep their procedural fists.`, err);
+  }
 }

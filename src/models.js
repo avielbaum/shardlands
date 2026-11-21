@@ -3563,12 +3563,12 @@ function alongY(c, a) {
   return new Float32Array([...X, 0, ...Y, 0, ...Z, 0, ...c, 1]);
 }
 
-/** @type {Record<string, (m: Mesh) => void>} */
+/** @type {Record<string, (m: Mesh, hands: boolean) => void>} */
 const VIEWMODELS = {
-  fork(m) {
+  fork(m, hands) {
     // Held like a sword: knuckles up and out, the handle across the palm, the tines up and to the left.
     const g = norm([-0.82, 0.55, 0.05]);
-    fist(m, [0, 0, -0.03], g, norm([0.3, -0.45, 0.84]), 0.02, mat('#5a2a26', 0.85));
+    if (hands) fist(m, [0, 0, -0.03], g, norm([0.3, -0.45, 0.84]), 0.02, mat('#5a2a26', 0.85));
     m.push();
     m.m = mul(m.m, alongY([-g[0] * 0.005, -g[1] * 0.005, -0.03 - g[2] * 0.005], g));
     // Leather-wrapped grip with ridged turns, a brass guard and a crystal-core pommel.
@@ -3583,10 +3583,10 @@ const VIEWMODELS = {
     }
     m.pop();
   },
-  scatter(m) {
+  scatter(m, hands) {
     // Raised and pushed out so the hand on the pistol grip sits on screen.
     m.push().at(0, 0.05, -0.04);
-    fist(m, [-0.005, -0.065, 0.0], [-0.01, 0.13, -0.04], norm([0.15, -0.3, 0.94]), 0.024, mat('#5a2a26', 0.85));
+    if (hands) fist(m, [-0.005, -0.065, 0.0], [-0.01, 0.13, -0.04], norm([0.15, -0.3, 0.94]), 0.024, mat('#5a2a26', 0.85));
     m.push().at(-0.02, 0.045, -0.12, 0, -Math.PI / 2);
     // Beveled brass chamber with banded rings, flared muzzle and a glowing crystal core.
     m.lathe([[0.03, -0.14], [0.036, -0.12], [0.038, 0.0], [0.034, 0.12], [0.036, 0.2], [0.05, 0.28], [0.072, 0.35], [0.068, 0.365], [0.05, 0.37]], 24, M.brassTex, { disp: rough(25, 0.0008, 3) });
@@ -3598,9 +3598,9 @@ const VIEWMODELS = {
     m.sweep([[-0.01, 0.0, -0.02], [-0.005, -0.065, 0.0], [0, -0.13, 0.02]], [[0.018, 0.026], [0.02, 0.028], [0.022, 0.03]], 14, M.wood, { cap1: true, disp: rough(40, 0.001, 4, { stretch: 3 }) });
     m.pop();
   },
-  crossbow(m) {
+  crossbow(m, hands) {
     m.push().at(0, 0.05, -0.04);
-    fist(m, [-0.017, -0.03, 0.0], [-0.006, 0.115, -0.035], norm([0.15, -0.3, 0.94]), 0.022, mat('#5a2a26', 0.85));
+    if (hands) fist(m, [-0.017, -0.03, 0.0], [-0.006, 0.115, -0.035], norm([0.15, -0.3, 0.94]), 0.022, mat('#5a2a26', 0.85));
     m.sweep([[-0.02, 0.03, -0.02], [-0.017, -0.03, 0.0], [-0.014, -0.085, 0.015]], [[0.016, 0.024], [0.018, 0.025], [0.02, 0.027]], 12, M.wood, { cap1: true });
     m.sweep([[-0.02, 0.03, 0.02], [-0.02, 0.035, -0.2], [-0.02, 0.04, -0.48]], [[0.022, 0.028], [0.02, 0.026], [0.018, 0.022]], 12, M.wood, { cap0: true, cap1: true });
     for (const s of [-1, 1]) {
@@ -3611,14 +3611,14 @@ const VIEWMODELS = {
     m.push().at(-0.02, 0.07, -0.57, 0, -Math.PI / 2).lathe([[0.012, 0], [0, 0.04]], 4, M.steel, { flat: true }).pop();
     m.pop();
   },
-  cast(m) {
+  cast(m, hands) {
     // Palm up under the orb: the fingers cup round it as if round a 4 cm grip.
-    fist(m, [0.035, 0.03, -0.07], [1, 0, 0], norm([0.3, -0.4, 0.86]), 0.04, mat('#5a2a26', 0.85));
+    if (hands) fist(m, [0.035, 0.03, -0.07], [1, 0, 0], norm([0.3, -0.4, 0.86]), 0.04, mat('#5a2a26', 0.85));
     // Gathered ley above the open palm; the renderer brightens it while a spell is cast.
     m.push().at(0.035, 0.03, -0.07).sphere(0.03, 16, mat('#7fe9ff', 0.2, 0, 1.6)).pop();
   },
-  lantern(m) {
-    fist(m, [-0.02, 0.02, -0.04], [0, 1, 0], norm([-0.3, -0.35, 0.88]), 0.005, mat('#4a3a2e', 0.85), true);
+  lantern(m, hands) {
+    if (hands) fist(m, [-0.02, 0.02, -0.04], [0, 1, 0], norm([-0.3, -0.35, 0.88]), 0.005, mat('#4a3a2e', 0.85), true);
     m.push().at(-0.02, -0.12, -0.04);
     m.sweep([[0, 0.12, 0], [0, 0.16, 0.0]], [0.004, 0.004], 4, M.iron);
     m.box(0.05, 0.07, 0.05, 0.008, M.glass);
@@ -3632,14 +3632,18 @@ const VIEWMODELS = {
 /** @type {Map<string, Mesh>} */
 const viewCache = new Map();
 
-/** Mesh for a viewmodel id (fork, scatter, crossbow, cast, lantern). @param {string} id */
-export function getViewmodel(id) {
-  let m = viewCache.get(id);
+/**
+ * Mesh for a viewmodel id (fork, scatter, crossbow, cast, lantern).
+ * @param {string} id @param {boolean} [hands] false: the item alone, for a renderer drawing the .glb hands (VIEW_HANDS)
+ */
+export function getViewmodel(id, hands = true) {
+  const key = hands ? id : `${id}-`;
+  let m = viewCache.get(key);
   if (!m) {
     m = new Mesh(4096);
-    (VIEWMODELS[id] ?? VIEWMODELS.cast)(m);
+    (VIEWMODELS[id] ?? VIEWMODELS.cast)(m, hands);
     finalize(m, { ao: 0.7 });
-    viewCache.set(id, m);
+    viewCache.set(key, m);
   }
   return m;
 }
